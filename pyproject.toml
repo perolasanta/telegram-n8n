@@ -1,0 +1,17 @@
+[project]
+name = "telegram-n8n"
+version = "0.1.0"
+description = "An app for automating n8n workflow from with telegram"
+authors = [
+    {name = "perolasanta",email = "peterenesibello@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.13,<3.15"
+dependencies = [
+    "aiogram (>=3.24.0,<4.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
