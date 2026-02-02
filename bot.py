@@ -222,14 +222,23 @@ async def add_to_cart(callback_query: types.CallbackQuery, state: FSMContext):
     
     await callback_query.message.answer(f"✅ Added {quantity}x {item} to your cart.")
     
-    # Get category from state and return to category menu
-    data = await state.get_data()
-    category = data.get('current_category')
+    # Clear state and go to main menu
+    await state.clear()
     
-    # ✅ Call show_menu with correct parameters
-    await show_menu(callback_query.message, category, state)
+    # Build main menu keyboard
+    keyboard = InlineKeyboardBuilder()
+    for category in MENU.keys():
+        keyboard.add(InlineKeyboardButton(text=category, callback_data=f"menu_{category}"))
+    keyboard.adjust(3)
+    
+    # Add View Cart button
+    keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
+    
+    await callback_query.message.answer(
+        "Choose a category:", 
+        reply_markup=keyboard.as_markup()
+    )
     await callback_query.answer()
-
 
 # Handle custom quantity request
 @dp.callback_query(F.data.startswith("custom_"))
@@ -257,7 +266,6 @@ async def handle_custom_quantity(message: types.Message, state: FSMContext):
     # Retrieve data from state
     data = await state.get_data()
     item = data.get("ordering_item")
-    category = data.get("current_category")
     quantity = int(message.text)
     
     # Check positive quantity
@@ -278,27 +286,23 @@ async def handle_custom_quantity(message: types.Message, state: FSMContext):
     
     await message.answer(f"✅ Added {quantity}x {item} to your cart!")
     
-    # Return to browsing state and show category menu
-    await state.set_state(OrderStates.browsing_category)
+    # Clear state and go to main menu
+    await state.clear()
     
-    # Show the category menu again with navigation buttons
+    # Build main menu keyboard
     keyboard = InlineKeyboardBuilder()
-    for menu_item in MENU[category]:
-        keyboard.add(InlineKeyboardButton(text=menu_item, callback_data=f"item_{menu_item}"))
-    keyboard.adjust(2)
+    for category in MENU.keys():
+        keyboard.add(InlineKeyboardButton(text=category, callback_data=f"menu_{category}"))
+    keyboard.adjust(3)
     
-    # Add navigation buttons
-    keyboard.row(
-        InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"),
-        InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")
-    )
+    # Add View Cart button
+    keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
     
     await message.answer(
-        f"Choose from {category}:", 
+        "Choose a category:", 
         reply_markup=keyboard.as_markup()
     )
 
-    
 # Show cart
 @dp.message(F.text.lower() == "cart")
 async def show_cart(message: types.Message, state: FSMContext):
