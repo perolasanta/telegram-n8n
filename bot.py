@@ -22,6 +22,7 @@ import aiohttp
 TOKEN = "7667383218:AAEqvEgBoj6J6eFMtDIbPu3uxTF7GOzH5Q4"
 KITCHEN_CHAT_ID = -4732576905 # Replace with your kitchen chat ID
 N8N_WEBHOOK_URL = "https://n8n-atad.onrender.com/webhook-test/new-order"  # Replace with your actual webhook URL
+N8N_UPDATE_WEBHOOK_URL = "https://n8n-atad.onrender.com/webhook-test/update-sheet"
 
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -384,6 +385,7 @@ async def show_cart(message: types.Message, state: FSMContext):
     await message.answer(cart_text, reply_markup=keyboard)
 
 
+
 # Confirm order - Show payment methods
 @dp.callback_query(F.data == "confirm_order")
 async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
@@ -467,7 +469,7 @@ async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.message.answer(bank_details)
     await callback_query.answer()
 
-# Handle payment proof (screenshot)
+
 # Handle payment proof (screenshot)
 @dp.message(OrderStates.waiting_for_payment_proof, F.photo)
 async def receive_payment_proof(message: types.Message, state: FSMContext):
@@ -546,13 +548,14 @@ async def receive_payment_proof(message: types.Message, state: FSMContext):
             [
                 InlineKeyboardButton(
                     text="✅ Confirm Payment", 
-                    callback_data=f"confirm_payment_{user_id}"
-                ),
+                    callback_data=f"confirm_payment|{telegram_username}|{user_id}" 
+                ), #used "|" so that i can user username in confirm_payment_handler
                 InlineKeyboardButton(
                     text="❌ Reject Payment", 
                     callback_data=f"reject_payment_{user_id}"
                 )
             ]
+            # Dont include mark as ready here. it shoud appear later
         ]
     )
     
@@ -681,10 +684,25 @@ async def process_order(callback_query: types.CallbackQuery, state: FSMContext, 
     )
     await callback_query.answer("Order sent to kitchen! 🍳")
 
-@dp.callback_query(F.data.startswith("confirm_payment_"))
+@dp.callback_query(F.data.startswith("confirm_payment|"))
 async def confirm_payment_handler(callback_query: types.CallbackQuery):
-    user_id = int(callback_query.data.split("_")[2])
+    # Parse callback data
+    # parts = callback_query.data.split("_")    
+    _ ,telegram_username, user_id = callback_query.data.split("|") 
+    user_id = int(user_id)
     
+     # 🔔 SEND UPDATE TO n8n
+    async with aiohttp.ClientSession() as session:
+        await session.post(
+            N8N_UPDATE_WEBHOOK_URL,
+            json={
+                "event": "payment_confirmed",
+                "chat_id": str(user_id),
+                "customer": telegram_username,
+                "payment_status": "confirmed"
+            }
+        )
+
     # Notify customer that payment is confirmed
     try:
         await bot.send_message(
@@ -695,13 +713,27 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
     except Exception as e:
         print(f"Failed to notify customer {user_id}: {e}")
     
-    # Update the kitchen message to show it's confirmed
+   # Create new keyboard with ONLY "Mark as Ready" button
+    ready_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🍽️ Mark as Ready",
+                    callback_data=f"ready|{telegram_username}|{user_id}"
+                )
+            ]
+        ]
+    )
+
+    # Update the kitchen message - replace buttons and update caption
     await callback_query.message.edit_caption(
         caption=callback_query.message.caption + "\n\n✅ PAYMENT CONFIRMED ✅",
-        reply_markup=None  # Remove the buttons
+        reply_markup=ready_keyboard  # Now only shows "Mark as Ready"
     )
-    
-    await callback_query.answer("✅ Payment confirmed and customer notified!")
+
+    await callback_query.answer("✅ Payment confirmed! Kitchen can now mark as ready.")
+
+
 
 
 @dp.callback_query(F.data.startswith("reject_payment_"))
@@ -718,10 +750,10 @@ async def reject_payment_handler(callback_query: types.CallbackQuery):
     except Exception as e:
         print(f"Failed to notify customer {user_id}: {e}")
     
-    # Update the kitchen message
+    # Update the kitchen message - NO BUTTONS (payment rejected)
     await callback_query.message.edit_caption(
         caption=callback_query.message.caption + "\n\n❌ PAYMENT REJECTED ❌",
-        reply_markup=None
+        reply_markup=None  # Remove all buttons
     )
     
     await callback_query.answer("❌ Payment rejected and customer notified!")
@@ -748,10 +780,12 @@ async def clear_cart(callback_query: types.CallbackQuery, state: FSMContext):
 async def handle_ready(callback_query: CallbackQuery):
     # Answer immediately so the button doesn't hang
     await callback_query.answer("Done!")
+    
+    print (f"Call data: {callback_query.data}")
 
     # Parse the callback_data
-    action, customer, client_chat_id = callback_query.data.split("|")
-
+    _, customer, client_chat_id = callback_query.data.split("|")
+    print(customer)
     # Notify the client
     await callback_query.bot.send_message(
         chat_id=int(client_chat_id),
@@ -759,12 +793,23 @@ async def handle_ready(callback_query: CallbackQuery):
         parse_mode="Markdown"
     )
 
-    # Confirm to the admin (update the button message so they know it's done)
-    await callback_query.message.edit_text(
-        f"✅ *{customer}* — marked as ready. Client has been notified.",
-        parse_mode="Markdown"
-    )
+    # Check if message has photo or text
+    if callback_query.message.photo:
+        # For bank transfer orders (messages with photos)
+        await callback_query.message.edit_caption(
+            caption=f"{callback_query.message.caption}\n\n🍽️ *{customer}* — marked as ready. Client has been notified.",
+            parse_mode="Markdown",
+            reply_markup=None  # Remove the button
+        )
+    else:
+        # For other payment methods (text-only messages)
+        await callback_query.message.edit_text(
+            text=f"{callback_query.message.text}\n\n🍽️ *{customer}* — marked as ready. Client has been notified.",
+            parse_mode="Markdown",
+            reply_markup=None  # Remove the button
+        )
 
+        
 async def main():
     logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
