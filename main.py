@@ -25,9 +25,11 @@ async def ping_n8n_periodically():
     """Background task to keep n8n awake on Render's free tier."""
     async with aiohttp.ClientSession() as session:
         while True:
+
             try:
-                async with session.get(N8N_HEARTBEAT_URL) as resp:
-                    print(f"Pinged n8n: {resp.status}")
+                    
+                    async with session.get(N8N_HEARTBEAT_URL) as response:
+                        print(f"Pinged n8n: {response.status}")
             except Exception as e:
                 print(f"Ping failed: {e}")
             
