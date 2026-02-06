@@ -16,13 +16,13 @@ import sqlite3
 import logging
 import asyncio
 import aiohttp
-
+import os
 
 # Set up bot
-TOKEN = "7667383218:AAEqvEgBoj6J6eFMtDIbPu3uxTF7GOzH5Q4"
-KITCHEN_CHAT_ID = -4732576905 # Replace with your kitchen chat ID
-N8N_WEBHOOK_URL = "https://n8n-atad.onrender.com/webhook/new-order"  # Replace with your actual webhook URL
-N8N_UPDATE_WEBHOOK_URL = "https://n8n-atad.onrender.com/webhook/update-sheet"
+TOKEN = os.getenv("TOKEN")
+KITCHEN_CHAT_ID = os.getenv("KITCHEN_CHAT_ID") # Replace with your kitchen chat ID
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL","https://n8n-atad.onrender.com/webhook/new-order")  # Replace with your actual webhook URL
+N8N_UPDATE_WEBHOOK_URL = os.getenv("N8N_UPDATE_WEBHOOK_URL", "https://n8n-atad.onrender.com/webhook/update-sheet")
 
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -824,11 +824,12 @@ async def handle_ready(callback_query: CallbackQuery):
         )
 
 
-        
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+## Not using  polling for deployment. using fastapi webservice
+# so i will disable this part      
+#async def main():
+ #   logging.basicConfig(level=logging.INFO)
+  #  await bot.delete_webhook(drop_pending_updates=True)
+   # await dp.start_polling(bot)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+#if __name__ == "__main__":
+ #   asyncio.run(main())
