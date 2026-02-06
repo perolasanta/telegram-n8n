@@ -1,0 +1,5 @@
+.env
+orders.db
+*.json
+snippets.py
+*.png
