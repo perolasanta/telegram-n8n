@@ -3,3 +3,12 @@ orders.db
 *.json
 snippets.py
 *.png
+__pycache__/
+*.py[cod]
+*$py.class
+*.db
+.venv/
+venv/
+ENV/
+env/
+.poetry/
