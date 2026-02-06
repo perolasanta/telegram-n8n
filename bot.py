@@ -7,7 +7,7 @@ from aiogram.utils.markdown import hbold
 
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-
+import time # to generate order_id
 
 router = Router()
 
@@ -21,8 +21,8 @@ import aiohttp
 # Set up bot
 TOKEN = "7667383218:AAEqvEgBoj6J6eFMtDIbPu3uxTF7GOzH5Q4"
 KITCHEN_CHAT_ID = -4732576905 # Replace with your kitchen chat ID
-N8N_WEBHOOK_URL = "https://n8n-atad.onrender.com/webhook-test/new-order"  # Replace with your actual webhook URL
-N8N_UPDATE_WEBHOOK_URL = "https://n8n-atad.onrender.com/webhook-test/update-sheet"
+N8N_WEBHOOK_URL = "https://n8n-atad.onrender.com/webhook/new-order"  # Replace with your actual webhook URL
+N8N_UPDATE_WEBHOOK_URL = "https://n8n-atad.onrender.com/webhook/update-sheet"
 
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -487,6 +487,8 @@ async def receive_payment_proof(message: types.Message, state: FSMContext):
     user = message.from_user
     telegram_username = user.username or user.first_name or "Unknown User"
     
+    #generate order_id
+    order_id = f"{user_id}_{int(time.time())}"
     # Build order text with payment proof
     order_text = f"🍽 New Order for Table {hbold(table_number)}:\n\n"
     items_list = []
@@ -518,7 +520,8 @@ async def receive_payment_proof(message: types.Message, state: FSMContext):
     
     # Prepare webhook payload
     webhook_payload = {
-        "restaurant": "Demo Restaurant Minna",
+        "order_id": order_id,
+        "restaurant": "City Bites Minna",
         "customer_name": telegram_username,
         "chat_id": str(user_id),
         "table_number": table_number,
@@ -548,7 +551,7 @@ async def receive_payment_proof(message: types.Message, state: FSMContext):
             [
                 InlineKeyboardButton(
                     text="✅ Confirm Payment", 
-                    callback_data=f"confirm_payment|{telegram_username}|{user_id}" 
+                    callback_data=f"confirm_payment|{telegram_username}|{order_id}" 
                 ), #used "|" so that i can user username in confirm_payment_handler
                 InlineKeyboardButton(
                     text="❌ Reject Payment", 
@@ -566,6 +569,7 @@ async def receive_payment_proof(message: types.Message, state: FSMContext):
         caption=order_text,
         reply_markup=keyboard  # Add buttons for kitchen staff to confirm/reject
     )
+
     
     # Clear cart and state
     user_orders[user_id] = {}
@@ -646,7 +650,7 @@ async def process_order(callback_query: types.CallbackQuery, state: FSMContext, 
     
     # Prepare webhook payload
     webhook_payload = {
-        "restaurant": "Demo Restaurant Minna",
+        "restaurant": "City Bites Minna",
         "customer_name": telegram_username,
         "chat_id": str(user_id),
         "table_number": table_number,
@@ -671,6 +675,10 @@ async def process_order(callback_query: types.CallbackQuery, state: FSMContext, 
     
     # Send to kitchen
     await bot.send_message(KITCHEN_CHAT_ID, order_text)
+
+
+
+
     
     # Clear cart and state
     user_orders[user_id] = {}
@@ -684,12 +692,17 @@ async def process_order(callback_query: types.CallbackQuery, state: FSMContext, 
     )
     await callback_query.answer("Order sent to kitchen! 🍳")
 
+
 @dp.callback_query(F.data.startswith("confirm_payment|"))
 async def confirm_payment_handler(callback_query: types.CallbackQuery):
     # Parse callback data
     # parts = callback_query.data.split("_")    
-    _ ,telegram_username, user_id = callback_query.data.split("|") 
+    _ ,telegram_username, order_id = callback_query.data.split("|") 
+    user_id = order_id.split("_")[0]
+    print(user_id)
+    print(f"order ID: {order_id}")
     user_id = int(user_id)
+
     
      # 🔔 SEND UPDATE TO n8n
     async with aiohttp.ClientSession() as session:
@@ -699,7 +712,8 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
                 "event": "payment_confirmed",
                 "chat_id": str(user_id),
                 "customer": telegram_username,
-                "payment_status": "confirmed"
+                "payment_status": "confirmed",
+                "order_id": str(order_id)
             }
         )
 
@@ -734,8 +748,6 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
     await callback_query.answer("✅ Payment confirmed! Kitchen can now mark as ready.")
 
 
-
-
 @dp.callback_query(F.data.startswith("reject_payment_"))
 async def reject_payment_handler(callback_query: types.CallbackQuery):
     user_id = int(callback_query.data.split("_")[2])
@@ -759,10 +771,13 @@ async def reject_payment_handler(callback_query: types.CallbackQuery):
     await callback_query.answer("❌ Payment rejected and customer notified!")
 
 
+
+
+
 @dp.message(Command("cancel"))
 async def cancel_order(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("❌ Order cancelled. Use /start to begin a new order.")
+    await message.answer("❌ Order cancelled. Use /start or rescan qr code to begin a new order.")
 
 # Optional: Clear cart handler
 @dp.callback_query(F.data == "clear_cart")
@@ -773,7 +788,6 @@ async def clear_cart(callback_query: types.CallbackQuery, state: FSMContext):
     
     await callback_query.message.answer("🗑 Your cart has been cleared.")
     await callback_query.answer()
-
 
 
 @router.callback_query(F.data.startswith("ready|"))
@@ -809,9 +823,11 @@ async def handle_ready(callback_query: CallbackQuery):
             reply_markup=None  # Remove the button
         )
 
+
         
 async def main():
     logging.basicConfig(level=logging.INFO)
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
