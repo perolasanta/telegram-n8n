@@ -7,6 +7,8 @@ import asyncio
 import aiohttp
 
 FASTAPI_WEBHOOK_URL = os.getenv("FASTAPI_WEBHOOK_URL","https://telegram-n8n-restaurant-bot.onrender.com")  # Replace with your actual webhook URL
+
+# URL of  n8n Heartbeat Webhook
 N8N_HEARTBEAT_URL=os.getenv("N8N_HEARTBEAT_URL", "https://n8n-atad.onrender.com/webhook/heartbeat")
 
 
@@ -16,18 +18,21 @@ app = FastAPI(title="Telegram Bot webservice", version= "1.0.0",
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+
+
 async def ping_n8n_periodically():
+    """Background task to keep n8n awake on Render's free tier."""
     async with aiohttp.ClientSession() as session:
-        """Background task to keep n8n awake on Render's free tier."""
         while True:
             try:
-                session.get(N8N_HEARTBEAT_URL) as response:
-                print (f"Pinged N8n: {response.status}")
+                async with session.get(N8N_HEARTBEAT_URL) as resp:
+                    print(f"Pinged n8n: {resp.status}")
             except Exception as e:
-                print (f"Ping failed: {e}")
+                print(f"Ping failed: {e}")
+            
             # Ping every 10 minutes to stay within Render's 15-min window
             await asyncio.sleep(600)
-
 
 
 @app.post("/webhook")
