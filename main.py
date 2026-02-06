@@ -21,7 +21,7 @@ async def ping_n8n_periodically():
         """Background task to keep n8n awake on Render's free tier."""
         while True:
             try:
-                session.get() as response:
+                session.get(N8N_HEARTBEAT_URL) as response:
                 print (f"Pinged N8n: {response.status}")
             except Exception as e:
                 print (f"Ping failed: {e}")
