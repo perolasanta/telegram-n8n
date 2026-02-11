@@ -115,7 +115,7 @@ async def start(message: types.Message, state: FSMContext):
     keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
     
     await message.answer(
-        f"Welcome! Table {hbold(table_number)}.\nChoose a category:", 
+        f"Welcome! Table {hbold(table_number)}.\nThis is a DEMO food ordering bot.\n• Orders here are NOT real\n• Menu is sample only\n• This shows how your own restaurant bot will work\nTo get your own bot 👉 visit the Selar product page.\n\nChoose a category:", 
         reply_markup=keyboard.as_markup()
     )
 
