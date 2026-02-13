@@ -2,396 +2,575 @@ from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
-from aiogram.filters import  CommandStart, Command
+from aiogram.filters import CommandStart, Command
 from aiogram.utils.markdown import hbold 
-
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-import time # to generate order_id
 
-router = Router()
-
-
-import sqlite3
 import logging
 import asyncio
 import aiohttp
 import os
+from supabase import Client, create_client
+from decimal import Decimal
+from dotenv import load_dotenv
+import base64
 
-# Set up bot
+router = Router()
+load_dotenv()
+
+# Environment variables
 TOKEN = os.getenv("TOKEN")
-KITCHEN_CHAT_ID = os.getenv("KITCHEN_CHAT_ID") # Replace with your kitchen chat ID
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL","https://n8n-atad.onrender.com/webhook/new-order")  # Replace with your actual webhook URL
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://n8n-atad.onrender.com/webhook/new-order")
 N8N_UPDATE_WEBHOOK_URL = os.getenv("N8N_UPDATE_WEBHOOK_URL", "https://n8n-atad.onrender.com/webhook/update-sheet")
-
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 dp.include_router(router)
 
-# User data storage
-user_orders = {}  # {user_id: {item_name: quantity}}
-user_table_map = {}  # {user_id: table_number}
+# Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# Database setup
-conn = sqlite3.connect("orders.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        table_number TEXT,
-        item TEXT,
-        quantity INTEGER
-    )
-""")
-conn.commit()
-
-
-
-# Menu items with prices
-MENU = {
-    "Alcohol": {
-        "Beer": 500,
-        "Wine": 2000,
-        "Whiskey": 3500,
-        "Bitters": 300
-    },
-    "Pepper Soup": {
-        "Fish": 1500,
-        "Chicken": 1200,
-        "Goat": 2000,
-        "Bokoto": 1800
-    },
-    "Rice": {
-        "Jollof Rice": 1000,
-        "Fried Rice": 1200,
-        "Ofada Rice": 900
-    },
-    "Noodles": {
-        "Indomie": 500,
-        "Spaghetti": 600
-    },
-    "Soft Drinks": {
-        "Coke": 200,
-        "Fanta": 200,
-        "Sprite": 200,
-        "Water": 100,
-        "Fearless": 300
-    },
-}
-
+# FSM States
 class OrderStates(StatesGroup):
     browsing_category = State()
     waiting_for_quantity = State()
-    waiting_for_payment_proof = State() 
+    waiting_for_payment_proof = State()
+    waiting_for_address = State()
 
 
+# ========== HELPER FUNCTIONS ==========
+
+async def get_categories(restaurant_id: str):
+    """Get active categories for restaurant"""
+    response = supabase.table("menu_categories")\
+        .select("*")\
+        .eq("restaurant_id", restaurant_id)\
+        .eq("is_active", True)\
+        .order("display_order")\
+        .execute()
+    return response.data
+
+
+async def get_menu_items(category_id: str):
+    """Get available items in category"""
+    response = supabase.table("menu_items")\
+        .select("*")\
+        .eq("category_id", category_id)\
+        .eq("is_available", True)\
+        .order("name")\
+        .execute()
+    return response.data
+
+
+async def get_cart_summary(user_id: int, restaurant_id: str):
+    """Get cart items from FSM state - returns dict {menu_item_id: {name, price, qty}}"""
+    # This is stored in FSM state, not DB
+    # We'll manage cart in memory via state since it's temporary
+    return {}
+
+
+
+# ========== COMMAND HANDLERS ==========
 @dp.message(CommandStart())
 async def start(message: types.Message, state: FSMContext):
-    # Parse table number from command arguments
     args = message.text.split()
-    table_number = args[1].replace("table_", "") if len(args) > 1 and args[1].startswith("table_") else "Unknown"
     
-    # Store table number and initialize orders
-    user_table_map[message.from_user.id] = table_number
-    user_orders[message.from_user.id] = {}
+    print("="*50)
+    print(f"RAW MESSAGE: '{message.text}'")
+    print(f"ARGS: {args}")
+    print("="*50)
     
-    # Optional: Store table number in FSM state as well
-    await state.update_data(table_number=table_number)
+    if len(args) < 2:
+        await message.answer(
+            "Please scan a QR code from the restaurant to begin ordering.\n\n"
+            "🪑 Table QR = Dine-in\n"
+            "🏠 Restaurant QR = Delivery/Pickup"
+        )
+        return
     
-    # Clear any previous state (fresh start)
-    await state.clear()
+    public_code = args[1]
+    print(f"PUBLIC CODE: '{public_code}'")
     
-    print(user_table_map)
-    print(user_orders)
+    try:
+        # Look up in restaurant_tables (includes both regular tables and external)
+        table = supabase.table("restaurant_tables")\
+            .select("id, table_number, restaurant_id, restaurants(id, name, kitchen_chat_id)")\
+            .eq("public_code", public_code)\
+            .eq("is_active", True)\
+            .execute()
+        
+        print(f"Query result: {table.data}")
+        
+        if not table.data:
+            await message.answer("Invalid QR code. Please contact staff.")
+            return
+        
+        table_data = table.data[0]
+        restaurant_data = table_data["restaurants"]
+        
+        table_id = table_data["id"]
+        table_number = table_data["table_number"]
+        restaurant_id = table_data["restaurant_id"]
+        restaurant_name = restaurant_data["name"]
+        kitchen_chat_id = restaurant_data["kitchen_chat_id"]
+        
+        # Check if this is external order (table_number is NULL or 'EXTERNAL')
+        if table_number is None or table_number == 'EXTERNAL':
+            # EXTERNAL ORDER (delivery/pickup)
+            print(f"✅ EXTERNAL ORDER: {restaurant_name}")
+            await handle_external_order(message, state, restaurant_id, restaurant_name, kitchen_chat_id, table_id)
+        else:
+            # DINE-IN ORDER (has table number)
+            print(f"✅ DINE-IN: Table {table_number} at {restaurant_name}")
+            await handle_dine_in_order(message, state, restaurant_id, restaurant_name, kitchen_chat_id, table_id, table_number)
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        await message.answer("Invalid QR code. Please try again.")
+
+
+async def handle_dine_in_order(message: types.Message, state: FSMContext, restaurant_id: str, restaurant_name: str, kitchen_chat_id: int, table_id: str, table_number: str):
+    """Handle dine-in order"""
     
-    # Build category selection keyboard
+    # Initialize cart for DINE-IN
+    await state.update_data(
+        restaurant_id=restaurant_id,
+        table_id=table_id,
+        restaurant_name=restaurant_name,
+        table_number=table_number,
+        kitchen_chat_id=kitchen_chat_id,
+        order_type="dine_in",
+        cart={}
+    )
+    
+    # Get categories
+    categories = await get_categories(restaurant_id)
+    
+    if not categories:
+        await message.answer("No menu available. Please contact staff.")
+        return
+    
+    # Build keyboard
     keyboard = InlineKeyboardBuilder()
-    for category in MENU.keys():
-        keyboard.add(InlineKeyboardButton(text=category, callback_data=f"menu_{category}"))
+    for category in categories:
+        keyboard.add(InlineKeyboardButton(
+            text=category["name"], 
+            callback_data=f"cat_{category['id']}"
+        ))
     keyboard.adjust(3)
-    
-    # Add View Cart button
     keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
     
     await message.answer(
-        f"Welcome! Table {hbold(table_number)}.\nThis is a DEMO food ordering bot.\n• Orders here are NOT real\n• Menu is sample only\n• This shows how your own restaurant bot will work\nTo get your own bot 👉 visit the Selar product page.\n\nChoose a category:", 
+        f"Welcome to {hbold(restaurant_name)}!\n"
+        f"🪑 Dine-in - Table {hbold(table_number)}\n\n"
+        f"Choose a category:",
         reply_markup=keyboard.as_markup()
     )
 
-    # Handle main menu button
+
+async def handle_external_order(message: types.Message, state: FSMContext, restaurant_id: str, restaurant_name: str, kitchen_chat_id: int, table_id: str):
+    """Handle external order (delivery/pickup)"""
+    
+    # Store restaurant info in state
+    await state.update_data(
+        restaurant_id=restaurant_id,
+        restaurant_name=restaurant_name,
+        kitchen_chat_id=kitchen_chat_id,
+        table_id=table_id,  # Still store the "EXTERNAL" table_id
+        table_number=None,
+        cart={}
+    )
+    
+    # Ask order type
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚗 Delivery", callback_data="order_type_delivery")],
+        [InlineKeyboardButton(text="🏃 Pickup", callback_data="order_type_pickup")]
+    ])
+    
+    await message.answer(
+        f"Welcome to {hbold(restaurant_name)}!\n\n"
+        f"How would you like to receive your order?",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data == "order_type_delivery")
+async def order_type_delivery(callback_query: types.CallbackQuery, state: FSMContext):
+    """Handle delivery order selection"""
+    
+    await state.update_data(order_type="delivery")
+    
+    await callback_query.message.answer(
+        "📍 Please enter your delivery address:\n\n"
+        "Example: 123 Main Street, Minna, Niger State"
+    )
+    
+    await state.set_state(OrderStates.waiting_for_address)
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data == "order_type_pickup")
+async def order_type_pickup(callback_query: types.CallbackQuery, state: FSMContext):
+    """Handle pickup order selection"""
+    
+    await state.update_data(order_type="pickup")
+    
+    await callback_query.message.answer(
+        "✅ You selected Pickup!\n\n"
+        "You'll collect your order from the restaurant."
+    )
+    
+    await show_menu_categories(callback_query.message, state)
+    await callback_query.answer()
+
+
+
+
+@dp.message(OrderStates.waiting_for_address)
+async def receive_address(message: types.Message, state: FSMContext):
+    """Receive delivery address"""
+    
+    address = message.text.strip()
+    
+    if len(address) < 10:
+        await message.answer("⚠️ Please enter a complete address.")
+        return
+    
+    await state.update_data(delivery_address=address)
+    
+    await message.answer(
+        f"✅ Delivery address saved:\n{address}\n\n"
+        f"Now let's see the menu!"
+    )
+    
+    await state.set_state(None)
+    await show_menu_categories(message, state)
+
+
+async def show_menu_categories(message: types.Message, state: FSMContext):
+    """Show menu categories"""
+    
+    data = await state.get_data()
+    restaurant_id = data.get("restaurant_id")
+    restaurant_name = data.get("restaurant_name", "Restaurant")
+    
+    categories = await get_categories(restaurant_id)
+    
+    if not categories:
+        await message.answer("No menu available. Please contact staff.")
+        return
+    
+    keyboard = InlineKeyboardBuilder()
+    for category in categories:
+        keyboard.add(InlineKeyboardButton(
+            text=category["name"], 
+            callback_data=f"cat_{category['id']}"
+        ))
+    keyboard.adjust(3)
+    keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
+    
+    await message.answer(
+        f"{restaurant_name}\nChoose a category:",
+        reply_markup=keyboard.as_markup()
+    )   
+    # ========== MENU NAVIGATION ==========
+
 @dp.callback_query(F.data == "main_menu")
 async def go_to_main_menu(callback_query: types.CallbackQuery, state: FSMContext):
-    await state.clear()
+    data = await state.get_data()
+    restaurant_id = data.get("restaurant_id")
+    restaurant_name = data.get("restaurant_name", "Restaurant")
     
-    # Build category selection keyboard
+    if not restaurant_id:
+        await callback_query.message.answer("Session expired. Please /start again.")
+        await callback_query.answer()
+        return
+    
+    categories = await get_categories(restaurant_id)
+    
     keyboard = InlineKeyboardBuilder()
-    for category in MENU.keys():
-        keyboard.add(InlineKeyboardButton(text=category, callback_data=f"menu_{category}"))
-    keyboard.adjust(3)
-    
-    # Add View Cart button
+    for category in categories:
+        keyboard.add(InlineKeyboardButton(
+            text=category["name"],
+            callback_data=f"cat_{category['id']}"
+        ))
+    keyboard.adjust(2)
     keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
     
     await callback_query.message.answer(
-        "Choose a category:", 
+        f"{restaurant_name}\nChoose a category:",
         reply_markup=keyboard.as_markup()
     )
     await callback_query.answer()
 
 
-# Handle view cart button
+@dp.callback_query(F.data.startswith("cat_"))
+async def show_menu(callback_query: types.CallbackQuery, state: FSMContext):
+    category_id = callback_query.data.replace("cat_", "")
+    
+    # Get category details
+    category = supabase.table("menu_categories")\
+        .select("name")\
+        .eq("id", category_id)\
+        .execute()
+    
+    if not category.data:
+        await callback_query.answer("Category not found!")
+        return
+    
+    # Get menu items
+    items = await get_menu_items(category_id)
+    
+    if not items:
+        await callback_query.message.answer("No items available in this category.")
+        await callback_query.answer()
+        return
+    
+    keyboard = InlineKeyboardBuilder()
+    for item in items:
+        keyboard.add(InlineKeyboardButton(
+            text=f"{item['name']} - ₦{float(item['price']):,.0f}",
+            callback_data=f"item_{item['id']}"
+        ))
+    keyboard.adjust(2)
+    keyboard.row(
+        InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"),
+        InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")
+    )
+    
+    await callback_query.message.answer(
+        f"{category.data[0]['name']}:\n\nSelect an item:",
+        reply_markup=keyboard.as_markup()
+    )
+    await callback_query.answer()
+
+
+# ========== ITEM SELECTION ==========
+
+@dp.callback_query(F.data.startswith("item_"))
+async def select_quantity(callback_query: types.CallbackQuery, state: FSMContext):
+    menu_item_id = callback_query.data.replace("item_", "")
+    
+    # Get item details
+    item = supabase.table("menu_items")\
+        .select("name, price")\
+        .eq("id", menu_item_id)\
+        .execute()
+    
+    if not item.data:
+        await callback_query.answer("Item not found!")
+        return
+    
+    # Store current item in state
+    await state.update_data(current_item_id=menu_item_id)
+    
+    keyboard = InlineKeyboardBuilder()
+    for i in range(1, 6):
+        keyboard.add(InlineKeyboardButton(
+            text=str(i),
+            callback_data=f"qty_{menu_item_id}_{i}"
+        ))
+    keyboard.add(InlineKeyboardButton(
+        text="Custom",
+        callback_data=f"custom_{menu_item_id}"
+    ))
+    keyboard.adjust(3)
+    keyboard.row(
+        InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"),
+        InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")
+    )
+    
+    await callback_query.message.answer(
+        f"Select quantity for {item.data[0]['name']}:",
+        reply_markup=keyboard.as_markup()
+    )
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data.startswith("qty_"))
+async def add_to_cart(callback_query: types.CallbackQuery, state: FSMContext):
+    parts = callback_query.data.split("_")
+    menu_item_id = parts[1]
+    quantity = int(parts[2])
+    
+    # Get item details from DB
+    item = supabase.table("menu_items")\
+        .select("name, price")\
+        .eq("id", menu_item_id)\
+        .execute()
+    
+    if not item.data:
+        await callback_query.answer("Item not found!")
+        return
+    
+    item_data = item.data[0]
+    
+    # Update cart in state
+    data = await state.get_data()
+    cart = data.get("cart", {})
+    
+    if menu_item_id in cart:
+        cart[menu_item_id]["qty"] += quantity
+    else:
+        cart[menu_item_id] = {
+            "name": item_data["name"],
+            "price": float(item_data["price"]),
+            "qty": quantity
+        }
+    
+    await state.update_data(cart=cart)
+    
+    await callback_query.message.answer(
+        f"✅ Added {quantity}x {item_data['name']} to cart!"
+    )
+    
+    # Show main menu
+    await go_to_main_menu(callback_query, state)
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data.startswith("custom_"))
+async def ask_custom_quantity(callback_query: types.CallbackQuery, state: FSMContext):
+    menu_item_id = callback_query.data.replace("custom_", "")
+    
+    # Get item name
+    item = supabase.table("menu_items")\
+        .select("name")\
+        .eq("id", menu_item_id)\
+        .execute()
+    
+    await state.update_data(ordering_item_id=menu_item_id)
+    await state.set_state(OrderStates.waiting_for_quantity)
+    
+    await callback_query.message.answer(
+        f"How many {item.data[0]['name']} would you like? 🔢\n"
+        "Please enter a number:"
+    )
+    await callback_query.answer()
+
+
+@dp.message(OrderStates.waiting_for_quantity)
+async def handle_custom_quantity(message: types.Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("⚠️ Please enter a valid number.")
+        return
+    
+    quantity = int(message.text)
+    
+    if quantity <= 0:
+        await message.answer("⚠️ Quantity must be greater than zero.")
+        return
+    
+    data = await state.get_data()
+    menu_item_id = data.get("ordering_item_id")
+    
+    # Get item details
+    item = supabase.table("menu_items")\
+        .select("name, price")\
+        .eq("id", menu_item_id)\
+        .execute()
+    
+    if not item.data:
+        await message.answer("Item not found!")
+        return
+    
+    item_data = item.data[0]
+    
+    # Update cart
+    cart = data.get("cart", {})
+    
+    if menu_item_id in cart:
+        cart[menu_item_id]["qty"] += quantity
+    else:
+        cart[menu_item_id] = {
+            "name": item_data["name"],
+            "price": float(item_data["price"]),
+            "qty": quantity
+        }
+    
+    await state.update_data(cart=cart)
+    
+    await message.answer(f"✅ Added {quantity}x {item_data['name']} to cart!")
+    
+    # Clear waiting state
+    await state.set_state(None)
+    
+    # Show categories
+    restaurant_id = data.get("restaurant_id")
+    categories = await get_categories(restaurant_id)
+    
+    keyboard = InlineKeyboardBuilder()
+    for category in categories:
+        keyboard.add(InlineKeyboardButton(
+            text=category["name"],
+            callback_data=f"cat_{category['id']}"
+        ))
+    keyboard.adjust(2)
+    keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
+    
+    await message.answer(
+        "Choose a category:",
+        reply_markup=keyboard.as_markup()
+    )
+
+
+# ========== CART MANAGEMENT ==========
+
 @dp.callback_query(F.data == "view_cart")
-async def view_cart_callback(callback_query: types.CallbackQuery, state: FSMContext):
-    user_id = callback_query.from_user.id
-    cart = user_orders.get(user_id, {})
+async def view_cart(callback_query: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    cart = data.get("cart", {})
     
     if not cart:
         await callback_query.message.answer("Your cart is empty. 🛒")
         await callback_query.answer()
         return
     
-    # Build cart display with prices
+    # Build cart display
     cart_text = "🛒 Your Cart:\n\n"
-    total_items = 0
     total_price = 0
+    total_items = 0
     
-    for item, qty in cart.items():
-        price = get_item_price(item)
+    for menu_item_id, item in cart.items():
+        qty = item["qty"]
+        price = item["price"]
         item_total = price * qty
+        
+        cart_text += f"• {qty}x {item['name']} - ₦{price:,.0f} = ₦{item_total:,.0f}\n"
         total_price += item_total
-        cart_text += f"• {qty}x {item} - ₦{price:,} = ₦{item_total:,}\n"
         total_items += qty
     
     cart_text += f"\n📊 Total Items: {total_items}"
-    cart_text += f"\n💰 Total Price: ₦{total_price:,}"
+    cart_text += f"\n💰 Total Price: ₦{total_price:,.0f}"
     
-    # Create keyboard with Confirm, Clear Cart, and Back options
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Confirm Order", callback_data="confirm_order")],
-            [InlineKeyboardButton(text="🗑 Clear Cart", callback_data="clear_cart")],
-            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")]
-        ]
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Confirm Order", callback_data="confirm_order")],
+        [InlineKeyboardButton(text="🗑 Clear Cart", callback_data="clear_cart")],
+        [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")]
+    ])
+    
     await callback_query.message.answer(cart_text, reply_markup=keyboard)
-    await callback_query.answer()    
-
-# Show menu items
-async def show_menu(message: types.Message, category: str, state: FSMContext):
-    # Store category in state
-    await state.set_state(OrderStates.browsing_category)
-    await state.update_data(current_category=category)
-    
-    keyboard = InlineKeyboardBuilder()
-    for item, price in MENU[category].items():
-        # Show item with price
-        keyboard.add(InlineKeyboardButton(
-            text=f"{item} - ₦{price:,}", 
-            callback_data=f"item_{item}"
-        ))
-    keyboard.adjust(2)
-    
-    # Add navigation buttons
-    keyboard.row(
-        InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"),
-        InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")
-    )
-    
-    await message.answer(
-        f"Choose from {category}:", 
-        reply_markup=keyboard.as_markup()
-    )
-
-# Helper function to get item price
-def get_item_price(item_name):
-    for category_items in MENU.values():
-        if item_name in category_items:
-            return category_items[item_name]
-    return 0  # Return 0 if item not found
-
-# Show menu items handler
-@dp.callback_query(F.data.startswith("menu_"))
-async def show_menu_handler(callback_query: types.CallbackQuery, state: FSMContext):
-    category = callback_query.data.split("_")[1]
-    await show_menu(callback_query.message, category, state)
     await callback_query.answer()
 
 
-# Select item and show quantity options
-@dp.callback_query(F.data.startswith("item_"))
-async def select_quantity(callback_query: types.CallbackQuery, state: FSMContext):
-    item = callback_query.data.split("_")[1]
-    
-    # Store item in state (we already have category stored)
-    await state.update_data(current_item=item)
-    
-    keyboard = InlineKeyboardBuilder()
-    for i in range(1, 6):
-        keyboard.add(InlineKeyboardButton(
-            text=str(i), 
-            callback_data=f"quantity_{item}_{i}"
-        ))
-    keyboard.add(InlineKeyboardButton(
-        text="Other", 
-        callback_data=f"custom_{item}"
-    ))
-    keyboard.adjust(3)
-    
-    # Add navigation buttons
-    keyboard.row(
-        InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"),
-        InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")
-    )
-    
-    await callback_query.message.answer(
-        f"Select quantity for {item}:", 
-        reply_markup=keyboard.as_markup()
-    )
+@dp.callback_query(F.data == "clear_cart")
+async def handle_clear_cart(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.update_data(cart={})
+    await callback_query.message.answer("🗑 Your cart has been cleared.")
     await callback_query.answer()
 
 
-# Handle predefined quantities
-@dp.callback_query(F.data.startswith("quantity_"))
-async def add_to_cart(callback_query: types.CallbackQuery, state: FSMContext):
-    _, item, quantity = callback_query.data.split("_")
-    user_id = callback_query.from_user.id
-    
-    # Initialize user orders if needed
-    if user_id not in user_orders:
-        user_orders[user_id] = {}
-    
-    # Add or update quantity
-    if item in user_orders[user_id]:
-        user_orders[user_id][item] += int(quantity)
-    else:
-        user_orders[user_id][item] = int(quantity)
-    
-    await callback_query.message.answer(f"✅ Added {quantity}x {item} to your cart.")
-    
-    # Clear state and go to main menu
-    await state.clear()
-    
-    # Build main menu keyboard
-    keyboard = InlineKeyboardBuilder()
-    for category in MENU.keys():
-        keyboard.add(InlineKeyboardButton(text=category, callback_data=f"menu_{category}"))
-    keyboard.adjust(3)
-    
-    # Add View Cart button
-    keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
-    
-    await callback_query.message.answer(
-        "Choose a category:", 
-        reply_markup=keyboard.as_markup()
-    )
-    await callback_query.answer()
+# ========== ORDER CONFIRMATION ==========
 
-# Handle custom quantity request
-@dp.callback_query(F.data.startswith("custom_"))
-async def ask_custom_quantity(callback_query: types.CallbackQuery, state: FSMContext):
-    item = callback_query.data.replace("custom_", "")
-    
-    # Store item and set state
-    await state.update_data(ordering_item=item)
-    await state.set_state(OrderStates.waiting_for_quantity)
-    
-    await callback_query.message.answer(
-        f"How many **{item}** would you like? 🔢\n"
-        "Please enter a number below:"
-    )
-    await callback_query.answer()
-
-# Handle custom quantity input
-@dp.message(OrderStates.waiting_for_quantity)
-async def handle_custom_quantity(message: types.Message, state: FSMContext):
-    # Validation
-    if not message.text.isdigit():
-        await message.answer("⚠️ Please enter a valid number (e.g., 1, 2, 5).")
-        return
-    
-    # Retrieve data from state
-    data = await state.get_data()
-    item = data.get("ordering_item")
-    quantity = int(message.text)
-    
-    # Check positive quantity
-    if quantity <= 0:
-        await message.answer("⚠️ Quantity must be greater than zero.")
-        return
-    
-    # Update orders
-    user_id = message.from_user.id
-    if user_id not in user_orders:
-        user_orders[user_id] = {}
-    
-    # Add to existing quantity instead of replacing
-    if item in user_orders[user_id]:
-        user_orders[user_id][item] += quantity
-    else:
-        user_orders[user_id][item] = quantity
-    
-    await message.answer(f"✅ Added {quantity}x {item} to your cart!")
-    
-    # Clear state and go to main menu
-    await state.clear()
-    
-    # Build main menu keyboard
-    keyboard = InlineKeyboardBuilder()
-    for category in MENU.keys():
-        keyboard.add(InlineKeyboardButton(text=category, callback_data=f"menu_{category}"))
-    keyboard.adjust(3)
-    
-    # Add View Cart button
-    keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
-    
-    await message.answer(
-        "Choose a category:", 
-        reply_markup=keyboard.as_markup()
-    )
-
-# Show cart
-@dp.message(F.text.lower() == "cart")
-async def show_cart(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    cart = user_orders.get(user_id, {})
-    
-    if not cart:
-        await message.answer("Your cart is empty. 🛒")
-        return
-    
-    # Build cart display with prices
-    cart_text = "🛒 Your Cart:\n\n"
-    total_items = 0
-    total_price = 0
-    
-    for item, qty in cart.items():
-        price = get_item_price(item)
-        item_total = price * qty
-        total_price += item_total
-        cart_text += f"• {qty}x {item} - ₦{price:,} = ₦{item_total:,}\n"
-        total_items += qty
-    
-    cart_text += f"\n📊 Total Items: {total_items}"
-    cart_text += f"\n💰 Total Price: ₦{total_price:,}"
-    
-    # Create keyboard with Confirm and Clear Cart options
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Confirm Order", callback_data="confirm_order")],
-            [InlineKeyboardButton(text="🗑 Clear Cart", callback_data="clear_cart")]
-        ]
-    )
-    await message.answer(cart_text, reply_markup=keyboard)
-
-
-
-# Confirm order - Show payment methods
 @dp.callback_query(F.data == "confirm_order")
 async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
-    user_id = callback_query.from_user.id
-    table_number = user_table_map.get(user_id, "Unknown")
-    cart = user_orders.get(user_id, {})
+    data = await state.get_data()
+    cart = data.get("cart", {})
     
     if not cart:
         await callback_query.message.answer("Your cart is empty. 🛒")
@@ -399,65 +578,235 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
         return
     
     # Calculate total
-    total_price = 0
-    for item, qty in cart.items():
-        price = get_item_price(item)
-        total_price += price * qty
+    total_price = sum(item["price"] * item["qty"] for item in cart.values())
     
-    # Store order details in state for later use
-    await state.update_data(
-        total_price=total_price,
-        cart=cart,
-        table_number=table_number
-    )
+    # Store total in state
+    await state.update_data(total_price=total_price)
     
-    # Show payment method selection
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💵 Pay on Delivery", callback_data="payment_delivery")],
-            [InlineKeyboardButton(text="💰 Cash Payment", callback_data="payment_cash")],
-            [InlineKeyboardButton(text="🏦 Bank Transfer", callback_data="payment_bank")],
-            [InlineKeyboardButton(text="🔙 Back to Cart", callback_data="view_cart")]
-        ]
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💵 Pay on Delivery", callback_data="pay_delivery")],
+        [InlineKeyboardButton(text="💰 Cash Payment", callback_data="pay_cash")],
+        [InlineKeyboardButton(text="🏦 Bank Transfer", callback_data="pay_bank")],
+        [InlineKeyboardButton(text="🔙 Back to Cart", callback_data="view_cart")]
+    ])
     
     await callback_query.message.answer(
-        f"💰 Total Amount: ₦{total_price:,}\n\n"
+        f"💰 Total Amount: ₦{total_price:,.0f}\n\n"
         "Please select your payment method:",
         reply_markup=keyboard
     )
     await callback_query.answer()
 
-# Handle Pay on Delivery
-@dp.callback_query(F.data == "payment_delivery")
-async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.message.answer(
-        "Please have cash or transfer ready on delivery."
-    )
-    await process_order(callback_query, state, "Pay on Delivery")
 
-# Handle Cash Payment
-@dp.callback_query(F.data == "payment_cash")
-async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.message.answer(
-        "Please pay cash when collecting"
-    )
-    await process_order(callback_query, state, "Cash Payment")
-
-# Handle Bank Transfer - Show bank details
-@dp.callback_query(F.data == "payment_bank")
-async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
-    # Get order details from state
+async def create_order_in_db(user_id: int, state: FSMContext, payment_method: str, payment_proof_file_id: str = None):
+    """Create order in database"""
     data = await state.get_data()
-    total_price = data.get('total_price', 0)
+    cart = data.get("cart", {})
+    restaurant_id = data.get("restaurant_id")
+    table_id = data.get("table_id")
+    total_price = data.get("total_price", 0)
     
-    # Set state to wait for payment proof
+    # Get customer name
+    user = await bot.get_chat(user_id)
+    customer_name = user.username or user.first_name or "Unknown"
+    
+    # Create order
+    order_response = supabase.table("orders").insert({
+        "restaurant_id": restaurant_id,
+        "table_id": table_id,
+        "telegram_user_id": user_id,
+        "customer_name": customer_name,
+        "total_amount": str(total_price),
+        "payment_method": payment_method,
+        "payment_status": "pending" if payment_method == "Bank Transfer" else "confirmed",
+        "order_status": "pending"
+    }).execute()
+    
+    if not order_response.data:
+        raise Exception("Failed to create order")
+    
+    order_id = order_response.data[0]["id"]
+    
+    # Create order items
+    order_items = []
+    for menu_item_id, item in cart.items():
+        unit_price = item["price"]
+        quantity = item["qty"]
+        subtotal = unit_price * quantity
+        
+        order_items.append({
+            "order_id": order_id,
+            "menu_item_id": menu_item_id,
+            "quantity": quantity,
+            "unit_price": str(unit_price),
+            "subtotal": str(subtotal)
+        })
+    
+    supabase.table("order_items").insert(order_items).execute()
+    
+    # If bank transfer, create payment record
+    if payment_method == "Bank Transfer" and payment_proof_file_id:
+        supabase.table("payments").insert({
+            "order_id": order_id,
+            "restaurant_id": restaurant_id,
+            "amount": str(total_price),
+            "provider": "Bank Transfer",
+            "status": "pending",
+            "provider_reference": payment_proof_file_id
+        }).execute()
+    
+    return order_id, order_response.data[0]
+
+
+async def send_order_to_kitchen(order_id: str, user_id: int, state: FSMContext, payment_proof_file_id: str = None):
+    """Send order notification to kitchen"""
+    data = await state.get_data()
+    cart = data.get("cart", {})
+    total_price = data.get("total_price", 0)
+    table_number = data.get("table_number", "Unknown")
+    restaurant_name = data.get("restaurant_name", "Restaurant")
+    kitchen_chat_id = data.get("kitchen_chat_id")
+    
+    if not kitchen_chat_id:
+        print("⚠️ No kitchen_chat_id configured for this restaurant")
+        return
+    
+    # Get customer info
+    user = await bot.get_chat(user_id)
+    customer_name = user.username or user.first_name or "Unknown"
+    
+    # Build order message
+    order_text = f"🍽 New Order #{order_id[:8]}\n"
+    order_text += f"🏪 {restaurant_name}\n"
+    order_text += f"📍 Table {table_number}\n\n"
+    
+    for item in cart.values():
+        qty = item["qty"]
+        name = item["name"]
+        price = item["price"]
+        order_text += f"• {qty}x {name} - ₦{price:,.0f}\n"
+    
+    order_text += f"\n💰 Total: ₦{total_price:,.0f}"
+    
+    payment_method = data.get("payment_method", "Unknown")
+    order_text += f"\n💳 Payment: {payment_method}"
+    
+    if payment_method == "Bank Transfer":
+        order_text += "\n⏳ Status: Pending Verification"
+    
+    order_text += f"\n👤 Customer: @{customer_name}" if user.username else f"\n👤 Customer: {customer_name}"
+    
+    # Send to kitchen
+    if payment_proof_file_id:
+        # Bank transfer - with payment proof
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Confirm Payment", callback_data=f"confirm_pay_{order_id}"),
+                InlineKeyboardButton(text="❌ Reject Payment", callback_data=f"reject_pay_{order_id}")
+            ]
+        ])
+        
+        await bot.send_photo(
+            kitchen_chat_id,
+            photo=payment_proof_file_id,
+            caption=order_text,
+            reply_markup=keyboard
+        )
+    else:
+        # Other payment methods
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🍽️ Mark as Ready", callback_data=f"ready_{order_id}")]
+        ])
+        
+        await bot.send_message(
+            kitchen_chat_id,
+            text=order_text,
+            reply_markup=keyboard
+        )
+
+
+@dp.callback_query(F.data == "pay_delivery")
+async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    
+    try:
+        await state.update_data(payment_method="Pay on Delivery")
+        order_id, order = await create_order_in_db(user_id, state, "Pay on Delivery")
+        
+        data = await state.get_data()
+        total_price = data.get("total_price", 0)
+        
+        # Send to kitchen
+        await send_order_to_kitchen(order_id, user_id, state)
+        
+        await callback_query.message.answer(
+            f"✅ Order placed successfully!\n"
+            f"Order ID: #{order_id[:8]}\n"
+            f"💰 Total: ₦{total_price:,.0f}\n"
+            f"💵 Payment Method: Pay on Delivery\n\n"
+            f"Please have cash ready when your order arrives."
+        )
+        
+        # Clear cart
+        await state.update_data(cart={})
+        
+    except Exception as e:
+        print(f"Order error: {e}")
+        await callback_query.message.answer("❌ Failed to place order. Please try again.")
+    
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data == "pay_cash")
+async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    
+    try:
+        await state.update_data(payment_method="Cash Payment")
+        order_id, order = await create_order_in_db(user_id, state, "Cash Payment")
+        
+        data = await state.get_data()
+        total_price = data.get("total_price", 0)
+        
+        # Send to kitchen
+        await send_order_to_kitchen(order_id, user_id, state)
+        
+        await callback_query.message.answer(
+            f"✅ Order placed successfully!\n"
+            f"Order ID: #{order_id[:8]}\n"
+            f"💰 Total: ₦{total_price:,.0f}\n"
+            f"💵 Payment Method: Cash Payment\n\n"
+            f"Please pay cash when collecting your order."
+        )
+        
+        # Clear cart
+        await state.update_data(cart={})
+        
+    except Exception as e:
+        print(f"Order error: {e}")
+        await callback_query.message.answer("❌ Failed to place order. Please try again.")
+    
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data == "pay_bank")
+async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    total_price = data.get("total_price", 0)
+    restaurant_id = data.get("restaurant_id")
+    
+    # Get restaurant bank details (you'll need to add these columns to restaurants table)
+    restaurant = supabase.table("restaurants")\
+        .select("name, phone")\
+        .eq("id", restaurant_id)\
+        .execute()
+    
     await state.set_state(OrderStates.waiting_for_payment_proof)
+    await state.update_data(payment_method="Bank Transfer")
     
-    # Bank details message
     bank_details = (
         f"🏦 <b>Bank Transfer Details</b>\n\n"
-        f"💰 Amount: ₦{total_price:,}\n\n"
+        f"💰 Amount: ₦{total_price:,.0f}\n\n"
         f"<b>Account Details:</b>\n"
         f"Bank: GTBank\n"
         f"Account Number: 0123456789\n"
@@ -470,366 +819,208 @@ async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
 
 
-# Handle payment proof (screenshot)
 @dp.message(OrderStates.waiting_for_payment_proof, F.photo)
 async def receive_payment_proof(message: types.Message, state: FSMContext):
-    # Get the highest resolution photo
     photo = message.photo[-1]
     file_id = photo.file_id
-    
-    # Get order details from state
-    data = await state.get_data()
-    cart = data.get('cart', {})
-    table_number = data.get('table_number', 'Unknown')
-    total_price = data.get('total_price', 0)
-    
     user_id = message.from_user.id
-    user = message.from_user
-    telegram_username = user.username or user.first_name or "Unknown User"
     
-    #generate order_id
-    order_id = f"{user_id}_{int(time.time())}"
-    # Build order text with payment proof
-    order_text = f"🍽 New Order for Table {hbold(table_number)}:\n\n"
-    items_list = []
-    
-    for item, qty in cart.items():
-        price = get_item_price(item)
-        item_total = price * qty
-        
-        items_list.append({
-            "item": item,
-            "qty": qty,
-            "price": price
-        })
-        
-        order_text += f"• {qty}x {item} - ₦{price:,} = ₦{item_total:,}\n"
-        
-        # Insert into database
-        cursor.execute(
-            "INSERT INTO orders (table_number, item, quantity) VALUES (?, ?, ?)", 
-            (table_number, item, qty)
-        )
-    
-    order_text += f"\n💰 {hbold(f'Total: ₦{total_price:,}')}"
-    order_text += f"\n💳 Payment Method: Bank Transfer"
-    order_text += f"\n⏳ Payment Status: Pending Verification"
-    order_text += f"\n👤 Customer: @{telegram_username}" if user.username else f"\n👤 Customer: {telegram_username}"
-    
-    conn.commit()
-    
-    # Prepare webhook payload
-    webhook_payload = {
-        "order_id": order_id,
-        "restaurant": "City Bites Minna",
-        "customer_name": telegram_username,
-        "chat_id": str(user_id),
-        "table_number": table_number,
-        "items": items_list,
-        "total": total_price,
-        "payment_method": "Bank Transfer",
-        "payment_status": "pending",
-        "payment_proof_file_id": file_id
-    }
-    
-    # Send to n8n webhook
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                N8N_WEBHOOK_URL, 
-                json=webhook_payload,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
-                if response.status == 200:
-                    print("✅ Webhook sent successfully")
+        # Create order with payment proof
+        order_id, order = await create_order_in_db(user_id, state, "Bank Transfer", file_id)
+        
+        data = await state.get_data()
+        total_price = data.get("total_price", 0)
+        
+        # Send to kitchen with payment proof
+        await send_order_to_kitchen(order_id, user_id, state, file_id)
+        
+        await message.answer(
+            f"✅ Order placed successfully!\n"
+            f"Order ID: #{order_id[:8]}\n"
+            f"💰 Total: ₦{total_price:,.0f}\n"
+            f"💳 Payment Method: Bank Transfer\n\n"
+            f"Your payment proof has been received and is being verified. "
+            f"You will be notified once confirmed."
+        )
+        
+        # Clear cart and state
+        await state.update_data(cart={})
+        await state.clear()
+        
     except Exception as e:
-        print(f"❌ Error sending webhook: {e}")
-    
-    # CREATE KEYBOARD WITH CONFIRM/REJECT BUTTONS FOR KITCHEN
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Confirm Payment", 
-                    callback_data=f"confirm_payment|{telegram_username}|{order_id}" 
-                ), #used "|" so that i can user username in confirm_payment_handler
-                InlineKeyboardButton(
-                    text="❌ Reject Payment", 
-                    callback_data=f"reject_payment_{user_id}"
-                )
-            ]
-            # Dont include mark as ready here. it shoud appear later
-        ]
-    )
-    
-    # SEND TO KITCHEN WITH PAYMENT PROOF AND BUTTONS
-    await bot.send_photo(
-        KITCHEN_CHAT_ID,
-        photo=file_id,
-        caption=order_text,
-        reply_markup=keyboard  # Add buttons for kitchen staff to confirm/reject
-    )
+        print(f"Order error: {e}")
+        await message.answer("❌ Failed to place order. Please try again.")
 
-    
-    # Clear cart and state
-    user_orders[user_id] = {}
-    await state.clear()
-    
-    # Confirmation to customer
-    await message.answer(
-        f"✅ Your order has been placed successfully!\n"
-        f"💰 Total: ₦{total_price:,}\n"
-        f"💳 Payment Method: Bank Transfer\n\n"
-        f"Your payment proof has been received and is being verified. "
-        f"You will be notified once confirmed."
-    )
 
-    
-# Handle if user sends text instead of photo
 @dp.message(OrderStates.waiting_for_payment_proof)
 async def payment_proof_invalid(message: types.Message):
     await message.answer(
         "⚠️ Please send a screenshot/photo of your payment receipt.\n"
-        "Or type /cancel to cancel the order."
+        "Or type /cancel to cancel."
     )
 
-# Process order for non-bank payment methods
-async def process_order(callback_query: types.CallbackQuery, state: FSMContext, payment_method: str):
-    # Get order details from state
-    data = await state.get_data()
-    cart = data.get('cart', {})
-    table_number = data.get('table_number', 'Unknown')
-    total_price = data.get('total_price', 0)
-    
-    user_id = callback_query.from_user.id
-    user = callback_query.from_user
-    telegram_username = user.username or user.first_name or "Unknown User"
-    
-    # Determine payment status based on method
-    if payment_method == "Bank Transfer":
-        payment_status = "pending"  # Needs proof verification
-    elif payment_method == "Pay on Delivery":
-        payment_status = "pending"  # Will pay when food arrives
-    elif payment_method == "Cash Payment":
-        payment_status = "confirmed"  # Assuming they paid at counter
-    else:
-        payment_status = "pending"
-    
-    # Build order text
-    order_text = f"🍽 New Order for Table {hbold(table_number)}:\n\n"
-    items_list = []
-    
-    for item, qty in cart.items():
-        price = get_item_price(item)
-        item_total = price * qty
-        
-        items_list.append({
-            "item": item,
-            "qty": qty,
-            "price": price
-        })
-        
-        order_text += f"• {qty}x {item} - ₦{price:,} = ₦{item_total:,}\n"
-        
-        # Insert into database
-        cursor.execute(
-            "INSERT INTO orders (table_number, item, quantity) VALUES (?, ?, ?)", 
-            (table_number, item, qty)
-        )
-    
-    order_text += f"\n💰 {hbold(f'Total: ₦{total_price:,}')}"
-    order_text += f"\n💳 Payment Method: {payment_method}"
-    
-    # Add payment status indicator
-    if payment_status == "pending":
-        order_text += f"\n⏳ Payment Status: Pending"
-    else:
-        order_text += f"\n✅ Payment Status: Confirmed"
-    
-    conn.commit()
-    
-    # Prepare webhook payload
-    webhook_payload = {
-        "restaurant": "City Bites Minna",
-        "customer_name": telegram_username,
-        "chat_id": str(user_id),
-        "table_number": table_number,
-        "items": items_list,
-        "total": total_price,
-        "payment_method": payment_method,
-        "payment_status": payment_status  # Add status here
-    }
-    
-    # Send to n8n webhook
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                N8N_WEBHOOK_URL, 
-                json=webhook_payload,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
-                if response.status == 200:
-                    print("✅ Webhook sent successfully")
-    except Exception as e:
-        print(f"❌ Error sending webhook: {e}")
-    
-    # Send to kitchen
-    await bot.send_message(KITCHEN_CHAT_ID, order_text)
 
+# ========== KITCHEN CALLBACKS ==========
 
-
-
-    
-    # Clear cart and state
-    user_orders[user_id] = {}
-    await state.clear()
-    
-    # Confirmation message
-    await callback_query.message.answer(
-        f"✅ Your order has been placed successfully!\n"
-        f"💰 Total: ₦{total_price:,}\n"
-        f"💳 Payment Method: {payment_method}"
-    )
-    await callback_query.answer("Order sent to kitchen! 🍳")
-
-
-@dp.callback_query(F.data.startswith("confirm_payment|"))
+@dp.callback_query(F.data.startswith("confirm_pay_"))
 async def confirm_payment_handler(callback_query: types.CallbackQuery):
-    # Parse callback data
-    # parts = callback_query.data.split("_")    
-    _ ,telegram_username, order_id = callback_query.data.split("|") 
-    user_id = order_id.split("_")[0]
-    print(user_id)
-    print(f"order ID: {order_id}")
-    user_id = int(user_id)
-
+    order_id = callback_query.data.replace("confirm_pay_", "")
     
-     # 🔔 SEND UPDATE TO n8n
-    async with aiohttp.ClientSession() as session:
-        await session.post(
-            N8N_UPDATE_WEBHOOK_URL,
-            json={
-                "event": "payment_confirmed",
-                "chat_id": str(user_id),
-                "customer": telegram_username,
-                "payment_status": "confirmed",
-                "order_id": str(order_id)
-            }
-        )
-
-    # Notify customer that payment is confirmed
-    try:
-        await bot.send_message(
-            user_id,
-            "✅ Your payment has been verified!\n"
-            "Your order is now being prepared. 🍳"
-        )
-    except Exception as e:
-        print(f"Failed to notify customer {user_id}: {e}")
+    # Update payment status in payments table
+    supabase.table("payments")\
+        .update({"status": "confirmed"})\
+        .eq("order_id", order_id)\
+        .execute()
     
-   # Create new keyboard with ONLY "Mark as Ready" button
-    ready_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🍽️ Mark as Ready",
-                    callback_data=f"ready|{telegram_username}|{user_id}"
+    # Update order payment status
+    supabase.table("orders")\
+        .update({"payment_status": "confirmed"})\
+        .eq("id", order_id)\
+        .execute()
+    
+    # Get order details
+    order = supabase.table("orders")\
+        .select("telegram_user_id, customer_name")\
+        .eq("id", order_id)\
+        .execute()
+    
+    if order.data:
+        user_id = order.data[0]["telegram_user_id"]
+        customer_name = order.data[0]["customer_name"]
+        
+        try:
+            await bot.send_message(
+                user_id,
+                f"✅ Your payment has been verified!\n"
+                f"Order #{order_id[:8]} is now being prepared. 🍳"
+            )
+        except Exception as e:
+            print(f"Failed to notify customer: {e}")
+    
+        # Send webhook notification
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(
+                    N8N_UPDATE_WEBHOOK_URL,
+                    json={
+                        "event": "payment_confirmed",
+                        "chat_id": str(user_id),
+                        "customer": customer_name,
+                        "payment_status": "confirmed",
+                        "order_id": str(order_id)
+                    }
                 )
-            ]
-        ]
-    )
-
-    # Update the kitchen message - replace buttons and update caption
+        except Exception as e:
+            print(f"Webhook error: {e}")
+    
+    # Update kitchen message
+    ready_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍽️ Mark as Ready", callback_data=f"ready_{order_id}")]
+    ])
+    
     await callback_query.message.edit_caption(
         caption=callback_query.message.caption + "\n\n✅ PAYMENT CONFIRMED ✅",
-        reply_markup=ready_keyboard  # Now only shows "Mark as Ready"
+        reply_markup=ready_keyboard
     )
+    
+    await callback_query.answer("✅ Payment confirmed!")
 
-    await callback_query.answer("✅ Payment confirmed! Kitchen can now mark as ready.")
 
-
-@dp.callback_query(F.data.startswith("reject_payment_"))
+@dp.callback_query(F.data.startswith("reject_pay_"))
 async def reject_payment_handler(callback_query: types.CallbackQuery):
-    user_id = int(callback_query.data.split("_")[2])
+    order_id = callback_query.data.replace("reject_pay_", "")
     
-    # Notify customer that payment was rejected
-    try:
-        await bot.send_message(
-            user_id,
-            "❌ Your payment could not be verified.\n"
-            "Please contact us or submit a new payment proof."
-        )
-    except Exception as e:
-        print(f"Failed to notify customer {user_id}: {e}")
+    # Update payment status
+    supabase.table("payments")\
+        .update({"status": "rejected"})\
+        .eq("order_id", order_id)\
+        .execute()
     
-    # Update the kitchen message - NO BUTTONS (payment rejected)
+    # Update order payment status
+    supabase.table("orders")\
+        .update({"payment_status": "rejected"})\
+        .eq("id", order_id)\
+        .execute()
+    
+    # Get order details
+    order = supabase.table("orders")\
+        .select("telegram_user_id")\
+        .eq("id", order_id)\
+        .execute()
+    
+    if order.data:
+        user_id = order.data[0]["telegram_user_id"]
+        
+        try:
+            await bot.send_message(
+                user_id,
+                f"❌ Your payment for Order #{order_id[:8]} could not be verified.\n"
+                f"Please contact us or submit a new payment proof."
+            )
+        except Exception as e:
+            print(f"Failed to notify customer: {e}")
+    
     await callback_query.message.edit_caption(
         caption=callback_query.message.caption + "\n\n❌ PAYMENT REJECTED ❌",
-        reply_markup=None  # Remove all buttons
+        reply_markup=None
     )
     
-    await callback_query.answer("❌ Payment rejected and customer notified!")
+    await callback_query.answer("❌ Payment rejected!")
 
 
-
+@router.callback_query(F.data.startswith("ready_"))
+async def handle_ready(callback_query: CallbackQuery):
+    order_id = callback_query.data.replace("ready_", "")
+    
+    # Update order status
+    supabase.table("orders")\
+        .update({"order_status": "ready"})\
+        .eq("id", order_id)\
+        .execute()
+    
+    # Get order details
+    order = supabase.table("orders")\
+        .select("telegram_user_id, customer_name")\
+        .eq("id", order_id)\
+        .execute()
+    
+    if order.data:
+        user_id = order.data[0]["telegram_user_id"]
+        customer_name = order.data[0]["customer_name"]
+        
+        await bot.send_message(
+            user_id,
+            f"✅ Hi {customer_name}, your order #{order_id[:8]} is ready! Please come pick it up."
+        )
+    
+    # Update kitchen message
+    if callback_query.message.photo:
+        await callback_query.message.edit_caption(
+            caption=f"{callback_query.message.caption}\n\n🍽️ Order marked as ready. Customer notified.",
+            reply_markup=None
+        )
+    else:
+        await callback_query.message.edit_text(
+            text=f"{callback_query.message.text}\n\n🍽️ Order marked as ready. Customer notified.",
+            reply_markup=None
+        )
+    
+    await callback_query.answer("Done!")
 
 
 @dp.message(Command("cancel"))
 async def cancel_order(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("❌ Order cancelled. Use /start or rescan qr code to begin a new order.")
-
-# Optional: Clear cart handler
-@dp.callback_query(F.data == "clear_cart")
-async def clear_cart(callback_query: types.CallbackQuery, state: FSMContext):
-    user_id = callback_query.from_user.id
-    user_orders[user_id] = {}
-    await state.clear()
-    
-    await callback_query.message.answer("🗑 Your cart has been cleared.")
-    await callback_query.answer()
+    await message.answer("❌ Session cancelled. Scan QR code to start a new order.")
 
 
-@router.callback_query(F.data.startswith("ready|"))
-async def handle_ready(callback_query: CallbackQuery):
-    # Answer immediately so the button doesn't hang
-    await callback_query.answer("Done!")
-    
-    print (f"Call data: {callback_query.data}")
+# For production with FastAPI/webhook
+# Don't use polling
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
 
-    # Parse the callback_data
-    _, customer, client_chat_id = callback_query.data.split("|")
-    print(customer)
-    # Notify the client
-    await callback_query.bot.send_message(
-        chat_id=int(client_chat_id),
-        text=f"✅ Hi *{customer}*, your order is ready! Please come pick it up.",
-        parse_mode="Markdown"
-    )
-
-    # Check if message has photo or text
-    if callback_query.message.photo:
-        # For bank transfer orders (messages with photos)
-        await callback_query.message.edit_caption(
-            caption=f"{callback_query.message.caption}\n\n🍽️ *{customer}* — marked as ready. Client has been notified.",
-            parse_mode="Markdown",
-            reply_markup=None  # Remove the button
-        )
-    else:
-        # For other payment methods (text-only messages)
-        await callback_query.message.edit_text(
-            text=f"{callback_query.message.text}\n\n🍽️ *{customer}* — marked as ready. Client has been notified.",
-            parse_mode="Markdown",
-            reply_markup=None  # Remove the button
-        )
-
-
-## Not using  polling for deployment. using fastapi webservice
-# so i will disable this part      
-#async def main():
- #   logging.basicConfig(level=logging.INFO)
-  #  await bot.delete_webhook(drop_pending_updates=True)
-   # await dp.start_polling(bot)
-
-#if __name__ == "__main__":
- #   asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

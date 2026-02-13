@@ -12,3 +12,5 @@ venv/
 ENV/
 env/
 .poetry/
+botai.py
+boted.py
