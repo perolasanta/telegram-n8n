@@ -16,8 +16,19 @@ from decimal import Decimal
 from dotenv import load_dotenv
 import base64
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from reports import generate_daily_report, generate_weekly_report
+from receipt_generator import generate_receipt_pdf
+from aiogram.types import FSInputFile
+import pytz
+from datetime import datetime, timedelta
+
 router = Router()
 load_dotenv()
+
+# Initialize scheduler
+scheduler = AsyncIOScheduler(timezone=pytz.timezone('Africa/Lagos'))
 
 # Environment variables
 TOKEN = os.getenv("TOKEN")
@@ -70,6 +81,126 @@ async def get_cart_summary(user_id: int, restaurant_id: str):
     # This is stored in FSM state, not DB
     # We'll manage cart in memory via state since it's temporary
     return {}
+
+async def send_receipt_to_customer(user_id: int, order_id: str):
+    """Generate and send PDF receipt to customer"""
+    try:
+        # Get order details
+        order = supabase.table("orders")\
+            .select("*, order_items(*, menu_items(name, price)), restaurant_tables(table_number), restaurants(name, phone)")\
+            .eq("id", order_id)\
+            .execute()
+        
+        if not order.data:
+            return
+        
+        order_data = order.data[0]
+        
+        # Prepare receipt data
+        items = []
+        for item in order_data["order_items"]:
+            items.append({
+                'name': item["menu_items"]["name"],
+                'qty': item["quantity"],
+                'price': float(item["unit_price"]),
+                'total': float(item["subtotal"])
+            })
+        
+        receipt_data = {
+            'order_id': order_id,
+            'restaurant_name': order_data["restaurants"]["name"],
+            'restaurant_phone': order_data["restaurants"].get("phone", ""),
+            'table_number': order_data["restaurant_tables"]["table_number"],
+            'customer_name': order_data["customer_name"],
+            'created_at': datetime.fromisoformat(order_data["created_at"].replace('Z', '+00:00')),
+            'items': items,
+            'subtotal': float(order_data["total_amount"]),
+            'tax': 0,
+            'total': float(order_data["total_amount"]),
+            'payment_method': order_data["payment_method"],
+            'payment_status': order_data["payment_status"]
+        }
+        
+        # Generate PDF
+        pdf_path = await generate_receipt_pdf(receipt_data)
+        
+        # Send to customer
+        receipt_file = FSInputFile(pdf_path)
+        await bot.send_document(
+            user_id,
+            receipt_file,
+            caption=f"📄 Receipt for Order #{order_id[:8]}\n\nThank you for your order!"
+        )
+        
+        # Clean up
+        os.remove(pdf_path)
+        
+        logging.info(f"Receipt sent to user {user_id} for order {order_id}")
+        
+    except Exception as e:
+        logging.error(f"Failed to send receipt: {e}")
+
+# ========== SCHEDULED REPORTS ==========
+
+async def send_daily_reports():
+    """Send daily reports to all restaurant managers"""
+    try:
+        restaurants = supabase.table("restaurants")\
+            .select("id, name, manager_telegram_id, manager_name")\
+            .eq("subscription_status", "active")\
+            .not_.is_("manager_telegram_id", "null")\
+            .execute()
+        
+        for restaurant in restaurants.data:
+            manager_id = restaurant.get("manager_telegram_id")
+            if not manager_id:
+                continue
+            
+            report = await generate_daily_report(supabase, restaurant["id"])
+            
+            try:
+                await bot.send_message(
+                    manager_id,
+                    report,
+                    parse_mode="Markdown"
+                )
+                logging.info(f"Daily report sent to manager of {restaurant['name']}")
+            except Exception as e:
+                logging.error(f"Failed to send daily report to manager of {restaurant['name']}: {e}")
+                
+    except Exception as e:
+        logging.error(f"Error in send_daily_reports: {e}")
+
+
+async def send_weekly_reports():
+    """Send weekly reports to all restaurant managers"""
+    try:
+        restaurants = supabase.table("restaurants")\
+            .select("id, name, manager_telegram_id, manager_name")\
+            .eq("subscription_status", "active")\
+            .not_.is_("manager_telegram_id", "null")\
+            .execute()
+        
+        for restaurant in restaurants.data:
+            manager_id = restaurant.get("manager_telegram_id")
+            if not manager_id:
+                continue
+            
+            report = await generate_weekly_report(supabase, restaurant["id"])
+            
+            try:
+                await bot.send_message(
+                    manager_id,
+                    report,
+                    parse_mode="Markdown"
+                )
+                logging.info(f"Weekly report sent to manager of {restaurant['name']}")
+            except Exception as e:
+                logging.error(f"Failed to send weekly report to manager of {restaurant['name']}: {e}")
+                
+    except Exception as e:
+        logging.error(f"Error in send_weekly_reports: {e}")
+
 
 
 
@@ -725,26 +856,36 @@ async def send_order_to_kitchen(order_id: str, user_id: int, state: FSMContext, 
         )
 
 
+# ========== ORDER CONFIRMATION & PAYMENT ==========
+# ====== PAYMENT HANDLERS SECTION ======
+
 @dp.callback_query(F.data == "pay_delivery")
 async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContext):
+    """Handle Pay on Delivery payment method"""
     user_id = callback_query.from_user.id
     
     try:
         await state.update_data(payment_method="Pay on Delivery")
+        
+        # CREATE ORDER IN DATABASE
         order_id, order = await create_order_in_db(user_id, state, "Pay on Delivery")
+        
+        # SEND TO KITCHEN
+        await send_order_to_kitchen(order_id, user_id, state)
+        
+        # SEND RECEIPT TO CUSTOMER
+        await send_receipt_to_customer(user_id, order_id)
         
         data = await state.get_data()
         total_price = data.get("total_price", 0)
-        
-        # Send to kitchen
-        await send_order_to_kitchen(order_id, user_id, state)
         
         await callback_query.message.answer(
             f"✅ Order placed successfully!\n"
             f"Order ID: #{order_id[:8]}\n"
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💵 Payment Method: Pay on Delivery\n\n"
-            f"Please have cash ready when your order arrives."
+            f"Please have cash ready when your order arrives.\n"
+            f"📄 Receipt has been sent to you."
         )
         
         # Clear cart
@@ -759,24 +900,31 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
 
 @dp.callback_query(F.data == "pay_cash")
 async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
+    """Handle Cash Payment method"""
     user_id = callback_query.from_user.id
     
     try:
         await state.update_data(payment_method="Cash Payment")
+        
+        # CREATE ORDER IN DATABASE
         order_id, order = await create_order_in_db(user_id, state, "Cash Payment")
+        
+        # SEND TO KITCHEN
+        await send_order_to_kitchen(order_id, user_id, state)
+        
+        # SEND RECEIPT TO CUSTOMER
+        await send_receipt_to_customer(user_id, order_id)
         
         data = await state.get_data()
         total_price = data.get("total_price", 0)
-        
-        # Send to kitchen
-        await send_order_to_kitchen(order_id, user_id, state)
         
         await callback_query.message.answer(
             f"✅ Order placed successfully!\n"
             f"Order ID: #{order_id[:8]}\n"
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💵 Payment Method: Cash Payment\n\n"
-            f"Please pay cash when collecting your order."
+            f"Please pay cash when collecting your order.\n"
+            f"📄 Receipt has been sent to you."
         )
         
         # Clear cart
@@ -791,11 +939,12 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "pay_bank")
 async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
+    """Handle Bank Transfer - Show bank details first"""
     data = await state.get_data()
     total_price = data.get("total_price", 0)
     restaurant_id = data.get("restaurant_id")
     
-    # Get restaurant bank details (you'll need to add these columns to restaurants table)
+    # Get restaurant bank details
     restaurant = supabase.table("restaurants")\
         .select("name, phone")\
         .eq("id", restaurant_id)\
@@ -810,7 +959,7 @@ async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
         f"<b>Account Details:</b>\n"
         f"Bank: GTBank\n"
         f"Account Number: 0123456789\n"
-        f"Account Name: City Bites Minna\n\n"
+        f"Account Name: Demo Restaurant\n\n"
         f"📸 After making the transfer, please send a screenshot "
         f"of your payment receipt."
     )
@@ -821,18 +970,19 @@ async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
 
 @dp.message(OrderStates.waiting_for_payment_proof, F.photo)
 async def receive_payment_proof(message: types.Message, state: FSMContext):
+    """Handle payment proof screenshot for bank transfer"""
     photo = message.photo[-1]
     file_id = photo.file_id
     user_id = message.from_user.id
     
     try:
-        # Create order with payment proof
+        # CREATE ORDER with payment proof
         order_id, order = await create_order_in_db(user_id, state, "Bank Transfer", file_id)
         
         data = await state.get_data()
         total_price = data.get("total_price", 0)
         
-        # Send to kitchen with payment proof
+        # SEND TO KITCHEN with payment proof
         await send_order_to_kitchen(order_id, user_id, state, file_id)
         
         await message.answer(
@@ -841,7 +991,8 @@ async def receive_payment_proof(message: types.Message, state: FSMContext):
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💳 Payment Method: Bank Transfer\n\n"
             f"Your payment proof has been received and is being verified. "
-            f"You will be notified once confirmed."
+            f"You will be notified once confirmed.\n"
+            f"📄 Receipt will be sent after payment confirmation."
         )
         
         # Clear cart and state
@@ -855,6 +1006,7 @@ async def receive_payment_proof(message: types.Message, state: FSMContext):
 
 @dp.message(OrderStates.waiting_for_payment_proof)
 async def payment_proof_invalid(message: types.Message):
+    """Handle invalid payment proof"""
     await message.answer(
         "⚠️ Please send a screenshot/photo of your payment receipt.\n"
         "Or type /cancel to cancel."
@@ -865,6 +1017,7 @@ async def payment_proof_invalid(message: types.Message):
 
 @dp.callback_query(F.data.startswith("confirm_pay_"))
 async def confirm_payment_handler(callback_query: types.CallbackQuery):
+    """Kitchen confirms payment for bank transfer"""
     order_id = callback_query.data.replace("confirm_pay_", "")
     
     # Update payment status in payments table
@@ -895,24 +1048,12 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
                 f"✅ Your payment has been verified!\n"
                 f"Order #{order_id[:8]} is now being prepared. 🍳"
             )
+            
+            # NOW SEND RECEIPT after payment confirmed
+            await send_receipt_to_customer(user_id, order_id)
+            
         except Exception as e:
             print(f"Failed to notify customer: {e}")
-    
-        # Send webhook notification
-        try:
-            async with aiohttp.ClientSession() as session:
-                await session.post(
-                    N8N_UPDATE_WEBHOOK_URL,
-                    json={
-                        "event": "payment_confirmed",
-                        "chat_id": str(user_id),
-                        "customer": customer_name,
-                        "payment_status": "confirmed",
-                        "order_id": str(order_id)
-                    }
-                )
-        except Exception as e:
-            print(f"Webhook error: {e}")
     
     # Update kitchen message
     ready_keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -929,6 +1070,7 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("reject_pay_"))
 async def reject_payment_handler(callback_query: types.CallbackQuery):
+    """Kitchen rejects payment"""
     order_id = callback_query.data.replace("reject_pay_", "")
     
     # Update payment status
@@ -971,6 +1113,7 @@ async def reject_payment_handler(callback_query: types.CallbackQuery):
 
 @router.callback_query(F.data.startswith("ready_"))
 async def handle_ready(callback_query: CallbackQuery):
+    """Kitchen marks order as ready"""
     order_id = callback_query.data.replace("ready_", "")
     
     # Update order status
@@ -1008,19 +1151,185 @@ async def handle_ready(callback_query: CallbackQuery):
     
     await callback_query.answer("Done!")
 
-
 @dp.message(Command("cancel"))
 async def cancel_order(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Session cancelled. Scan QR code to start a new order.")
 
+# ==================== SEND REPORTS ===========================
+
+# Manual report commands for managers
+@dp.message(Command("daily_report"))
+async def manual_daily_report(message: types.Message):
+    """Manually request daily report (managers only)"""
+    # Get restaurant by manager_telegram_id
+    restaurant = supabase.table("restaurants")\
+        .select("id, name")\
+        .eq("manager_telegram_id", message.from_user.id)\
+        .execute()
+    
+    if not restaurant.data:
+        await message.answer("⚠️ You are not registered as a restaurant manager.")
+        return
+    
+    await message.answer("📊 Generating daily report...")
+    report = await generate_daily_report(supabase, restaurant.data[0]["id"])
+    await message.answer(report, parse_mode="Markdown")
+
+
+@dp.message(Command("weekly_report"))
+async def manual_weekly_report(message: types.Message):
+    """Manually request weekly report (managers only)"""
+    restaurant = supabase.table("restaurants")\
+        .select("id, name")\
+        .eq("manager_telegram_id", message.from_user.id)\
+        .execute()
+    
+    if not restaurant.data:
+        await message.answer("⚠️ You are not registered as a restaurant manager.")
+        return
+    
+    await message.answer("📊 Generating weekly report...")
+    report = await generate_weekly_report(supabase, restaurant.data[0]["id"])
+    await message.answer(report, parse_mode="Markdown")
+
+
+# Optional: Monthly report
+@dp.message(Command("monthly_report"))
+async def manual_monthly_report(message: types.Message):
+    """Manually request monthly report (managers only)"""
+    restaurant = supabase.table("restaurants")\
+        .select("id, name")\
+        .eq("manager_telegram_id", message.from_user.id)\
+        .execute()
+    
+    if not restaurant.data:
+        await message.answer("⚠️ You are not registered as a restaurant manager.")
+        return
+    
+    await message.answer("📊 Generating monthly report...")
+    
+    # Get last 30 days
+    from datetime import datetime, timedelta
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=30)
+    
+    # You can create a similar function in reports.py
+    # For now, let's use weekly report logic
+    report = await generate_weekly_report(supabase, restaurant.data[0]["id"], end_date)
+    report = report.replace("Weekly Report", "Monthly Report (Last 30 Days)")
+    
+    await message.answer(report, parse_mode="Markdown")
+
+@dp.message(Command("register_manager"))
+async def register_manager(message: types.Message):
+    """Register as a restaurant manager"""
+    
+    # Check if user is already registered
+    existing = supabase.table("restaurants")\
+        .select("id, name")\
+        .eq("manager_telegram_id", message.from_user.id)\
+        .execute()
+    
+    if existing.data:
+        await message.answer(
+            f"✅ You are already registered as manager of:\n"
+            f"• {existing.data[0]['name']}\n\n"
+            f"Available commands:\n"
+            f"/daily_report - Get today's sales report\n"
+            f"/weekly_report - Get this week's report\n"
+            f"/monthly_report - Get last 30 days report"
+        )
+        return
+    
+    await message.answer(
+        "⚠️ You are not registered as a manager.\n\n"
+        "To register, please ask your system administrator to update your restaurant record with your Telegram ID:\n"
+        f"Your Telegram ID: `{message.from_user.id}`\n"
+        f"Your Username: @{message.from_user.username or 'Not set'}",
+        parse_mode="Markdown"
+    )
+
+
+# Admin command to set manager (optional)
+@dp.message(Command("set_manager"))
+async def set_manager(message: types.Message):
+    """Set manager for a restaurant (admin only)"""
+    
+    # You can add admin check here
+    # For now, anyone can use it (you should restrict this)
+    
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer(
+            "Usage: /set_manager <restaurant_id> <telegram_id>\n\n"
+            "Example: /set_manager abc123 987654321"
+        )
+        return
+    
+    restaurant_id = args[1]
+    manager_telegram_id = args[2]
+    
+    try:
+        # Update restaurant
+        result = supabase.table("restaurants")\
+            .update({
+                "manager_telegram_id": int(manager_telegram_id),
+                "manager_name": f"Manager {manager_telegram_id}"
+            })\
+            .eq("id", restaurant_id)\
+            .execute()
+        
+        if result.data:
+            await message.answer(
+                f"✅ Manager set successfully!\n"
+                f"Restaurant: {result.data[0]['name']}\n"
+                f"Manager Telegram ID: {manager_telegram_id}"
+            )
+        else:
+            await message.answer("❌ Restaurant not found.")
+            
+    except Exception as e:
+        await message.answer(f"❌ Error: {e}")
+
+
 
 # For production with FastAPI/webhook
 # Don't use polling
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+#async def main():
+#    logging.basicConfig(
+#        level=logging.INFO,
+#        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+#    )
+#    
+#    # Schedule reports
+#    # Daily report at 11:59 PM (sent to managers)
+#    scheduler.add_job(
+##        CronTrigger(hour=23, minute=59, timezone=pytz.timezone('Africa/Lagos')),
+ #       id='daily_reports'
+ #   )
+ #   
+ #   # Weekly report every Monday at 9:00 AM (sent to managers)
+ #   scheduler.add_job(
+ #       send_weekly_reports,
+ ##       CronTrigger(day_of_week='mon', hour=9, minute=0, timezone=pytz.timezone('Africa/Lagos')),
+  #      id='weekly_reports'
+  #  )
+    
+ #   # Start scheduler
+ #   scheduler.start()
+  #  logging.info("✅ Scheduler started")
+ #   logging.info("📊 Daily reports: Every day at 11:59 PM → Managers")
+ #   logging.info("📊 Weekly reports: Every Monday at 9:00 AM → Managers")
+    
+ #   # Delete webhook if exists
+ #   await bot.delete_webhook(drop_pending_updates=True)
+    
+ #   logging.info("🤖 Starting bot...")
+    
+ #   # Start polling
+ #   await dp.start_polling(bot)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+
+# if __name__ == "__main__":
+ #   asyncio.run(main())
