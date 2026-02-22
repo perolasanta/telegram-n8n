@@ -1784,43 +1784,42 @@ async def kitchen_back_to_categories(callback_query: types.CallbackQuery):
     )
     await callback_query.answer()
 
-# For production with FastAPI/webhook
-# Don't use polling
-async def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Schedule reports
-    # Daily report at 11:59 PM (sent to managers)
-    scheduler.add_job(
-        send_daily_reports,
-        CronTrigger(hour=23, minute=59, timezone=pytz.timezone('Africa/Lagos')),
-        id='daily_reports'
-    )
-    
-    # Weekly report every Monday at 9:00 AM (sent to managers)
-    scheduler.add_job(
-        send_weekly_reports,
-        CronTrigger(day_of_week='mon', hour=9, minute=0, timezone=pytz.timezone('Africa/Lagos')),
-        id='weekly_reports'
-    )
-    
-    # Start scheduler
-    scheduler.start()
-    logging.info("✅ Scheduler started")
-    logging.info("📊 Daily reports: Every day at 11:59 PM → Managers")
-    logging.info("📊 Weekly reports: Every Monday at 9:00 AM → Managers")
-    
-    # Delete webhook if exists
-    await bot.delete_webhook(drop_pending_updates=True)
-    
-    logging.info("🤖 Starting bot...")
-    
-   # Start polling
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
+## For production with FastAPI/webhook
+## Don't use polling
+#async def main():
+#    logging.basicConfig(
+#        level=logging.INFO,
+#        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+#    )
+#    
+#    # Schedule reports
+#    # Daily report at 11:59 PM (sent to managers)
+#    scheduler.add_job(
+#        send_daily_reports,
+#        CronTrigger(hour=23, minute=59, timezone=pytz.timezone('Africa/Lagos')),
+#        id='daily_reports'
+#    )
+#    
+#   # Weekly report every Monday at 9:00 AM (sent to managers)
+#    scheduler.add_job(
+#        send_weekly_reports,
+ #       CronTrigger(day_of_week='mon', hour=9, minute=0, timezone=pytz.timezone('Africa/Lagos')),
+ #       id='weekly_reports'
+ #   )
+ #   
+#    # Start scheduler
+#    scheduler.start()
+#    logging.info("✅ Scheduler started")
+#    logging.info("📊 Daily reports: Every day at 11:59 PM → Managers")
+#    logging.info("📊 Weekly reports: Every Monday at 9:00 AM → Managers")
+#    
+#    # Delete webhook if exists
+#    await bot.delete_webhook(drop_pending_updates=True)
+#    
+#    logging.info("🤖 Starting bot...")
+#    
+#   # Start polling
+ #   await dp.start_polling(bot)
+#
+#if __name__ == "__main__":
     asyncio.run(main())
