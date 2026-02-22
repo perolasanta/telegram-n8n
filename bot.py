@@ -140,6 +140,59 @@ async def send_receipt_to_customer(user_id: int, order_id: str):
     except Exception as e:
         logging.error(f"Failed to send receipt: {e}")
 
+
+async def load_pending_reorder(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pending_cart = data.get("pending_reorder_cart")
+    pending_restaurant = data.get("pending_reorder_restaurant_id")
+    active_restaurant = data.get("restaurant_id")
+    table_number = data.get("table_number")  # None means external
+
+    if not pending_cart or pending_restaurant != active_restaurant:
+        return False
+
+    # Load the cart first
+    await state.update_data(
+        cart=pending_cart,
+        pending_reorder_cart=None,
+        pending_reorder_restaurant_id=None
+    )
+
+    cart_text = "🔄 Your saved reorder has been loaded!\n\n"
+    total = 0
+    for item in pending_cart.values():
+        item_total = item["price"] * item["qty"]
+        cart_text += f"• {item['qty']}x {item['name']} — ₦{item_total:,.0f}\n"
+        total += item_total
+    cart_text += f"\n💰 Total: ₦{total:,.0f}"
+
+    await message.answer(cart_text)
+
+    # If external table, still ask delivery or pickup before proceeding
+    if table_number is None or table_number == "EXTERNAL":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚗 Delivery", callback_data="order_type_delivery")],
+            [InlineKeyboardButton(text="🏃 Pickup", callback_data="order_type_pickup")]
+        ])
+        await message.answer(
+            "How would you like to receive your order?",
+            reply_markup=keyboard
+        )
+        return True  # stop here, let them pick delivery/pickup first
+
+    # Dine-in — go straight to cart confirmation
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Confirm Order", callback_data="confirm_order")],
+        [InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart")],
+        [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")]
+    ])
+    await message.answer(
+        "What would you like to do?",
+        reply_markup=keyboard
+    )
+    return True
+
+
 # ========== SCHEDULED REPORTS ==========
 
 async def send_daily_reports():
@@ -208,6 +261,7 @@ async def send_weekly_reports():
 @dp.message(CommandStart())
 async def start(message: types.Message, state: FSMContext):
     args = message.text.split()
+    user_id = message.from_user.id
     
     print("="*50)
     print(f"RAW MESSAGE: '{message.text}'")
@@ -247,6 +301,24 @@ async def start(message: types.Message, state: FSMContext):
         restaurant_id = table_data["restaurant_id"]
         restaurant_name = restaurant_data["name"]
         kitchen_chat_id = restaurant_data["kitchen_chat_id"]
+
+            # Check if first-time user
+        user_history = supabase.table("orders")\
+            .select("id")\
+            .eq("telegram_user_id", user_id)\
+            .limit(1)\
+            .execute()
+        
+        if not user_history.data:
+            # Send welcome message with tips
+            await message.answer(
+                "👋 Welcome! Here's how to order:\n\n"
+                "1️⃣ Browse menu categories\n"
+                "2️⃣ Add items to cart 🛒\n"
+                "3️⃣ Confirm & pay\n"
+                "4️⃣ Wait for notification when ready!\n\n"
+                "💡 Tip: You can /cancel anytime"
+            )
         
         # Check if this is external order (table_number is NULL or 'EXTERNAL')
         if table_number is None or table_number == 'EXTERNAL':
@@ -265,6 +337,8 @@ async def start(message: types.Message, state: FSMContext):
         await message.answer("Invalid QR code. Please try again.")
 
 
+    
+
 async def handle_dine_in_order(message: types.Message, state: FSMContext, restaurant_id: str, restaurant_name: str, kitchen_chat_id: int, table_id: str, table_number: str):
     """Handle dine-in order"""
     
@@ -279,6 +353,10 @@ async def handle_dine_in_order(message: types.Message, state: FSMContext, restau
         cart={}
     )
     
+    if await load_pending_reorder(message, state):
+        return  # reorder loaded, skip normal menu display
+
+
     # Get categories
     categories = await get_categories(restaurant_id)
     
@@ -316,6 +394,9 @@ async def handle_external_order(message: types.Message, state: FSMContext, resta
         table_number=None,
         cart={}
     )
+
+    if await load_pending_reorder(message, state):
+        return
     
     # Ask order type
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -328,6 +409,8 @@ async def handle_external_order(message: types.Message, state: FSMContext, resta
         f"How would you like to receive your order?",
         reply_markup=keyboard
     )
+
+
 
 
 @dp.callback_query(F.data == "order_type_delivery")
@@ -430,7 +513,7 @@ async def go_to_main_menu(callback_query: types.CallbackQuery, state: FSMContext
             text=category["name"],
             callback_data=f"cat_{category['id']}"
         ))
-    keyboard.adjust(2)
+    keyboard.adjust(3)
     keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
     
     await callback_query.message.answer(
@@ -641,7 +724,7 @@ async def handle_custom_quantity(message: types.Message, state: FSMContext):
             text=category["name"],
             callback_data=f"cat_{category['id']}"
         ))
-    keyboard.adjust(2)
+    keyboard.adjust(3)
     keyboard.row(InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart"))
     
     await message.answer(
@@ -710,16 +793,20 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
     
     # Calculate total
     total_price = sum(item["price"] * item["qty"] for item in cart.values())
+    order_type = data.get("order_type", "dine_in")
     
     # Store total in state
     await state.update_data(total_price=total_price)
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💵 Pay on Delivery", callback_data="pay_delivery")],
-        [InlineKeyboardButton(text="💰 Cash Payment", callback_data="pay_cash")],
-        [InlineKeyboardButton(text="🏦 Bank Transfer", callback_data="pay_bank")],
-        [InlineKeyboardButton(text="🔙 Back to Cart", callback_data="view_cart")]
-    ])
+
+    # Build payment keyboard based on order type
+    payment_buttons = []
+    if order_type == "delivery":
+        payment_buttons.append([InlineKeyboardButton(text="💵 Pay on Delivery", callback_data="pay_delivery")])
+    payment_buttons.append([InlineKeyboardButton(text="💰 Cash Payment", callback_data="pay_cash")])
+    payment_buttons.append([InlineKeyboardButton(text="🏦 Bank Transfer", callback_data="pay_bank")])
+    payment_buttons.append([InlineKeyboardButton(text="🔙 Back to Cart", callback_data="view_cart")])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=payment_buttons)
     
     await callback_query.message.answer(
         f"💰 Total Amount: ₦{total_price:,.0f}\n\n"
@@ -727,7 +814,6 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
         reply_markup=keyboard
     )
     await callback_query.answer()
-
 
 async def create_order_in_db(user_id: int, state: FSMContext, payment_method: str, payment_proof_file_id: str = None):
     """Create order in database"""
@@ -750,7 +836,8 @@ async def create_order_in_db(user_id: int, state: FSMContext, payment_method: st
         "total_amount": str(total_price),
         "payment_method": payment_method,
         "payment_status": "pending" if payment_method == "Bank Transfer" else "confirmed",
-        "order_status": "pending"
+        "order_status": "pending",
+        "order_type": data.get("order_type", "dine_in")
     }).execute()
     
     if not order_response.data:
@@ -944,11 +1031,27 @@ async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
     total_price = data.get("total_price", 0)
     restaurant_id = data.get("restaurant_id")
     
-    # Get restaurant bank details
+    # Get restaurant bank details FROM DATABASE
     restaurant = supabase.table("restaurants")\
-        .select("name, phone")\
+        .select("name, phone, bank_name, account_number, account_name")\
         .eq("id", restaurant_id)\
         .execute()
+    
+    if not restaurant.data:
+        await callback_query.message.answer("Error loading payment details. Please contact staff.")
+        await callback_query.answer()
+        return
+    
+    restaurant_info = restaurant.data[0]
+    
+    # Check if bank details are configured
+    if not restaurant_info.get("bank_name") or not restaurant_info.get("account_number"):
+        await callback_query.message.answer(
+            "⚠️ Bank transfer is not available at this restaurant.\n"
+            "Please choose another payment method."
+        )
+        await callback_query.answer()
+        return
     
     await state.set_state(OrderStates.waiting_for_payment_proof)
     await state.update_data(payment_method="Bank Transfer")
@@ -957,9 +1060,9 @@ async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
         f"🏦 <b>Bank Transfer Details</b>\n\n"
         f"💰 Amount: ₦{total_price:,.0f}\n\n"
         f"<b>Account Details:</b>\n"
-        f"Bank: GTBank\n"
-        f"Account Number: 0123456789\n"
-        f"Account Name: Demo Restaurant\n\n"
+        f"Bank: {restaurant_info['bank_name']}\n"
+        f"Account Number: {restaurant_info['account_number']}\n"
+        f"Account Name: {restaurant_info['account_name']}\n\n"
         f"📸 After making the transfer, please send a screenshot "
         f"of your payment receipt."
     )
@@ -1156,6 +1259,190 @@ async def cancel_order(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("❌ Session cancelled. Scan QR code to start a new order.")
 
+
+# ========== ORDER HISTORY ==========
+
+@dp.message(Command("history"))
+async def order_history(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    orders = supabase.table("orders")\
+        .select("id, created_at, total_amount, order_status, payment_status, order_type, order_items(quantity, menu_items(name, price)), restaurants(name), restaurant_tables(table_number)")\
+        .eq("telegram_user_id", user_id)\
+        .order("created_at", desc=True)\
+        .limit(5)\
+        .execute()
+
+    if not orders.data:
+        await message.answer(
+            "📭 You have no previous orders.\n\n"
+            "Scan a restaurant QR code to start ordering!"
+        )
+        return
+
+    emoji_map = {
+        "pending": "⏳",
+        "preparing": "🍳",
+        "ready": "✅",
+        "completed": "🎉",
+        "cancelled": "❌"
+    }
+
+    for order in orders.data:
+        order_id = order["id"]
+        short_id = order_id[:8]
+        date = datetime.fromisoformat(order["created_at"].replace('Z', '+00:00'))
+        date_str = date.strftime("%d %b %Y, %I:%M %p")
+        total = float(order["total_amount"])
+        restaurant = order["restaurants"]["name"] if order.get("restaurants") else "Unknown"
+        table = order["restaurant_tables"]["table_number"] if order.get("restaurant_tables") else "—"
+
+        raw_status = order.get("order_status", "pending")
+        raw_payment = order.get("payment_status", "pending")
+        status_emoji = emoji_map.get(raw_status.lower(), "📦")
+        status = raw_status.capitalize()
+        payment = raw_payment.capitalize()
+
+        # Build items text
+        items_text = ""
+        for oi in order.get("order_items", []):
+            mi = oi.get("menu_items")
+            if mi:
+                items_text += f"   • {oi['quantity']}x {mi['name']} — ₦{float(mi['price']):,.0f}\n"
+
+        text = (
+            f"{status_emoji} <b>Order #{short_id}</b>\n"
+            f"🏪 {restaurant} | 🪑 Table {table}\n"
+            f"📅 {date_str}\n\n"
+            f"{items_text}\n"
+            f"💰 ₦{total:,.0f} | {status} | Payment: {payment}"
+        )
+
+        # Reorder button sits directly under each order card
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"🔄 Reorder these items",
+                callback_data=f"reorder_{order_id}"
+            )]
+        ])
+
+        await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("reorder_"))
+async def handle_reorder(callback_query: types.CallbackQuery, state: FSMContext):
+    """Reorder items from a past order"""
+    order_id = callback_query.data.replace("reorder_", "")
+    user_id = callback_query.from_user.id
+
+    order = supabase.table("orders")\
+        .select("restaurant_id, table_id, order_type, order_items(quantity, unit_price, menu_item_id, menu_items(id, name, price, is_available)), restaurants(name, kitchen_chat_id), restaurant_tables(table_number)")\
+        .eq("id", order_id)\
+        .eq("telegram_user_id", user_id)\
+        .execute()
+
+    if not order.data:
+        await callback_query.message.answer("❌ Order not found.")
+        await callback_query.answer()
+        return
+
+    order_data = order.data[0]
+    reorder_restaurant_id = order_data["restaurant_id"]
+
+    # Rebuild cart, skip unavailable items
+    new_cart = {}
+    skipped = []
+    for item in order_data["order_items"]:
+        menu_item = item.get("menu_items")
+        
+        if menu_item:
+            # Normal path — menu item found
+            if menu_item.get("is_available") is False:
+                skipped.append(menu_item["name"])
+                continue
+            menu_item_id = menu_item["id"]
+            new_cart[menu_item_id] = {
+                "name": menu_item["name"],
+                "price": float(menu_item["price"]),
+                "qty": item["quantity"]
+            }
+        else:
+            # Fallback — use data stored on the order_item itself
+            menu_item_id = item.get("menu_item_id")
+            if not menu_item_id:
+                continue
+            new_cart[menu_item_id] = {
+                "name": f"Item ({menu_item_id[:8]})",  # best we can do without the join
+                "price": float(item.get("unit_price", 0)),
+                "qty": item["quantity"]
+            }
+
+    if not new_cart:
+        await callback_query.message.answer(
+            "⚠️ None of the items from this order are currently available."
+        )
+        await callback_query.answer()
+        return
+
+    # Check current session state
+    current_data = await state.get_data()
+    active_restaurant = current_data.get("restaurant_id")
+
+    if active_restaurant and active_restaurant == reorder_restaurant_id:
+        # ✅ Same restaurant session active — merge into current cart
+        existing_cart = current_data.get("cart", {})
+        for item_id, item in new_cart.items():
+            if item_id in existing_cart:
+                existing_cart[item_id]["qty"] += item["qty"]
+            else:
+                existing_cart[item_id] = item
+        await state.update_data(cart=existing_cart)
+
+        cart_text = "✅ Items added to your current cart!\n\n"
+        total = 0
+        for item in new_cart.values():
+            item_total = item["price"] * item["qty"]
+            cart_text += f"• {item['qty']}x {item['name']} — ₦{item_total:,.0f}\n"
+            total += item_total
+        if skipped:
+            cart_text += f"\n⚠️ Unavailable (skipped): {', '.join(skipped)}"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 View Cart", callback_data="view_cart")],
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="main_menu")]
+        ])
+        await callback_query.message.answer(cart_text, reply_markup=keyboard)
+
+    elif active_restaurant and active_restaurant != reorder_restaurant_id:
+        # ❌ Different restaurant session active
+        await callback_query.message.answer(
+            "⚠️ You're currently in a session at a different restaurant.\n"
+            "Please /cancel first, then scan the correct QR code to reorder."
+        )
+
+    else:
+        # 📲 No active session — save cart and prompt QR scan
+        await state.update_data(
+            pending_reorder_cart=new_cart,
+            pending_reorder_restaurant_id=reorder_restaurant_id
+        )
+
+        cart_text = "📋 Items saved for reorder:\n\n"
+        total = 0
+        for item in new_cart.values():
+            item_total = item["price"] * item["qty"]
+            cart_text += f"• {item['qty']}x {item['name']} — ₦{item_total:,.0f}\n"
+            total += item_total
+        cart_text += f"\n💰 Total: ₦{total:,.0f}"
+        if skipped:
+            cart_text += f"\n⚠️ Unavailable (skipped): {', '.join(skipped)}"
+        cart_text += "\n\n📲 Please scan your table's QR code to place this reorder.\nYour items will be loaded automatically."
+
+        await callback_query.message.answer(cart_text)
+
+    await callback_query.answer()
+
+
 # ==================== SEND REPORTS ===========================
 
 # Manual report commands for managers
@@ -1292,44 +1579,248 @@ async def set_manager(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Error: {e}")
 
+# ========== KITCHEN MENU MANAGEMENT ==========
 
+def short_id(uuid_str):
+    """Shorten UUID to 12 chars by removing dashes"""
+    return uuid_str.replace('-', '')[:12]
+
+
+@dp.message(Command("menu"))
+async def kitchen_menu_management(message: types.Message):
+    chat_id = message.chat.id
+
+    restaurant = supabase.table("restaurants")\
+        .select("id, name")\
+        .eq("kitchen_chat_id", chat_id)\
+        .execute()
+
+    if not restaurant.data:
+        await message.answer("⚠️ This command only works in a registered kitchen group.")
+        return
+
+    restaurant_id = restaurant.data[0]["id"]
+    restaurant_name = restaurant.data[0]["name"]
+
+    categories = await get_categories(restaurant_id)
+
+    if not categories:
+        await message.answer("No menu categories found.")
+        return
+
+    keyboard = InlineKeyboardBuilder()
+    for cat in categories:
+        keyboard.add(InlineKeyboardButton(
+            text=cat["name"],
+            callback_data=f"kmc_{short_id(cat['id'])}"  # kmc_ + 12 = 16 chars
+        ))
+    keyboard.adjust(2)
+
+    await message.answer(
+        f"🍽️ <b>{restaurant_name} — Menu Management</b>\n\n"
+        f"Select a category to manage items:",
+        reply_markup=keyboard.as_markup()
+    )
+
+
+async def get_full_id(table: str, short: str, id_field: str = "id"):
+    """Resolve a short ID back to full UUID"""
+    rows = supabase.table(table).select(id_field).execute()
+    for row in rows.data:
+        if row[id_field].replace('-', '')[:12] == short:
+            return row[id_field]
+    return None
+
+
+@dp.callback_query(F.data.startswith("kmc_"))
+async def kitchen_show_category_items(callback_query: types.CallbackQuery):
+    short_cat = callback_query.data.replace("kmc_", "")
+
+    # Resolve short category id
+    cats = supabase.table("menu_categories").select("id, name, restaurant_id").execute()
+    category_data = None
+    for c in cats.data:
+        if c["id"].replace('-', '')[:12] == short_cat:
+            category_data = c
+            break
+
+    if not category_data:
+        await callback_query.answer("Category not found.")
+        return
+
+    category_id = category_data["id"]
+    category_name = category_data["name"]
+    restaurant_id = category_data["restaurant_id"]
+
+    items = supabase.table("menu_items")\
+        .select("id, name, price, is_available")\
+        .eq("category_id", category_id)\
+        .order("name")\
+        .execute()
+
+    if not items.data:
+        await callback_query.message.answer("No items in this category.")
+        await callback_query.answer()
+        return
+
+    keyboard = InlineKeyboardBuilder()
+    for item in items.data:
+        status = "✅" if item["is_available"] else "❌"
+        # kmt_ + 12 + _ + 12 = 29 chars
+        keyboard.add(InlineKeyboardButton(
+            text=f"{status} {item['name']} — ₦{float(item['price']):,.0f}",
+            callback_data=f"kmt_{short_id(item['id'])}_{short_id(category_id)}"
+        ))
+    keyboard.adjust(1)
+    # kmb_ + 12 = 16 chars
+    keyboard.row(InlineKeyboardButton(
+        text="🔙 Back to Categories",
+        callback_data=f"kmb_{short_id(restaurant_id)}"
+    ))
+
+    await callback_query.message.answer(
+        f"📋 <b>{category_name}</b>\n\n"
+        f"✅ = Available | ❌ = Unavailable\n"
+        f"Tap an item to toggle:",
+        reply_markup=keyboard.as_markup()
+    )
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data.startswith("kmt_"))
+async def kitchen_toggle_item(callback_query: types.CallbackQuery):
+    parts = callback_query.data.split("_")
+    short_item = parts[1]
+    short_cat = parts[2]
+
+    # Resolve item
+    all_items = supabase.table("menu_items")\
+        .select("id, name, is_available, category_id")\
+        .execute()
+
+    item_data = None
+    for i in all_items.data:
+        if i["id"].replace('-', '')[:12] == short_item:
+            item_data = i
+            break
+
+    if not item_data:
+        await callback_query.answer("Item not found.")
+        return
+
+    category_id = item_data["category_id"]
+    new_status = not item_data["is_available"]
+
+    supabase.table("menu_items")\
+        .update({"is_available": new_status})\
+        .eq("id", item_data["id"])\
+        .execute()
+
+    status_text = "✅ Available" if new_status else "❌ Unavailable"
+    await callback_query.answer(f"{item_data['name']} → {status_text}", show_alert=True)
+
+    # Refresh keyboard
+    items = supabase.table("menu_items")\
+        .select("id, name, price, is_available")\
+        .eq("category_id", category_id)\
+        .order("name")\
+        .execute()
+
+    category = supabase.table("menu_categories")\
+        .select("restaurant_id")\
+        .eq("id", category_id)\
+        .execute()
+    restaurant_id = category.data[0]["restaurant_id"]
+
+    keyboard = InlineKeyboardBuilder()
+    for item in items.data:
+        status = "✅" if item["is_available"] else "❌"
+        keyboard.add(InlineKeyboardButton(
+            text=f"{status} {item['name']} — ₦{float(item['price']):,.0f}",
+            callback_data=f"kmt_{short_id(item['id'])}_{short_id(category_id)}"
+        ))
+    keyboard.adjust(1)
+    keyboard.row(InlineKeyboardButton(
+        text="🔙 Back to Categories",
+        callback_data=f"kmb_{short_id(restaurant_id)}"
+    ))
+
+    await callback_query.message.edit_reply_markup(
+        reply_markup=keyboard.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("kmb_"))
+async def kitchen_back_to_categories(callback_query: types.CallbackQuery):
+    short_rest = callback_query.data.replace("kmb_", "")
+
+    # Resolve restaurant
+    restaurants = supabase.table("restaurants").select("id, name").execute()
+    restaurant_data = None
+    for r in restaurants.data:
+        if r["id"].replace('-', '')[:12] == short_rest:
+            restaurant_data = r
+            break
+
+    if not restaurant_data:
+        await callback_query.answer("Restaurant not found.")
+        return
+
+    restaurant_id = restaurant_data["id"]
+    categories = await get_categories(restaurant_id)
+
+    keyboard = InlineKeyboardBuilder()
+    for cat in categories:
+        keyboard.add(InlineKeyboardButton(
+            text=cat["name"],
+            callback_data=f"kmc_{short_id(cat['id'])}"
+        ))
+    keyboard.adjust(2)
+
+    await callback_query.message.answer(
+        f"🍽️ <b>{restaurant_data['name']} — Menu Management</b>\n\n"
+        f"Select a category to manage items:",
+        reply_markup=keyboard.as_markup()
+    )
+    await callback_query.answer()
 
 # For production with FastAPI/webhook
 # Don't use polling
-#async def main():
-#    logging.basicConfig(
-#        level=logging.INFO,
-#        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-#    )
-#    
-#    # Schedule reports
-#    # Daily report at 11:59 PM (sent to managers)
-#    scheduler.add_job(
-##        CronTrigger(hour=23, minute=59, timezone=pytz.timezone('Africa/Lagos')),
- #       id='daily_reports'
- #   )
- #   
- #   # Weekly report every Monday at 9:00 AM (sent to managers)
- #   scheduler.add_job(
- #       send_weekly_reports,
- ##       CronTrigger(day_of_week='mon', hour=9, minute=0, timezone=pytz.timezone('Africa/Lagos')),
-  #      id='weekly_reports'
-  #  )
+async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
- #   # Start scheduler
- #   scheduler.start()
-  #  logging.info("✅ Scheduler started")
- #   logging.info("📊 Daily reports: Every day at 11:59 PM → Managers")
- #   logging.info("📊 Weekly reports: Every Monday at 9:00 AM → Managers")
+    # Schedule reports
+    # Daily report at 11:59 PM (sent to managers)
+    scheduler.add_job(
+        send_daily_reports,
+        CronTrigger(hour=23, minute=59, timezone=pytz.timezone('Africa/Lagos')),
+        id='daily_reports'
+    )
     
- #   # Delete webhook if exists
- #   await bot.delete_webhook(drop_pending_updates=True)
+    # Weekly report every Monday at 9:00 AM (sent to managers)
+    scheduler.add_job(
+        send_weekly_reports,
+        CronTrigger(day_of_week='mon', hour=9, minute=0, timezone=pytz.timezone('Africa/Lagos')),
+        id='weekly_reports'
+    )
     
- #   logging.info("🤖 Starting bot...")
+    # Start scheduler
+    scheduler.start()
+    logging.info("✅ Scheduler started")
+    logging.info("📊 Daily reports: Every day at 11:59 PM → Managers")
+    logging.info("📊 Weekly reports: Every Monday at 9:00 AM → Managers")
     
- #   # Start polling
- #   await dp.start_polling(bot)
+    # Delete webhook if exists
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    logging.info("🤖 Starting bot...")
+    
+   # Start polling
+    await dp.start_polling(bot)
 
 
-# if __name__ == "__main__":
- #   asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
