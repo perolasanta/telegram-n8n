@@ -1,0 +1,20 @@
+__pycache__
+*.pyc
+*.db
+*.png
+*.json
+botai.py
+boted.py
+snippets.py
+test.py
+test_payload.py
+generate_qr_codes.py
+generate_short_codes.py
+poetry.lock
+pyproject.toml
+.env
+orders.db
+
+table_*.png
+Call back query.json
+tiktok.json

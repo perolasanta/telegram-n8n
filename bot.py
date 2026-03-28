@@ -16,8 +16,8 @@ from decimal import Decimal
 from dotenv import load_dotenv
 import base64
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+#from apscheduler.schedulers.asyncio import AsyncIOScheduler
+#from apscheduler.triggers.cron import CronTrigger
 from reports import generate_daily_report, generate_weekly_report
 from receipt_generator import generate_receipt_pdf
 from aiogram.types import FSInputFile
@@ -27,8 +27,8 @@ from datetime import datetime, timedelta
 router = Router()
 load_dotenv()
 
-# Initialize scheduler
-scheduler = AsyncIOScheduler(timezone=pytz.timezone('Africa/Lagos'))
+# Initialize scheduler for polling testing only
+#scheduler = AsyncIOScheduler(timezone=pytz.timezone('Africa/Lagos'))
 
 # Environment variables
 TOKEN = os.getenv("TOKEN")
@@ -254,7 +254,34 @@ async def send_weekly_reports():
     except Exception as e:
         logging.error(f"Error in send_weekly_reports: {e}")
 
+# ========== CHECK SUBSCRIPTIONS AND UPDATE SUBCRIPTIONS ===============
+async def is_subscription_active(restaurant_id: str) -> bool:
+    result = supabase.table("restaurants")\
+        .select("subscription_status, subscription_expires_at")\
+        .eq("id", restaurant_id)\
+        .execute()
+    if not result.data:
+        return False
+    restaurant = result.data[0]
+    status = restaurant.get("subscription_status")
+    expires_at = restaurant.get("subscription_expires_at")
+    if status not in ("trialing", "active"):
+        return False
+    if expires_at:
+        expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+        return expiry > datetime.now(pytz.utc)
+    return False
 
+
+async def upgrade_restaurant(restaurant_id: str, plan: str = "pro", days: int = 30):
+    supabase.table("restaurants")\
+        .update({
+            "plan": plan,
+            "subscription_status": "active",
+            "subscription_expires_at": (datetime.now(pytz.utc) + timedelta(days=days)).isoformat()
+        })\
+        .eq("id", restaurant_id)\
+        .execute()
 
 
 # ========== COMMAND HANDLERS ==========
@@ -301,6 +328,14 @@ async def start(message: types.Message, state: FSMContext):
         restaurant_id = table_data["restaurant_id"]
         restaurant_name = restaurant_data["name"]
         kitchen_chat_id = restaurant_data["kitchen_chat_id"]
+
+        # Check if restaurant subscription is active
+        if not await is_subscription_active(restaurant_id):
+            await message.answer(
+                "⚠️ This restaurant's subscription is currently inactive.\n"
+                "Please contact the restaurant staff."
+            )
+            return
 
             # Check if first-time user
         user_history = supabase.table("orders")\
@@ -415,18 +450,19 @@ async def handle_external_order(message: types.Message, state: FSMContext, resta
 
 @dp.callback_query(F.data == "order_type_delivery")
 async def order_type_delivery(callback_query: types.CallbackQuery, state: FSMContext):
-    """Handle delivery order selection"""
-    
     await state.update_data(order_type="delivery")
     
     await callback_query.message.answer(
-        "📍 Please enter your delivery address:\n\n"
-        "Example: 123 Main Street, Minna, Niger State"
+        "📍 <b>Enter your delivery address</b>\n\n"
+        "You can either:\n\n"
+        "📌 <b>Share your location</b> — tap the 📎 paperclip icon "
+        "at the bottom of your screen → tap <b>Location</b> → "
+        "tap <b>Send My Current Location</b>\n\n"
+        "✍️ <b>Or type your address</b> — e.g:\n"
+        "<i>12 Adeola Street, Minna, Niger State</i>"
     )
-    
     await state.set_state(OrderStates.waiting_for_address)
     await callback_query.answer()
-
 
 @dp.callback_query(F.data == "order_type_pickup")
 async def order_type_pickup(callback_query: types.CallbackQuery, state: FSMContext):
@@ -445,26 +481,63 @@ async def order_type_pickup(callback_query: types.CallbackQuery, state: FSMConte
 
 
 
-@dp.message(OrderStates.waiting_for_address)
-async def receive_address(message: types.Message, state: FSMContext):
-    """Receive delivery address"""
+@dp.message(OrderStates.waiting_for_address, F.location)
+async def receive_location(message: types.Message, state: FSMContext):
+    lat = message.location.latitude
+    lon = message.location.longitude
     
-    address = message.text.strip()
+    # Reverse geocode with Nominatim (free, no API key)
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": lat, "lon": lon, "format": "json"},
+            headers={"User-Agent": "ChowlinBot/1.0"}
+        ) as resp:
+            data = await resp.json()
     
-    if len(address) < 10:
-        await message.answer("⚠️ Please enter a complete address.")
-        return
+    address = data.get("display_name", f"{lat}, {lon}")
     
-    await state.update_data(delivery_address=address)
-    
-    await message.answer(
-        f"✅ Delivery address saved:\n{address}\n\n"
-        f"Now let's see the menu!"
+    # Store both human address and coordinates
+    await state.update_data(
+        delivery_address=address,
+        delivery_lat=lat,
+        delivery_lon=lon
     )
     
+    await message.answer(
+        f"✅ Location received!\n\n"
+        f"📍 <b>{address}</b>\n\n"
+        f"Is this correct?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Yes, correct", callback_data="address_confirmed")],
+            [InlineKeyboardButton(text="✍️ No, type it instead", callback_data="address_retype")]
+        ])
+    )
+
+
+@dp.message(OrderStates.waiting_for_address, F.text)
+async def receive_address(message: types.Message, state: FSMContext):
+    address = message.text.strip()
+    if len(address) < 10:
+        await message.answer("⚠️ Please enter a complete address or share your location.")
+        return
+    await state.update_data(delivery_address=address)
+    await message.answer(f"✅ Delivery address saved:\n<b>{address}</b>\n\nNow let's see the menu!")
     await state.set_state(None)
     await show_menu_categories(message, state)
 
+
+@dp.callback_query(F.data == "address_confirmed")
+async def address_confirmed(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(None)
+    await show_menu_categories(callback_query.message, state)
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data == "address_retype")
+async def address_retype(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.message.answer("✍️ Please type your delivery address:")
+    await callback_query.answer()
 
 async def show_menu_categories(message: types.Message, state: FSMContext):
     """Show menu categories"""
@@ -1784,6 +1857,64 @@ async def kitchen_back_to_categories(callback_query: types.CallbackQuery):
     )
     await callback_query.answer()
 
+# Activate Restaurant subscription
+@dp.message(Command("activate"))
+async def activate_restaurant(message: types.Message):
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer("Usage: /activate <restaurant_id> <days>")
+        return
+    restaurant_id = args[1]
+    days = int(args[2]) if args[2].isdigit() else 30
+    await upgrade_restaurant(restaurant_id, days=days)
+    await message.answer(f"✅ Restaurant activated for {days} days.")
+
+# ========== TEST COMMANDS =============
+#Remove before deploying to production
+#@dp.message(Command("test_sub"))
+#async def test_subscription(message: types.Message):
+#    """Temporary test command - remove in production"""
+#    restaurant = supabase.table("restaurants")\
+#        .select("id, name, subscription_status, subscription_expires_at")\
+#        .limit(1)\
+#        .execute()
+#    
+#    if not restaurant.data:
+#        await message.answer("No restaurants found.")
+#        return
+#    
+#    r = restaurant.data[0]
+#    is_active = await is_subscription_active(r["id"])
+#    
+#    await message.answer(
+#        f"🧪 Test Result:\n\n"
+#        f"Restaurant: {r['name']}\n"
+#        f"Status: {r['subscription_status']}\n"
+#        f"Expires: {r['subscription_expires_at']}\n"
+#       f"is_active check: {'✅ Active' if is_active else '❌ Inactive'}"
+#    )
+
+#async def expire_subscriptions():
+#    try:
+#        supabase.table("restaurants")\
+#            .update({"subscription_status": "expired"})\
+#            .in_("subscription_status", ["trialing", "active"])\
+#            .lt("subscription_expires_at", datetime.now(pytz.utc).isoformat())\
+#            .execute()
+#        #logger.info("✅ Subscription expiry check complete")
+#    except Exception as e:
+#        #logger.error(f"Error expiring subscriptions: {e}")
+#        print (e)
+##
+#
+#@dp.message(Command("test_expire"))
+#async def test_expire(message: types.Message):
+#    """Manually trigger expiry check - remove in production"""
+#    await expire_subscriptions()
+#    await message.answer("✅ Expiry check ran. Check your restaurants table.")
+
+
+
 ## For production with FastAPI/webhook
 ## Don't use polling
 #async def main():
@@ -1822,4 +1953,4 @@ async def kitchen_back_to_categories(callback_query: types.CallbackQuery):
  #   await dp.start_polling(bot)
 #
 #if __name__ == "__main__":
-    asyncio.run(main())
+ #   asyncio.run(main())

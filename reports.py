@@ -185,3 +185,5 @@ async def generate_weekly_report(supabase: Client, restaurant_id: str, end_date:
             report += f"   Sold: {data['qty']} | Revenue: ₦{data['revenue']:,.0f}\n"
     
     return report
+
+

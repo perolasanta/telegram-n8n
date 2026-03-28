@@ -1,0 +1,13 @@
+services:
+  chowlin:
+    build: .
+    container_name: chowlin_bot
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
