@@ -46,6 +46,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # FSM States
 class OrderStates(StatesGroup):
+    waiting_for_name = State() #wait for customer name for order
     browsing_category = State()
     waiting_for_quantity = State()
     waiting_for_payment_proof = State()
@@ -1006,8 +1007,9 @@ async def send_order_to_kitchen(order_id: str, user_id: int, state: FSMContext, 
     else:
         # Other payment methods
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🍽️ Mark as Ready", callback_data=f"ready_{order_id}")]
-        ])
+    [InlineKeyboardButton(text="🍳 Mark as Preparing", callback_data=f"preparing_{order_id}")],
+    [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]
+])
         
         await bot.send_message(
             kitchen_chat_id,
@@ -1285,6 +1287,29 @@ async def reject_payment_handler(callback_query: types.CallbackQuery):
     )
     
     await callback_query.answer("❌ Payment rejected!")
+
+
+@dp.callback_query(F.data.startswith("preparing_"))
+async def handle_preparing(callback_query: types.CallbackQuery):
+    order_id = callback_query.data.replace("preparing_", "")
+    
+    supabase.table("orders")\
+        .update({"order_status": "preparing"})\
+        .eq("id", order_id)\
+        .execute()
+    
+    order = supabase.table("orders")\
+        .select("telegram_user_id")\
+        .eq("id", order_id)\
+        .execute()
+    
+    if order.data:
+        await bot.send_message(
+            order.data[0]["telegram_user_id"],
+            f"🍳 Your order #{order_id[:8]} is now being prepared!"
+        )
+    
+    await callback_query.answer("Marked as preparing!")
 
 
 @router.callback_query(F.data.startswith("ready_"))
@@ -1618,6 +1643,10 @@ async def set_manager(message: types.Message):
     
     # You can add admin check here
     # For now, anyone can use it (you should restrict this)
+    # Add this check — only you can run this
+    ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID"))
+    if message.from_user.id != ADMIN_TELEGRAM_ID:
+        return  # silently ignore
     
     args = message.text.split()
     if len(args) < 3:
@@ -1954,3 +1983,90 @@ async def activate_restaurant(message: types.Message):
 #
 #if __name__ == "__main__":
  #   asyncio.run(main())
+
+
+ # ============== Added Improvements ==============
+# - Reorder from history with availability check
+@dp.message(Command("status"))
+async def order_status(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    order = supabase.table("orders")\
+        .select("id, order_status, payment_status, total_amount, created_at")\
+        .eq("telegram_user_id", user_id)\
+        .in_("order_status", ["pending", "preparing"])\
+        .order("created_at", desc=True)\
+        .limit(1)\
+        .execute()
+    
+    if not order.data:
+        await message.answer("No active orders found.")
+        return
+    
+    o = order.data[0]
+    emoji = {"pending": "⏳", "preparing": "🍳"}.get(o["order_status"], "📦")
+    await message.answer(
+        f"{emoji} <b>Active Order</b>\n\n"
+        f"Order: #{o['id'][:8]}\n"
+        f"Status: {o['order_status'].capitalize()}\n"
+        f"Payment: {o['payment_status'].capitalize()}\n"
+        f"Total: ₦{float(o['total_amount']):,.0f}"
+    )
+
+
+# Cart confirmation with empty cart check and session expiry handling
+@dp.callback_query(F.data == "confirm_order")
+async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    cart = data.get("cart", {})
+    
+    if not cart:
+        await callback_query.message.answer(
+            "🛒 Your cart is empty.\n\n"
+            "⚠️ If you had items in your cart, your session may have "
+            "expired. Please scan the QR code again to restart."
+        )
+        await callback_query.answer()
+        return
+
+# kitchen counter for pending orders
+# Show loading state when confirming order
+    await callback_query.answer("Processing your order...", show_alert=True)
+@dp.message(Command("pending"))
+async def pending_orders(message: types.Message):
+    chat_id = message.chat.id
+    
+    restaurant = supabase.table("restaurants")\
+        .select("id, name")\
+        .eq("kitchen_chat_id", chat_id)\
+        .execute()
+    
+    if not restaurant.data:
+        return
+    
+    pending = supabase.table("orders")\
+        .select("id", count="exact")\
+        .eq("restaurant_id", restaurant.data[0]["id"])\
+        .eq("order_status", "pending")\
+        .execute()
+    
+    preparing = supabase.table("orders")\
+        .select("id", count="exact")\
+        .eq("restaurant_id", restaurant.data[0]["id"])\
+        .eq("order_status", "preparing")\
+        .execute()
+    
+    await message.answer(
+        f"📊 <b>Current Queue</b>\n\n"
+        f"⏳ Pending: {pending.count or 0}\n"
+        f"🍳 Preparing: {preparing.count or 0}"
+    )
+
+# Admin-only command to activate restaurant subscription (for testing)
+@dp.message(Command("activate"))
+async def activate_restaurant(message: types.Message):
+    # Add this check — only you can run this
+    ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID"))
+    if message.from_user.id != ADMIN_TELEGRAM_ID:
+        return  # silently ignore
+    ...

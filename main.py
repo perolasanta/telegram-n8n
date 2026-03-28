@@ -130,7 +130,7 @@ async def notify_expiring_subscriptions():
 
 
 
-""" async def ping_n8n_periodically():
+async def ping_n8n_periodically():
     #Background task to keep n8n awake on Render's free tier.
     async with aiohttp.ClientSession() as session:
         while True:
@@ -144,7 +144,7 @@ async def notify_expiring_subscriptions():
             
             # Ping every 10 minutes to stay within Render's 15-min window
             await asyncio.sleep(600)
-"""
+
 
 @app.post("/webhook")
 async def webhook(request:Request):
