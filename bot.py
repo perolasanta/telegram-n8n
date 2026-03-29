@@ -36,6 +36,7 @@ N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "https://n8n-atad.onrender.com/we
 N8N_UPDATE_WEBHOOK_URL = os.getenv("N8N_UPDATE_WEBHOOK_URL", "https://n8n-atad.onrender.com/webhook/update-sheet")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -330,6 +331,7 @@ async def start(message: types.Message, state: FSMContext):
         restaurant_name = restaurant_data["name"]
         kitchen_chat_id = restaurant_data["kitchen_chat_id"]
 
+        print( "SUB CHECK - restaurant_id:", restaurant_id)
         # Check if restaurant subscription is active
         if not await is_subscription_active(restaurant_id):
             await message.answer(
@@ -1644,14 +1646,14 @@ async def set_manager(message: types.Message):
     # You can add admin check here
     # For now, anyone can use it (you should restrict this)
     # Add this check — only you can run this
-    ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID"))
+    ADMIN_TELEGRAM_ID = int(ADMIN_TELEGRAM_ID)
     if message.from_user.id != ADMIN_TELEGRAM_ID:
         return  # silently ignore
     
     args = message.text.split()
     if len(args) < 3:
         await message.answer(
-            "Usage: /set_manager <restaurant_id> <telegram_id>\n\n"
+            "Usage: /set_manager [restaurant_id] [telegram_id]\n\n"
             "Example: /set_manager abc123 987654321"
         )
         return
@@ -1887,11 +1889,16 @@ async def kitchen_back_to_categories(callback_query: types.CallbackQuery):
     await callback_query.answer()
 
 # Activate Restaurant subscription
+# Admin-only command to activate restaurant subscription (for testing)
 @dp.message(Command("activate"))
 async def activate_restaurant(message: types.Message):
+    # Add this check — only you can run this
+    ADMIN_TELEGRAM_ID = int(ADMIN_TELEGRAM_ID)
+    if message.from_user.id != ADMIN_TELEGRAM_ID:
+        return  # silently ignore
     args = message.text.split()
     if len(args) < 3:
-        await message.answer("Usage: /activate <restaurant_id> <days>")
+        await message.answer("Usage: /activate [restaurant_id] [days]")
         return
     restaurant_id = args[1]
     days = int(args[2]) if args[2].isdigit() else 30
@@ -2062,11 +2069,4 @@ async def pending_orders(message: types.Message):
         f"🍳 Preparing: {preparing.count or 0}"
     )
 
-# Admin-only command to activate restaurant subscription (for testing)
-@dp.message(Command("activate"))
-async def activate_restaurant(message: types.Message):
-    # Add this check — only you can run this
-    ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID"))
-    if message.from_user.id != ADMIN_TELEGRAM_ID:
-        return  # silently ignore
-    ...
+
