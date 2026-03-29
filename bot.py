@@ -1646,8 +1646,8 @@ async def set_manager(message: types.Message):
     # You can add admin check here
     # For now, anyone can use it (you should restrict this)
     # Add this check — only you can run this
-    ADMIN_TELEGRAM_ID = int(ADMIN_TELEGRAM_ID)
-    if message.from_user.id != ADMIN_TELEGRAM_ID:
+    admin_telegram_id = int(ADMIN_TELEGRAM_ID)
+    if message.from_user.id != admin_telegram_id:
         return  # silently ignore
     
     args = message.text.split()
@@ -1893,8 +1893,8 @@ async def kitchen_back_to_categories(callback_query: types.CallbackQuery):
 @dp.message(Command("activate"))
 async def activate_restaurant(message: types.Message):
     # Add this check — only you can run this
-    ADMIN_TELEGRAM_ID = int(ADMIN_TELEGRAM_ID)
-    if message.from_user.id != ADMIN_TELEGRAM_ID:
+    admin_telegram_id = int(ADMIN_TELEGRAM_ID)
+    if message.from_user.id != admin_telegram_id:
         return  # silently ignore
     args = message.text.split()
     if len(args) < 3:
