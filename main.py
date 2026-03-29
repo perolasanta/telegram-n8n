@@ -168,13 +168,13 @@ async def on_startup():
     # SCHEDULE REPORT
     scheduler.add_job(
         send_daily_reports,
-        CronTrigger(hour=22, minute=00),
+        CronTrigger(hour=21, minute=00),
         id='daily_reports'
     )
     
     scheduler.add_job(
         send_weekly_reports,
-        CronTrigger(day_of_week='mon', hour=9, minute=0),
+        CronTrigger(day_of_week='mon', hour=8, minute=0),
         id='weekly_reports'
     )
 
@@ -193,7 +193,7 @@ async def on_startup():
     
     scheduler.start()
     logger.info("✅ Scheduler started")
-    logger.info("📊 Daily reports: Every day at 11:59 PM")
+    logger.info("📊 Daily reports: Every day at 09:59 PM")
     logger.info("📊 Weekly reports: Every Monday at 9:00 AM")
 
 
