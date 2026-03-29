@@ -264,16 +264,21 @@ async def is_subscription_active(restaurant_id: str) -> bool:
         .execute()
     if not result.data:
         return False
+    
     restaurant = result.data[0]
     status = restaurant.get("subscription_status")
     expires_at = restaurant.get("subscription_expires_at")
+    
     if status not in ("trialing", "active"):
         return False
-    if expires_at:
-        expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-        return expiry > datetime.now(pytz.utc)
-    return False
-
+    
+    # No expiry date = permanent/manual subscription — treat as active
+    if not expires_at:
+        return True
+    
+    # Has expiry date — check it hasn't passed
+    expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+    return expiry > datetime.now(pytz.utc)
 
 async def upgrade_restaurant(restaurant_id: str, plan: str = "pro", days: int = 30):
     supabase.table("restaurants")\
@@ -863,18 +868,18 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
     cart = data.get("cart", {})
     
     if not cart:
-        await callback_query.message.answer("Your cart is empty. 🛒")
+        await callback_query.message.answer(
+            "🛒 Your cart is empty.\n\n"
+            "⚠️ If you had items in your cart, your session may have "
+            "expired. Please scan the QR code again to restart."
+        )
         await callback_query.answer()
         return
-    
-    # Calculate total
+
     total_price = sum(item["price"] * item["qty"] for item in cart.values())
     order_type = data.get("order_type", "dine_in")
-    
-    # Store total in state
     await state.update_data(total_price=total_price)
 
-    # Build payment keyboard based on order type
     payment_buttons = []
     if order_type == "delivery":
         payment_buttons.append([InlineKeyboardButton(text="💵 Pay on Delivery", callback_data="pay_delivery")])
@@ -891,6 +896,7 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
     )
     await callback_query.answer()
 
+    
 async def create_order_in_db(user_id: int, state: FSMContext, payment_method: str, payment_proof_file_id: str = None):
     """Create order in database"""
     data = await state.get_data()
