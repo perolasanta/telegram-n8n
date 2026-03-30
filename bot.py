@@ -919,7 +919,10 @@ async def create_order_in_db(user_id: int, state: FSMContext, payment_method: st
         "payment_method": payment_method,
         "payment_status": "pending" if payment_method == "Bank Transfer" else "confirmed",
         "order_status": "pending",
-        "order_type": data.get("order_type", "dine_in")
+        "order_type": data.get("order_type", "dine_in"),
+        "delivery_address": data.get("delivery_address") if data.get("order_type") == "delivery" else None,
+        "delivery_lat": data.get("delivery_lat") if data.get("order_type") == "delivery" else None,
+        "delivery_lon": data.get("delivery_lon") if data.get("order_type") == "delivery" else None
     }).execute()
     
     if not order_response.data:
@@ -966,6 +969,14 @@ async def send_order_to_kitchen(order_id: str, user_id: int, state: FSMContext, 
     table_number = data.get("table_number", "Unknown")
     restaurant_name = data.get("restaurant_name", "Restaurant")
     kitchen_chat_id = data.get("kitchen_chat_id")
+
+    if data.get("order_type") == "delivery":
+        table_number = "Delivery Order"
+        delivery_address = data.get("delivery_address", "No address provided")
+        table_number += f"\n📍 {delivery_address}"
+        
+    elif data.get("order_type") == "pickup":
+        table_number = "Pickup Order"
     
     if not kitchen_chat_id:
         print("⚠️ No kitchen_chat_id configured for this restaurant")
