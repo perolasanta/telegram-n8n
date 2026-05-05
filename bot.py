@@ -56,6 +56,10 @@ class OrderStates(StatesGroup):
 
 # ========== HELPER FUNCTIONS ==========
 
+def format_delivery_coordinates(lat: float, lon: float) -> str:
+    """Build a readable fallback address from shared coordinates."""
+    return f"Shared location: {lat:.6f}, {lon:.6f}"
+
 async def get_categories(restaurant_id: str):
     """Get active categories for restaurant"""
     response = supabase.table("menu_categories")\
@@ -493,24 +497,32 @@ async def order_type_pickup(callback_query: types.CallbackQuery, state: FSMConte
 async def receive_location(message: types.Message, state: FSMContext):
     lat = message.location.latitude
     lon = message.location.longitude
-    
-    # Reverse geocode with Nominatim (free, no API key)
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            "https://nominatim.openstreetmap.org/reverse",
-            params={"lat": lat, "lon": lon, "format": "json"},
-            headers={"User-Agent": "ChowlinBot/1.0"}
-        ) as resp:
-            data = await resp.json()
-    
-    address = data.get("display_name", f"{lat}, {lon}")
-    
-    # Store both human address and coordinates
+
+    # Save coordinates immediately so we don't lose them if reverse geocoding fails.
+    fallback_address = format_delivery_coordinates(lat, lon)
     await state.update_data(
-        delivery_address=address,
+        delivery_address=fallback_address,
         delivery_lat=lat,
         delivery_lon=lon
     )
+
+    address = fallback_address
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={"lat": lat, "lon": lon, "format": "json"},
+                headers={"User-Agent": "ChowlinBot/1.0"}
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        address = data.get("display_name") or fallback_address
+    except Exception as e:
+        logging.warning("Reverse geocoding failed for delivery location: %s", e)
+
+    # Update the address if we resolved a more user-friendly label.
+    await state.update_data(delivery_address=address)
     
     await message.answer(
         f"✅ Location received!\n\n"
@@ -529,7 +541,11 @@ async def receive_address(message: types.Message, state: FSMContext):
     if len(address) < 10:
         await message.answer("⚠️ Please enter a complete address or share your location.")
         return
-    await state.update_data(delivery_address=address)
+    await state.update_data(
+        delivery_address=address,
+        delivery_lat=None,
+        delivery_lon=None
+    )
     await message.answer(f"✅ Delivery address saved:\n<b>{address}</b>\n\nNow let's see the menu!")
     await state.set_state(None)
     await show_menu_categories(message, state)
@@ -904,6 +920,14 @@ async def create_order_in_db(user_id: int, state: FSMContext, payment_method: st
     restaurant_id = data.get("restaurant_id")
     table_id = data.get("table_id")
     total_price = data.get("total_price", 0)
+    order_type = data.get("order_type", "dine_in")
+    delivery_address = data.get("delivery_address")
+    delivery_lat = data.get("delivery_lat")
+    delivery_lon = data.get("delivery_lon")
+
+    if order_type == "delivery" and not delivery_address and delivery_lat is not None and delivery_lon is not None:
+        delivery_address = format_delivery_coordinates(delivery_lat, delivery_lon)
+        await state.update_data(delivery_address=delivery_address)
     
     # Get customer name
     user = await bot.get_chat(user_id)
@@ -919,10 +943,10 @@ async def create_order_in_db(user_id: int, state: FSMContext, payment_method: st
         "payment_method": payment_method,
         "payment_status": "pending" if payment_method == "Bank Transfer" else "confirmed",
         "order_status": "pending",
-        "order_type": data.get("order_type", "dine_in"),
-        "delivery_address": data.get("delivery_address") if data.get("order_type") == "delivery" else None,
-        "delivery_lat": data.get("delivery_lat") if data.get("order_type") == "delivery" else None,
-        "delivery_lon": data.get("delivery_lon") if data.get("order_type") == "delivery" else None
+        "order_type": order_type,
+        "delivery_address": delivery_address if order_type == "delivery" else None,
+        "delivery_lat": delivery_lat if order_type == "delivery" else None,
+        "delivery_lon": delivery_lon if order_type == "delivery" else None
     }).execute()
     
     if not order_response.data:
@@ -2085,5 +2109,4 @@ async def pending_orders(message: types.Message):
         f"⏳ Pending: {pending.count or 0}\n"
         f"🍳 Preparing: {preparing.count or 0}"
     )
-
 
