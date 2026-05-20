@@ -60,14 +60,17 @@ def format_delivery_coordinates(lat: float, lon: float) -> str:
     """Build a readable fallback address from shared coordinates."""
     return f"Shared location: {lat:.6f}, {lon:.6f}"
 
-async def get_categories(restaurant_id: str):
+async def get_categories(restaurant_id: str, menu_filter: str | None = None):
     """Get active categories for restaurant"""
-    response = supabase.table("menu_categories")\
+    query = supabase.table("menu_categories")\
         .select("*")\
         .eq("restaurant_id", restaurant_id)\
-        .eq("is_active", True)\
-        .order("display_order")\
-        .execute()
+        .eq("is_active", True)
+
+    if menu_filter:
+        query = query.ilike("name", f"{menu_filter} —%")
+
+    response = query.order("display_order").execute()
     return response.data
 
 
@@ -320,7 +323,7 @@ async def start(message: types.Message, state: FSMContext):
     try:
         # Look up in restaurant_tables (includes both regular tables and external)
         table = supabase.table("restaurant_tables")\
-            .select("id, table_number, restaurant_id, restaurants(id, name, kitchen_chat_id)")\
+            .select("id, table_number, restaurant_id, menu_filter, restaurants(id, name, kitchen_chat_id)")\
             .eq("public_code", public_code)\
             .eq("is_active", True)\
             .execute()
@@ -336,6 +339,7 @@ async def start(message: types.Message, state: FSMContext):
         
         table_id = table_data["id"]
         table_number = table_data["table_number"]
+        menu_filter = table_data.get("menu_filter")
         restaurant_id = table_data["restaurant_id"]
         restaurant_name = restaurant_data["name"]
         kitchen_chat_id = restaurant_data["kitchen_chat_id"]
@@ -371,11 +375,11 @@ async def start(message: types.Message, state: FSMContext):
         if table_number is None or table_number == 'EXTERNAL':
             # EXTERNAL ORDER (delivery/pickup)
             print(f"✅ EXTERNAL ORDER: {restaurant_name}")
-            await handle_external_order(message, state, restaurant_id, restaurant_name, kitchen_chat_id, table_id)
+            await handle_external_order(message, state, restaurant_id, restaurant_name, kitchen_chat_id, table_id, menu_filter)
         else:
             # DINE-IN ORDER (has table number)
             print(f"✅ DINE-IN: Table {table_number} at {restaurant_name}")
-            await handle_dine_in_order(message, state, restaurant_id, restaurant_name, kitchen_chat_id, table_id, table_number)
+            await handle_dine_in_order(message, state, restaurant_id, restaurant_name, kitchen_chat_id, table_id, table_number, menu_filter)
         
     except Exception as e:
         print(f"Error: {e}")
@@ -386,7 +390,7 @@ async def start(message: types.Message, state: FSMContext):
 
     
 
-async def handle_dine_in_order(message: types.Message, state: FSMContext, restaurant_id: str, restaurant_name: str, kitchen_chat_id: int, table_id: str, table_number: str):
+async def handle_dine_in_order(message: types.Message, state: FSMContext, restaurant_id: str, restaurant_name: str, kitchen_chat_id: int, table_id: str, table_number: str, menu_filter: str | None = None):
     """Handle dine-in order"""
     
     # Initialize cart for DINE-IN
@@ -395,6 +399,7 @@ async def handle_dine_in_order(message: types.Message, state: FSMContext, restau
         table_id=table_id,
         restaurant_name=restaurant_name,
         table_number=table_number,
+        menu_filter=menu_filter,
         kitchen_chat_id=kitchen_chat_id,
         order_type="dine_in",
         cart={}
@@ -405,7 +410,7 @@ async def handle_dine_in_order(message: types.Message, state: FSMContext, restau
 
 
     # Get categories
-    categories = await get_categories(restaurant_id)
+    categories = await get_categories(restaurant_id, menu_filter)
     
     if not categories:
         await message.answer("No menu available. Please contact staff.")
@@ -429,7 +434,7 @@ async def handle_dine_in_order(message: types.Message, state: FSMContext, restau
     )
 
 
-async def handle_external_order(message: types.Message, state: FSMContext, restaurant_id: str, restaurant_name: str, kitchen_chat_id: int, table_id: str):
+async def handle_external_order(message: types.Message, state: FSMContext, restaurant_id: str, restaurant_name: str, kitchen_chat_id: int, table_id: str, menu_filter: str | None = None):
     """Handle external order (delivery/pickup)"""
     
     # Store restaurant info in state
@@ -439,6 +444,7 @@ async def handle_external_order(message: types.Message, state: FSMContext, resta
         kitchen_chat_id=kitchen_chat_id,
         table_id=table_id,  # Still store the "EXTERNAL" table_id
         table_number=None,
+        menu_filter=menu_filter,
         cart={}
     )
 
@@ -569,8 +575,9 @@ async def show_menu_categories(message: types.Message, state: FSMContext):
     data = await state.get_data()
     restaurant_id = data.get("restaurant_id")
     restaurant_name = data.get("restaurant_name", "Restaurant")
+    menu_filter = data.get("menu_filter")
     
-    categories = await get_categories(restaurant_id)
+    categories = await get_categories(restaurant_id, menu_filter)
     
     if not categories:
         await message.answer("No menu available. Please contact staff.")
@@ -596,13 +603,14 @@ async def go_to_main_menu(callback_query: types.CallbackQuery, state: FSMContext
     data = await state.get_data()
     restaurant_id = data.get("restaurant_id")
     restaurant_name = data.get("restaurant_name", "Restaurant")
+    menu_filter = data.get("menu_filter")
     
     if not restaurant_id:
         await callback_query.message.answer("Session expired. Please /start again.")
         await callback_query.answer()
         return
     
-    categories = await get_categories(restaurant_id)
+    categories = await get_categories(restaurant_id, menu_filter)
     
     keyboard = InlineKeyboardBuilder()
     for category in categories:
@@ -623,15 +631,27 @@ async def go_to_main_menu(callback_query: types.CallbackQuery, state: FSMContext
 @dp.callback_query(F.data.startswith("cat_"))
 async def show_menu(callback_query: types.CallbackQuery, state: FSMContext):
     category_id = callback_query.data.replace("cat_", "")
+    data = await state.get_data()
+    restaurant_id = data.get("restaurant_id")
+    menu_filter = data.get("menu_filter")
     
     # Get category details
-    category = supabase.table("menu_categories")\
-        .select("name")\
-        .eq("id", category_id)\
-        .execute()
+    category_query = supabase.table("menu_categories")\
+        .select("name, restaurant_id")\
+        .eq("id", category_id)
+
+    if restaurant_id:
+        category_query = category_query.eq("restaurant_id", restaurant_id)
+
+    category = category_query.execute()
     
     if not category.data:
         await callback_query.answer("Category not found!")
+        return
+
+    category_name = category.data[0]["name"]
+    if menu_filter and not category_name.lower().startswith(f"{menu_filter.lower()} —"):
+        await callback_query.answer("Category not available for this table.")
         return
     
     # Get menu items
@@ -655,7 +675,7 @@ async def show_menu(callback_query: types.CallbackQuery, state: FSMContext):
     )
     
     await callback_query.message.answer(
-        f"{category.data[0]['name']}:\n\nSelect an item:",
+        f"{category_name}:\n\nSelect an item:",
         reply_markup=keyboard.as_markup()
     )
     await callback_query.answer()
@@ -813,7 +833,8 @@ async def handle_custom_quantity(message: types.Message, state: FSMContext):
     
     # Show categories
     restaurant_id = data.get("restaurant_id")
-    categories = await get_categories(restaurant_id)
+    menu_filter = data.get("menu_filter")
+    categories = await get_categories(restaurant_id, menu_filter)
     
     keyboard = InlineKeyboardBuilder()
     for category in categories:
@@ -2109,4 +2130,3 @@ async def pending_orders(message: types.Message):
         f"⏳ Pending: {pending.count or 0}\n"
         f"🍳 Preparing: {preparing.count or 0}"
     )
-
