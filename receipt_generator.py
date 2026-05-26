@@ -7,6 +7,9 @@ from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from datetime import datetime
 import os
 
+def format_currency(amount):
+    return f"NGN {amount:,.0f}"
+
 async def generate_receipt_pdf(order_data: dict, filename: str = None):
     """
     Generate PDF receipt for an order
@@ -102,8 +105,8 @@ async def generate_receipt_pdf(order_data: dict, filename: str = None):
         items_data.append([
             item['name'],
             str(item['qty']),
-            f"₦{item['price']:,.0f}",
-            f"₦{item['total']:,.0f}"
+            format_currency(item['price']),
+            format_currency(item['total'])
         ])
     
     items_table = Table(items_data, colWidths=[3*inch, 0.8*inch, 1.2*inch, 1.2*inch])
@@ -134,10 +137,10 @@ async def generate_receipt_pdf(order_data: dict, filename: str = None):
     totals_data = []
     
     if order_data.get('tax', 0) > 0:
-        totals_data.append(['Subtotal:', f"₦{order_data['subtotal']:,.0f}"])
-        totals_data.append(['Tax:', f"₦{order_data['tax']:,.0f}"])
+        totals_data.append(['Subtotal:', format_currency(order_data['subtotal'])])
+        totals_data.append(['Tax:', format_currency(order_data['tax'])])
     
-    totals_data.append(['TOTAL:', f"₦{order_data['total']:,.0f}"])
+    totals_data.append(['TOTAL:', format_currency(order_data['total'])])
     totals_data.append(['Payment Method:', order_data['payment_method']])
     totals_data.append(['Payment Status:', order_data['payment_status'].upper()])
     

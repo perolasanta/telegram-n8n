@@ -52,6 +52,7 @@ class OrderStates(StatesGroup):
     waiting_for_quantity = State()
     waiting_for_payment_proof = State()
     waiting_for_address = State()
+    waiting_for_restock_quantity = State()
 
 
 # ========== HELPER FUNCTIONS ==========
@@ -59,6 +60,106 @@ class OrderStates(StatesGroup):
 def format_delivery_coordinates(lat: float, lon: float) -> str:
     """Build a readable fallback address from shared coordinates."""
     return f"Shared location: {lat:.6f}, {lon:.6f}"
+
+async def get_restaurant_by_kitchen_chat(chat_id: int):
+    response = supabase.table("restaurants")\
+        .select("id, name, kitchen_chat_id")\
+        .eq("kitchen_chat_id", chat_id)\
+        .execute()
+    return response.data[0] if response.data else None
+
+
+def format_inventory_line(item: dict) -> str:
+    count = int(item.get("inventory_count") or 0)
+    threshold = int(item.get("restock_threshold") or 0)
+    if count <= 0:
+        return f"• {item['name']} — 0 portions (unavailable)"
+    if count <= threshold:
+        return f"• {item['name']} — {count} portions ⚠️ Low"
+    return f"• {item['name']} — {count} portions"
+
+
+async def get_tracked_inventory_items(restaurant_id: str):
+    response = supabase.table("menu_items")\
+        .select("id, name, inventory_count, restock_threshold, is_available")\
+        .eq("restaurant_id", restaurant_id)\
+        .eq("track_inventory", True)\
+        .order("name")\
+        .execute()
+    return response.data or []
+
+
+async def validate_cart_inventory(cart: dict):
+    shortages = []
+    for menu_item_id, cart_item in cart.items():
+        item = supabase.table("menu_items")\
+            .select("name, inventory_count, track_inventory")\
+            .eq("id", menu_item_id)\
+            .execute()
+        if not item.data:
+            continue
+        item_data = item.data[0]
+        if not item_data.get("track_inventory"):
+            continue
+        available = int(item_data.get("inventory_count") or 0)
+        requested = int(cart_item.get("qty") or 0)
+        if requested > available:
+            shortages.append({
+                "name": item_data["name"],
+                "requested": requested,
+                "available": available,
+            })
+    return shortages
+
+
+async def send_restock_alert(restaurant_id: str, kitchen_chat_id: int | None, low_stock_items: list[dict]):
+    if not low_stock_items:
+        return
+
+    lines = []
+    for item in low_stock_items:
+        count = int(item.get("inventory_count") or 0)
+        threshold = int(item.get("restock_threshold") or 0)
+        if count <= threshold:
+            lines.append(f"• {item['name']} — {count} portions remaining")
+
+    if not lines:
+        return
+
+    restaurant = supabase.table("restaurants")\
+        .select("name, manager_telegram_id")\
+        .eq("id", restaurant_id)\
+        .execute()
+    restaurant_data = restaurant.data[0] if restaurant.data else {}
+    restaurant_name = restaurant_data.get("name", "Restaurant")
+    manager_telegram_id = restaurant_data.get("manager_telegram_id")
+
+    if kitchen_chat_id:
+        try:
+            await bot.send_message(
+                kitchen_chat_id,
+                "⚠️ <b>Restock Alert</b>\n\n" + "\n".join(lines) + "\n\nUse /restock to update stock."
+            )
+        except Exception as e:
+            print(f"Failed to send restock alert to kitchen: {e}")
+
+    if manager_telegram_id:
+        manager_footer = "Kitchen has been notified." if kitchen_chat_id else "No kitchen group is configured for this restaurant."
+        try:
+            await bot.send_message(
+                int(manager_telegram_id),
+                f"⚠️ <b>Low Stock — {restaurant_name}</b>\n\n"
+                + "\n".join(lines)
+                + f"\n\n{manager_footer}"
+            )
+        except Exception as e:
+            print(f"Failed to send low stock alert to manager: {e}")
+
+
+async def deduct_inventory_for_order(order_id: str):
+    response = supabase.rpc("deduct_order_inventory", {"p_order_id": order_id}).execute()
+    return response.data or []
+
 
 async def get_categories(restaurant_id: str, menu_filter: str | None = None):
     """Get active categories for restaurant"""
@@ -949,6 +1050,14 @@ async def create_order_in_db(user_id: int, state: FSMContext, payment_method: st
     if order_type == "delivery" and not delivery_address and delivery_lat is not None and delivery_lon is not None:
         delivery_address = format_delivery_coordinates(delivery_lat, delivery_lon)
         await state.update_data(delivery_address=delivery_address)
+
+    shortages = await validate_cart_inventory(cart)
+    if shortages:
+        details = "; ".join(
+            f"{item['name']} has {item['available']} left, requested {item['requested']}"
+            for item in shortages
+        )
+        raise ValueError(f"Insufficient stock: {details}")
     
     # Get customer name
     user = await bot.get_chat(user_id)
@@ -1098,6 +1207,10 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
         
         # SEND TO KITCHEN
         await send_order_to_kitchen(order_id, user_id, state)
+
+        low_stock_items = await deduct_inventory_for_order(order_id)
+        data = await state.get_data()
+        await send_restock_alert(data.get("restaurant_id"), data.get("kitchen_chat_id"), low_stock_items)
         
         # SEND RECEIPT TO CUSTOMER
         await send_receipt_to_customer(user_id, order_id)
@@ -1117,6 +1230,8 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
         # Clear cart
         await state.update_data(cart={})
         
+    except ValueError as e:
+        await callback_query.message.answer(f"⚠️ {e}")
     except Exception as e:
         print(f"Order error: {e}")
         await callback_query.message.answer("❌ Failed to place order. Please try again.")
@@ -1137,6 +1252,10 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
         
         # SEND TO KITCHEN
         await send_order_to_kitchen(order_id, user_id, state)
+
+        low_stock_items = await deduct_inventory_for_order(order_id)
+        data = await state.get_data()
+        await send_restock_alert(data.get("restaurant_id"), data.get("kitchen_chat_id"), low_stock_items)
         
         # SEND RECEIPT TO CUSTOMER
         await send_receipt_to_customer(user_id, order_id)
@@ -1156,6 +1275,8 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
         # Clear cart
         await state.update_data(cart={})
         
+    except ValueError as e:
+        await callback_query.message.answer(f"⚠️ {e}")
     except Exception as e:
         print(f"Order error: {e}")
         await callback_query.message.answer("❌ Failed to place order. Please try again.")
@@ -1241,6 +1362,8 @@ async def receive_payment_proof(message: types.Message, state: FSMContext):
         await state.update_data(cart={})
         await state.clear()
         
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}")
     except Exception as e:
         print(f"Order error: {e}")
         await message.answer("❌ Failed to place order. Please try again.")
@@ -1276,13 +1399,18 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
     
     # Get order details
     order = supabase.table("orders")\
-        .select("telegram_user_id, customer_name")\
+        .select("telegram_user_id, customer_name, restaurant_id, restaurants(kitchen_chat_id)")\
         .eq("id", order_id)\
         .execute()
     
     if order.data:
-        user_id = order.data[0]["telegram_user_id"]
-        customer_name = order.data[0]["customer_name"]
+        order_data = order.data[0]
+        user_id = order_data["telegram_user_id"]
+        customer_name = order_data["customer_name"]
+        kitchen_chat_id = (order_data.get("restaurants") or {}).get("kitchen_chat_id")
+
+        low_stock_items = await deduct_inventory_for_order(order_id)
+        await send_restock_alert(order_data.get("restaurant_id"), kitchen_chat_id, low_stock_items)
         
         try:
             await bot.send_message(
@@ -1752,6 +1880,109 @@ def short_id(uuid_str):
     return uuid_str.replace('-', '')[:12]
 
 
+@dp.message(Command("restock"))
+async def kitchen_restock_management(message: types.Message, state: FSMContext):
+    restaurant = await get_restaurant_by_kitchen_chat(message.chat.id)
+    if not restaurant:
+        await message.answer("⚠️ This command only works in a registered kitchen group.")
+        return
+
+    items = await get_tracked_inventory_items(restaurant["id"])
+    if not items:
+        await message.answer("No inventory-tracked menu items found. Enable tracking from the database first.")
+        return
+
+    keyboard = InlineKeyboardBuilder()
+    for item in items:
+        count = int(item.get("inventory_count") or 0)
+        keyboard.add(InlineKeyboardButton(
+            text=f"{item['name']} ({count})",
+            callback_data=f"rsi_{short_id(item['id'])}"
+        ))
+    keyboard.adjust(1)
+
+    summary = "\n".join(format_inventory_line(item) for item in items)
+    await state.clear()
+    await message.answer(
+        f"📦 <b>{restaurant['name']} — Restock</b>\n\n"
+        f"{summary}\n\n"
+        f"Select an item to add stock:",
+        reply_markup=keyboard.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("rsi_"))
+async def kitchen_select_restock_item(callback_query: types.CallbackQuery, state: FSMContext):
+    short_item = callback_query.data.replace("rsi_", "")
+    restaurant = await get_restaurant_by_kitchen_chat(callback_query.message.chat.id)
+    if not restaurant:
+        await callback_query.answer("Kitchen group not recognized.", show_alert=True)
+        return
+
+    items = supabase.table("menu_items")\
+        .select("id, name, inventory_count, restaurant_id")\
+        .eq("restaurant_id", restaurant["id"])\
+        .eq("track_inventory", True)\
+        .execute()
+
+    item_data = None
+    for item in items.data or []:
+        if item["id"].replace('-', '')[:12] == short_item:
+            item_data = item
+            break
+
+    if not item_data:
+        await callback_query.answer("Item not found.", show_alert=True)
+        return
+
+    await state.update_data(restock_item_id=item_data["id"], restock_item_name=item_data["name"])
+    await state.set_state(OrderStates.waiting_for_restock_quantity)
+    await callback_query.message.answer(
+        f"How many portions of {item_data['name']} should be added?\n"
+        f"Current stock: {int(item_data.get('inventory_count') or 0)}"
+    )
+    await callback_query.answer()
+
+
+@dp.message(OrderStates.waiting_for_restock_quantity)
+async def handle_restock_quantity(message: types.Message, state: FSMContext):
+    if not message.text or not message.text.isdigit():
+        await message.answer("⚠️ Please enter a whole number greater than zero.")
+        return
+
+    quantity = int(message.text)
+    if quantity <= 0:
+        await message.answer("⚠️ Restock quantity must be greater than zero.")
+        return
+
+    data = await state.get_data()
+    item_id = data.get("restock_item_id")
+    item_name = data.get("restock_item_name", "Item")
+
+    item = supabase.table("menu_items")\
+        .select("inventory_count")\
+        .eq("id", item_id)\
+        .execute()
+
+    if not item.data:
+        await message.answer("Item not found.")
+        await state.clear()
+        return
+
+    new_count = int(item.data[0].get("inventory_count") or 0) + quantity
+    supabase.table("menu_items")\
+        .update({"inventory_count": new_count, "is_available": new_count > 0})\
+        .eq("id", item_id)\
+        .execute()
+
+    await state.clear()
+    await message.answer(
+        f"✅ {item_name} restocked.\n"
+        f"Added: {quantity}\n"
+        f"Current stock: {new_count}"
+    )
+
+
 @dp.message(Command("menu"))
 async def kitchen_menu_management(message: types.Message):
     chat_id = message.chat.id
@@ -2083,24 +2314,7 @@ async def order_status(message: types.Message, state: FSMContext):
     )
 
 
-# Cart confirmation with empty cart check and session expiry handling
-@dp.callback_query(F.data == "confirm_order")
-async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    cart = data.get("cart", {})
-    
-    if not cart:
-        await callback_query.message.answer(
-            "🛒 Your cart is empty.\n\n"
-            "⚠️ If you had items in your cart, your session may have "
-            "expired. Please scan the QR code again to restart."
-        )
-        await callback_query.answer()
-        return
-
 # kitchen counter for pending orders
-# Show loading state when confirming order
-    await callback_query.answer("Processing your order...", show_alert=True)
 @dp.message(Command("pending"))
 async def pending_orders(message: types.Message):
     chat_id = message.chat.id

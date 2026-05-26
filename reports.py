@@ -2,6 +2,31 @@
 from datetime import datetime, timedelta
 from supabase import Client
 
+
+def build_inventory_summary(supabase: Client, restaurant_id: str) -> str:
+    items = supabase.table("menu_items")\
+        .select("name, inventory_count, restock_threshold, is_available")\
+        .eq("restaurant_id", restaurant_id)\
+        .eq("track_inventory", True)\
+        .order("name")\
+        .execute()
+
+    if not items.data:
+        return ""
+
+    report = "📦 *Inventory Summary*\n"
+    for item in items.data:
+        count = int(item.get("inventory_count") or 0)
+        threshold = int(item.get("restock_threshold") or 0)
+        if count <= 0 or item.get("is_available") is False:
+            report += f"• {item['name']} — {count} portions (unavailable)\n"
+        elif count <= threshold:
+            report += f"• {item['name']} — {count} portions ⚠️ Low\n"
+        else:
+            report += f"• {item['name']} — {count} portions remaining\n"
+
+    return report + "\n"
+
 async def generate_daily_report(supabase: Client, restaurant_id: str, date: datetime = None) -> str:
     """Generate daily sales report"""
     
@@ -29,9 +54,11 @@ async def generate_daily_report(supabase: Client, restaurant_id: str, date: date
         .execute()
     
     if not orders.data:
+        inventory_summary = build_inventory_summary(supabase, restaurant_id)
         return f"📊 *Daily Report - {date.strftime('%Y-%m-%d')}*\n\n" \
                f"🏪 {restaurant_name}\n\n" \
-               f"No orders today."
+               f"No orders today.\n\n" \
+               f"{inventory_summary}"
     
     # Calculate statistics
     total_orders = len(orders.data)
@@ -83,7 +110,9 @@ async def generate_daily_report(supabase: Client, restaurant_id: str, date: date
         report += f"🔥 *Top Selling Items*\n"
         for i, (item, qty) in enumerate(top_items, 1):
             report += f"{i}. {item} - {qty} sold\n"
-    
+        report += "\n"
+
+    report += build_inventory_summary(supabase, restaurant_id)
     return report
 
 
@@ -112,10 +141,12 @@ async def generate_weekly_report(supabase: Client, restaurant_id: str, end_date:
         .execute()
     
     if not orders.data:
+        inventory_summary = build_inventory_summary(supabase, restaurant_id)
         return f"📊 *Weekly Report*\n" \
                f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}\n\n" \
                f"🏪 {restaurant_name}\n\n" \
-               f"No orders this week."
+               f"No orders this week.\n\n" \
+               f"{inventory_summary}"
     
     # Calculate statistics
     total_orders = len(orders.data)
@@ -183,7 +214,8 @@ async def generate_weekly_report(supabase: Client, restaurant_id: str, end_date:
         for i, (item, data) in enumerate(top_items, 1):
             report += f"{i}. {item}\n"
             report += f"   Sold: {data['qty']} | Revenue: ₦{data['revenue']:,.0f}\n"
-    
-    return report
+        report += "\n"
 
+    report += build_inventory_summary(supabase, restaurant_id)
+    return report
 
