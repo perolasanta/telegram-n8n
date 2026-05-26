@@ -11,6 +11,7 @@ import logging
 import asyncio
 import aiohttp
 import os
+from html import escape
 from supabase import Client, create_client
 from decimal import Decimal
 from dotenv import load_dotenv
@@ -37,6 +38,7 @@ N8N_UPDATE_WEBHOOK_URL = os.getenv("N8N_UPDATE_WEBHOOK_URL", "https://n8n-atad.o
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
+RUSH_HOUR_PENDING_THRESHOLD = int(os.getenv("RUSH_HOUR_PENDING_THRESHOLD", "5"))
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -159,6 +161,215 @@ async def send_restock_alert(restaurant_id: str, kitchen_chat_id: int | None, lo
 async def deduct_inventory_for_order(order_id: str):
     response = supabase.rpc("deduct_order_inventory", {"p_order_id": order_id}).execute()
     return response.data or []
+
+
+def format_money(amount) -> str:
+    return f"₦{float(amount):,.0f}"
+
+
+def order_short_id(order_id: str) -> str:
+    return order_id.replace("-", "")[:4].upper()
+
+
+def parse_created_at(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def summarize_order_items(order_items: list[dict], max_items: int = 3) -> str:
+    parts = []
+    for item in order_items or []:
+        menu_item = item.get("menu_items") or {}
+        name = menu_item.get("name", "Item")
+        quantity = int(item.get("quantity") or 0)
+        parts.append(f"{name} x{quantity}")
+
+    if not parts:
+        return "Items unavailable"
+
+    visible = parts[:max_items]
+    if len(parts) > max_items:
+        visible.append(f"+{len(parts) - max_items} more")
+    return ", ".join(visible)
+
+
+def format_order_location(order: dict, include_type: bool = False) -> str:
+    order_type = order.get("order_type") or "dine_in"
+    if order_type == "delivery":
+        address = order.get("delivery_address") or "No address"
+        area = address.split(",")[0].strip()
+        label = f"Delivery ({area[:28]})" if area else "Delivery"
+    elif order_type == "pickup":
+        label = "Pickup"
+    else:
+        table = order.get("restaurant_tables") or {}
+        label = f"Table {table.get('table_number') or 'Unknown'}"
+
+    if include_type and order_type == "dine_in":
+        return f"{label} — Dine-in"
+    return label
+
+
+async def build_kitchen_order_board(restaurant_id: str) -> tuple[str, int]:
+    lagos_tz = pytz.timezone("Africa/Lagos")
+    now = datetime.now(lagos_tz)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+
+    restaurant = supabase.table("restaurants")\
+        .select("name")\
+        .eq("id", restaurant_id)\
+        .execute()
+    restaurant_name = restaurant.data[0]["name"] if restaurant.data else "Restaurant"
+
+    orders = supabase.table("orders")\
+        .select("id, order_type, delivery_address, order_status, payment_status, payment_method, created_at, order_items(quantity, menu_items(name)), restaurant_tables(table_number)")\
+        .eq("restaurant_id", restaurant_id)\
+        .in_("order_status", ["pending", "preparing", "ready"])\
+        .neq("payment_status", "rejected")\
+        .gte("created_at", start.astimezone(pytz.utc).isoformat())\
+        .lt("created_at", end.astimezone(pytz.utc).isoformat())\
+        .order("created_at")\
+        .execute()
+
+    rows = orders.data or []
+    pending = [order for order in rows if order.get("order_status") == "pending"]
+    preparing = [order for order in rows if order.get("order_status") == "preparing"]
+    ready = sorted(
+        [order for order in rows if order.get("order_status") == "ready"],
+        key=lambda item: parse_created_at(item["created_at"]),
+        reverse=True
+    )[:3]
+
+    rush_label = "  🔥 RUSH HOUR" if len(pending) > RUSH_HOUR_PENDING_THRESHOLD else ""
+    board = [
+        f"📋 <b>LIVE ORDER BOARD — {escape(restaurant_name)}</b>{rush_label}",
+        f"Updated: {now.strftime('%I:%M %p').lstrip('0')}",
+        "",
+    ]
+
+    def add_section(
+        title: str,
+        section_orders: list[dict],
+        show_items: bool = True,
+        max_orders: int = 20
+    ):
+        board.append(title)
+        if not section_orders:
+            board.append("No orders")
+            board.append("")
+            return
+
+        visible_orders = section_orders[:max_orders]
+        for order in visible_orders:
+            short_id = order_short_id(order["id"])
+            location = format_order_location(order)
+            payment_note = ""
+            if order.get("payment_status") == "pending":
+                payment_note = " — payment check"
+
+            if show_items:
+                items = summarize_order_items(order.get("order_items") or [])
+                board.append(
+                    f"#{short_id} — {escape(location)} — {escape(items)}{payment_note}"
+                )
+            else:
+                board.append(f"#{short_id} — {escape(location)}")
+
+        hidden_count = len(section_orders) - len(visible_orders)
+        if hidden_count > 0:
+            board.append(f"+{hidden_count} more")
+        board.append("")
+
+    add_section("🔴 <b>PENDING</b>", pending)
+    add_section("🟡 <b>PREPARING</b>", preparing)
+    add_section("✅ <b>READY (last 3)</b>", ready, show_items=False)
+
+    board.append("Use the buttons on each order message to update status.")
+    return "\n".join(board), len(pending)
+
+
+async def send_rush_hour_alert_if_needed(restaurant: dict, pending_count: int, today: str):
+    if pending_count <= RUSH_HOUR_PENDING_THRESHOLD:
+        return
+
+    if restaurant.get("kitchen_rush_alert_date") == today:
+        return
+
+    manager_id = restaurant.get("manager_telegram_id")
+    if not manager_id:
+        return
+
+    try:
+        await bot.send_message(
+            int(manager_id),
+            f"⚠️ <b>{pending_count} orders pending at {escape(restaurant.get('name', 'Restaurant'))}.</b>\n"
+            "Kitchen may need support."
+        )
+        supabase.table("restaurants")\
+            .update({"kitchen_rush_alert_date": today})\
+            .eq("id", restaurant["id"])\
+            .execute()
+    except Exception as e:
+        print(f"Failed to send rush hour alert: {e}")
+
+
+async def refresh_kitchen_order_board(restaurant_id: str):
+    restaurant_response = supabase.table("restaurants")\
+        .select("id, name, kitchen_chat_id, manager_telegram_id, kitchen_board_message_id, kitchen_board_message_date, kitchen_rush_alert_date")\
+        .eq("id", restaurant_id)\
+        .execute()
+
+    if not restaurant_response.data:
+        return
+
+    restaurant = restaurant_response.data[0]
+    kitchen_chat_id = restaurant.get("kitchen_chat_id")
+    if not kitchen_chat_id:
+        return
+
+    lagos_tz = pytz.timezone("Africa/Lagos")
+    today = datetime.now(lagos_tz).date().isoformat()
+    board_text, pending_count = await build_kitchen_order_board(restaurant_id)
+
+    message_id = restaurant.get("kitchen_board_message_id")
+    message_date = restaurant.get("kitchen_board_message_date")
+
+    if message_id and message_date == today:
+        try:
+            await bot.edit_message_text(
+                text=board_text,
+                chat_id=kitchen_chat_id,
+                message_id=int(message_id)
+            )
+            await send_rush_hour_alert_if_needed(restaurant, pending_count, today)
+            return
+        except Exception as e:
+            print(f"Failed to edit kitchen order board, creating a new one: {e}")
+
+    try:
+        sent_message = await bot.send_message(kitchen_chat_id, board_text)
+        try:
+            await bot.pin_chat_message(
+                chat_id=kitchen_chat_id,
+                message_id=sent_message.message_id,
+                disable_notification=True
+            )
+        except Exception as e:
+            print(f"Failed to pin kitchen order board: {e}")
+
+        supabase.table("restaurants")\
+            .update({
+                "kitchen_board_message_id": sent_message.message_id,
+                "kitchen_board_message_date": today,
+            })\
+            .eq("id", restaurant_id)\
+            .execute()
+
+        restaurant["kitchen_board_message_id"] = sent_message.message_id
+        restaurant["kitchen_board_message_date"] = today
+        await send_rush_hour_alert_if_needed(restaurant, pending_count, today)
+    except Exception as e:
+        print(f"Failed to refresh kitchen order board: {e}")
 
 
 async def get_categories(restaurant_id: str, menu_filter: str | None = None):
@@ -1122,15 +1333,18 @@ async def send_order_to_kitchen(order_id: str, user_id: int, state: FSMContext, 
     total_price = data.get("total_price", 0)
     table_number = data.get("table_number", "Unknown")
     restaurant_name = data.get("restaurant_name", "Restaurant")
+    restaurant_id = data.get("restaurant_id")
     kitchen_chat_id = data.get("kitchen_chat_id")
+    order_type = data.get("order_type", "dine_in")
 
-    if data.get("order_type") == "delivery":
-        table_number = "Delivery Order"
+    if order_type == "delivery":
         delivery_address = data.get("delivery_address", "No address provided")
-        table_number += f"\n📍 {delivery_address}"
+        order_location = f"Delivery\n📍 {delivery_address}"
         
-    elif data.get("order_type") == "pickup":
-        table_number = "Pickup Order"
+    elif order_type == "pickup":
+        order_location = "Pickup"
+    else:
+        order_location = f"Table {table_number} — Dine-in"
     
     if not kitchen_chat_id:
         print("⚠️ No kitchen_chat_id configured for this restaurant")
@@ -1141,25 +1355,25 @@ async def send_order_to_kitchen(order_id: str, user_id: int, state: FSMContext, 
     customer_name = user.username or user.first_name or "Unknown"
     
     # Build order message
-    order_text = f"🍽 New Order #{order_id[:8]}\n"
-    order_text += f"🏪 {restaurant_name}\n"
-    order_text += f"📍 Table {table_number}\n\n"
+    order_text = f"🆕 <b>NEW ORDER  #{order_short_id(order_id)}</b>\n"
+    order_text += f"🏪 {escape(restaurant_name)}\n"
+    order_text += f"📍 {escape(order_location)}\n"
+    order_text += "─────────────────\n"
     
     for item in cart.values():
         qty = item["qty"]
         name = item["name"]
-        price = item["price"]
-        order_text += f"• {qty}x {name} - ₦{price:,.0f}\n"
+        order_text += f"• {escape(name)} × {qty}\n"
     
-    order_text += f"\n💰 Total: ₦{total_price:,.0f}"
-    
+    order_text += "─────────────────"
     payment_method = data.get("payment_method", "Unknown")
-    order_text += f"\n💳 Payment: {payment_method}"
+    order_text += f"\n💰 {format_money(total_price)}  |  {escape(payment_method)}"
+    order_text += f"\n⏱ {datetime.now(pytz.timezone('Africa/Lagos')).strftime('%I:%M %p').lstrip('0')}"
     
     if payment_method == "Bank Transfer":
         order_text += "\n⏳ Status: Pending Verification"
     
-    order_text += f"\n👤 Customer: @{customer_name}" if user.username else f"\n👤 Customer: {customer_name}"
+    order_text += f"\n👤 Customer: @{escape(customer_name)}" if user.username else f"\n👤 Customer: {escape(customer_name)}"
     
     # Send to kitchen
     if payment_proof_file_id:
@@ -1180,15 +1394,18 @@ async def send_order_to_kitchen(order_id: str, user_id: int, state: FSMContext, 
     else:
         # Other payment methods
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🍳 Mark as Preparing", callback_data=f"preparing_{order_id}")],
-    [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]
-])
+            [InlineKeyboardButton(text="🍳 Mark as Preparing", callback_data=f"preparing_{order_id}")],
+            [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]
+        ])
         
         await bot.send_message(
             kitchen_chat_id,
             text=order_text,
             reply_markup=keyboard
         )
+
+    if restaurant_id:
+        await refresh_kitchen_order_board(restaurant_id)
 
 
 # ========== ORDER CONFIRMATION & PAYMENT ==========
@@ -1402,9 +1619,12 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
         .select("telegram_user_id, customer_name, restaurant_id, restaurants(kitchen_chat_id)")\
         .eq("id", order_id)\
         .execute()
+
+    restaurant_id = None
     
     if order.data:
         order_data = order.data[0]
+        restaurant_id = order_data.get("restaurant_id")
         user_id = order_data["telegram_user_id"]
         customer_name = order_data["customer_name"]
         kitchen_chat_id = (order_data.get("restaurants") or {}).get("kitchen_chat_id")
@@ -1416,7 +1636,7 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
             await bot.send_message(
                 user_id,
                 f"✅ Your payment has been verified!\n"
-                f"Order #{order_id[:8]} is now being prepared. 🍳"
+                f"Order #{order_short_id(order_id)} has been sent to the kitchen. 🍳"
             )
             
             # NOW SEND RECEIPT after payment confirmed
@@ -1426,14 +1646,18 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
             print(f"Failed to notify customer: {e}")
     
     # Update kitchen message
-    ready_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    kitchen_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍳 Mark as Preparing", callback_data=f"preparing_{order_id}")],
         [InlineKeyboardButton(text="🍽️ Mark as Ready", callback_data=f"ready_{order_id}")]
     ])
     
     await callback_query.message.edit_caption(
         caption=callback_query.message.caption + "\n\n✅ PAYMENT CONFIRMED ✅",
-        reply_markup=ready_keyboard
+        reply_markup=kitchen_keyboard
     )
+
+    if restaurant_id:
+        await refresh_kitchen_order_board(restaurant_id)
     
     await callback_query.answer("✅ Payment confirmed!")
 
@@ -1457,17 +1681,20 @@ async def reject_payment_handler(callback_query: types.CallbackQuery):
     
     # Get order details
     order = supabase.table("orders")\
-        .select("telegram_user_id")\
+        .select("telegram_user_id, restaurant_id")\
         .eq("id", order_id)\
         .execute()
+
+    restaurant_id = None
     
     if order.data:
+        restaurant_id = order.data[0].get("restaurant_id")
         user_id = order.data[0]["telegram_user_id"]
         
         try:
             await bot.send_message(
                 user_id,
-                f"❌ Your payment for Order #{order_id[:8]} could not be verified.\n"
+                f"❌ Your payment for Order #{order_short_id(order_id)} could not be verified.\n"
                 f"Please contact us or submit a new payment proof."
             )
         except Exception as e:
@@ -1477,6 +1704,9 @@ async def reject_payment_handler(callback_query: types.CallbackQuery):
         caption=callback_query.message.caption + "\n\n❌ PAYMENT REJECTED ❌",
         reply_markup=None
     )
+
+    if restaurant_id:
+        await refresh_kitchen_order_board(restaurant_id)
     
     await callback_query.answer("❌ Payment rejected!")
 
@@ -1491,14 +1721,32 @@ async def handle_preparing(callback_query: types.CallbackQuery):
         .execute()
     
     order = supabase.table("orders")\
-        .select("telegram_user_id")\
+        .select("telegram_user_id, restaurant_id")\
         .eq("id", order_id)\
         .execute()
     
     if order.data:
         await bot.send_message(
             order.data[0]["telegram_user_id"],
-            f"🍳 Your order #{order_id[:8]} is now being prepared!"
+            f"🍳 Your order #{order_short_id(order_id)} is now being prepared!"
+        )
+
+        restaurant_id = order.data[0].get("restaurant_id")
+        if restaurant_id:
+            await refresh_kitchen_order_board(restaurant_id)
+
+    ready_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]
+    ])
+    if callback_query.message.photo:
+        await callback_query.message.edit_caption(
+            caption=f"{callback_query.message.caption}\n\n🍳 Order marked as preparing.",
+            reply_markup=ready_keyboard
+        )
+    else:
+        await callback_query.message.edit_text(
+            text=f"{callback_query.message.text}\n\n🍳 Order marked as preparing.",
+            reply_markup=ready_keyboard
         )
     
     await callback_query.answer("Marked as preparing!")
@@ -1517,17 +1765,20 @@ async def handle_ready(callback_query: CallbackQuery):
     
     # Get order details
     order = supabase.table("orders")\
-        .select("telegram_user_id, customer_name")\
+        .select("telegram_user_id, customer_name, restaurant_id")\
         .eq("id", order_id)\
         .execute()
+
+    restaurant_id = None
     
     if order.data:
         user_id = order.data[0]["telegram_user_id"]
         customer_name = order.data[0]["customer_name"]
+        restaurant_id = order.data[0].get("restaurant_id")
         
         await bot.send_message(
             user_id,
-            f"✅ Hi {customer_name}, your order #{order_id[:8]} is ready! Please come pick it up."
+            f"✅ Hi {customer_name}, your order #{order_short_id(order_id)} is ready! Please come pick it up."
         )
     
     # Update kitchen message
@@ -1541,6 +1792,9 @@ async def handle_ready(callback_query: CallbackQuery):
             text=f"{callback_query.message.text}\n\n🍽️ Order marked as ready. Customer notified.",
             reply_markup=None
         )
+
+    if restaurant_id:
+        await refresh_kitchen_order_board(restaurant_id)
     
     await callback_query.answer("Done!")
 
@@ -2344,3 +2598,20 @@ async def pending_orders(message: types.Message):
         f"⏳ Pending: {pending.count or 0}\n"
         f"🍳 Preparing: {preparing.count or 0}"
     )
+
+
+@dp.message(Command("board"))
+async def manual_order_board_refresh(message: types.Message):
+    chat_id = message.chat.id
+
+    restaurant = supabase.table("restaurants")\
+        .select("id, name")\
+        .eq("kitchen_chat_id", chat_id)\
+        .execute()
+
+    if not restaurant.data:
+        await message.answer("⚠️ This command only works in a registered kitchen group.")
+        return
+
+    await refresh_kitchen_order_board(restaurant.data[0]["id"])
+    await message.answer("📋 Live order board refreshed.")
