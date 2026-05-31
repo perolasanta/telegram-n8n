@@ -75,4 +75,4 @@ jobs:
 
           docker compose -p chowlin up -d --build --remove-orphans
           docker compose -p chowlin ps
-REMOTE
+          EOF
