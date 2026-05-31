@@ -46,15 +46,15 @@ jobs:
             --exclude='.env' \
             --exclude='__pycache__' \
             --exclude='*.pyc' \
-            -czf "$RELEASE_ARCHIVE" .
-          printf '%s\n' "${{ secrets.CHOWLIN_ENV }}" > "$ENV_FILE"
-          chmod 600 "$ENV_FILE"
+            -czf "/tmp/$RELEASE_ARCHIVE" .
+          printf '%s\n' "${{ secrets.CHOWLIN_ENV }}" > "/tmp/$ENV_FILE"
+          chmod 600 "/tmp/$ENV_FILE"
 
       - name: Upload release
         run: |
           scp -P "${{ secrets.VPS_PORT || '22' }}" \
             -i ~/.ssh/chowlin_deploy_key \
-            "$RELEASE_ARCHIVE" "$ENV_FILE" \
+            "/tmp/$RELEASE_ARCHIVE" "/tmp/$ENV_FILE" \
             "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/tmp/"
 
       - name: Deploy with Docker Compose
