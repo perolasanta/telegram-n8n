@@ -1447,6 +1447,7 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
         # Clear cart
         await state.update_data(cart={})
         
+        
     except ValueError as e:
         await callback_query.message.answer(f"⚠️ {e}")
     except Exception as e:
