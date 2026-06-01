@@ -74,6 +74,8 @@ jobs:
           mv "/tmp/$ENV_FILE" .env
           chmod 600 .env
 
+
+          
           docker compose -p chowlin up -d --build --remove-orphans
           docker compose -p chowlin ps
           EOF
