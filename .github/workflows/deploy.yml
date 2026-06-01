@@ -1,0 +1,79 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: chowlin-vps-deploy
+  cancel-in-progress: true
+
+env:
+  APP_DIR: /opt/chowlin
+  RELEASE_ARCHIVE: chowlin-release.tgz
+  ENV_FILE: chowlin.env
+
+jobs:
+  deploy:
+    name: Deploy Chowlin
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        run: |
+          test -n "${{ secrets.VPS_HOST }}"
+          test -n "${{ secrets.VPS_USER }}"
+          test -n "${{ secrets.VPS_SSH_KEY }}"
+          test -n "${{ secrets.CHOWLIN_ENV }}"
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" | tr -d '\r' > ~/.ssh/chowlin_deploy_key
+          chmod 600 ~/.ssh/chowlin_deploy_key
+          ssh-keygen -y -f ~/.ssh/chowlin_deploy_key > /dev/null
+          ssh-keyscan -p "${{ secrets.VPS_PORT || '22' }}" "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Package application
+        run: |
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.env' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            -czf "/tmp/$RELEASE_ARCHIVE" .
+          printf '%s\n' "${{ secrets.CHOWLIN_ENV }}" > "/tmp/$ENV_FILE"
+          chmod 600 "/tmp/$ENV_FILE"
+
+      - name: Upload release
+        run: |
+          scp -P "${{ secrets.VPS_PORT || '22' }}" \
+            -i ~/.ssh/chowlin_deploy_key \
+            "/tmp/$RELEASE_ARCHIVE" "/tmp/$ENV_FILE" \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/tmp/"
+
+      - name: Deploy with Docker Compose
+        run: |
+          ssh -p "${{ secrets.VPS_PORT || '22' }}" \
+            -i ~/.ssh/chowlin_deploy_key \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "APP_DIR='$APP_DIR' RELEASE_ARCHIVE='$RELEASE_ARCHIVE' ENV_FILE='$ENV_FILE' bash -s" <<EOF
+          set -euo pipefail
+
+          mkdir -p "$APP_DIR"
+          tar -xzf "/tmp/$RELEASE_ARCHIVE" -C "$APP_DIR"
+          rm -f "/tmp/$RELEASE_ARCHIVE"
+
+          cd "$APP_DIR"
+          mv "/tmp/$ENV_FILE" .env
+          chmod 600 .env
+
+          docker compose -p chowlin up -d --build --remove-orphans
+          docker compose -p chowlin ps
+          EOF
