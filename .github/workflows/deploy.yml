@@ -63,7 +63,7 @@ jobs:
           ssh -p "${{ secrets.VPS_PORT || '22' }}" \
             -i ~/.ssh/chowlin_deploy_key \
             "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
-            "APP_DIR='$APP_DIR' RELEASE_ARCHIVE='$RELEASE_ARCHIVE' ENV_FILE='$ENV_FILE' bash -s" <<'REMOTE'
+            "APP_DIR='$APP_DIR' RELEASE_ARCHIVE='$RELEASE_ARCHIVE' ENV_FILE='$ENV_FILE' bash -s" <<EOF
           set -euo pipefail
 
           mkdir -p "$APP_DIR"
@@ -76,4 +76,4 @@ jobs:
 
           docker compose -p chowlin up -d --build --remove-orphans
           docker compose -p chowlin ps
-REMOTE
+          EOF
