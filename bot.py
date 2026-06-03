@@ -358,7 +358,10 @@ async def refresh_kitchen_order_board(restaurant_id: str):
             )
             board_pinned = True
         except Exception as e:
-            print(f"Failed to pin kitchen order board: {e}")
+            print(
+                f"Failed to pin kitchen order board: {e}. "
+                "If this says not enough rights, promote the bot to admin with Pin Messages permission."
+            )
 
         supabase.table("restaurants")\
             .update({
@@ -418,7 +421,7 @@ async def send_receipt_to_customer(user_id: int, order_id: str):
             .execute()
         
         if not order.data:
-            return
+            return False
         
         order_data = order.data[0]
         
@@ -465,9 +468,22 @@ async def send_receipt_to_customer(user_id: int, order_id: str):
         os.remove(pdf_path)
         
         logging.info(f"Receipt sent to user {user_id} for order {order_id}")
+        return True
         
     except Exception as e:
         logging.error(f"Failed to send receipt: {e}")
+        return False
+
+
+async def try_send_receipt_after_order(message: types.Message, user_id: int, order_id: str):
+    try:
+        receipt_sent = await send_receipt_to_customer(user_id, order_id)
+    except Exception as e:
+        print(f"Receipt generation failed for order {order_id}: {e}")
+        receipt_sent = False
+
+    if not receipt_sent:
+        await message.answer("📄 Receipt could not be generated. Please ask staff for a copy.")
 
 
 async def load_pending_reorder(message: types.Message, state: FSMContext):
@@ -1436,11 +1452,7 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
         low_stock_items = await deduct_inventory_for_order(order_id)
         data = await state.get_data()
         await send_restock_alert(data.get("restaurant_id"), data.get("kitchen_chat_id"), low_stock_items)
-        
-        # SEND RECEIPT TO CUSTOMER
-        await send_receipt_to_customer(user_id, order_id)
-        
-        data = await state.get_data()
+
         total_price = data.get("total_price", 0)
         
         await callback_query.message.answer(
@@ -1449,8 +1461,11 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💵 Payment Method: Pay on Delivery\n\n"
             f"Please have cash ready when your order arrives.\n"
-            f"📄 Receipt has been sent to you."
+            f"📄 Receipt will be sent shortly."
         )
+
+        # SEND RECEIPT TO CUSTOMER
+        await try_send_receipt_after_order(callback_query.message, user_id, order_id)
         
         # Clear cart
         await state.update_data(cart={})
@@ -1481,11 +1496,7 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
         low_stock_items = await deduct_inventory_for_order(order_id)
         data = await state.get_data()
         await send_restock_alert(data.get("restaurant_id"), data.get("kitchen_chat_id"), low_stock_items)
-        
-        # SEND RECEIPT TO CUSTOMER
-        await send_receipt_to_customer(user_id, order_id)
-        
-        data = await state.get_data()
+
         total_price = data.get("total_price", 0)
         
         await callback_query.message.answer(
@@ -1494,8 +1505,11 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💵 Payment Method: Cash Payment\n\n"
             f"Please pay cash when collecting your order.\n"
-            f"📄 Receipt has been sent to you."
+            f"📄 Receipt will be sent shortly."
         )
+
+        # SEND RECEIPT TO CUSTOMER
+        await try_send_receipt_after_order(callback_query.message, user_id, order_id)
         
         # Clear cart
         await state.update_data(cart={})
