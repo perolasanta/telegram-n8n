@@ -315,7 +315,7 @@ async def send_rush_hour_alert_if_needed(restaurant: dict, pending_count: int, t
 
 async def refresh_kitchen_order_board(restaurant_id: str):
     restaurant_response = supabase.table("restaurants")\
-        .select("id, name, kitchen_chat_id, manager_telegram_id, kitchen_board_message_id, kitchen_board_message_date, kitchen_rush_alert_date")\
+        .select("id, name, kitchen_chat_id, manager_telegram_id, kitchen_board_message_id, kitchen_board_message_date, kitchen_board_pinned, kitchen_rush_alert_date")\
         .eq("id", restaurant_id)\
         .execute()
 
@@ -333,8 +333,9 @@ async def refresh_kitchen_order_board(restaurant_id: str):
 
     message_id = restaurant.get("kitchen_board_message_id")
     message_date = restaurant.get("kitchen_board_message_date")
+    board_pinned = restaurant.get("kitchen_board_pinned") is True
 
-    if message_id and message_date == today:
+    if message_id and message_date == today and board_pinned:
         try:
             await bot.edit_message_text(
                 text=board_text,
@@ -348,12 +349,14 @@ async def refresh_kitchen_order_board(restaurant_id: str):
 
     try:
         sent_message = await bot.send_message(kitchen_chat_id, board_text)
+        board_pinned = False
         try:
             await bot.pin_chat_message(
                 chat_id=kitchen_chat_id,
                 message_id=sent_message.message_id,
                 disable_notification=True
             )
+            board_pinned = True
         except Exception as e:
             print(f"Failed to pin kitchen order board: {e}")
 
@@ -361,12 +364,14 @@ async def refresh_kitchen_order_board(restaurant_id: str):
             .update({
                 "kitchen_board_message_id": sent_message.message_id,
                 "kitchen_board_message_date": today,
+                "kitchen_board_pinned": board_pinned,
             })\
             .eq("id", restaurant_id)\
             .execute()
 
         restaurant["kitchen_board_message_id"] = sent_message.message_id
         restaurant["kitchen_board_message_date"] = today
+        restaurant["kitchen_board_pinned"] = board_pinned
         await send_rush_hour_alert_if_needed(restaurant, pending_count, today)
     except Exception as e:
         print(f"Failed to refresh kitchen order board: {e}")
@@ -427,19 +432,22 @@ async def send_receipt_to_customer(user_id: int, order_id: str):
                 'total': float(item["subtotal"])
             })
         
+        restaurant_table = order_data.get("restaurant_tables") or {}
+        restaurant = order_data.get("restaurants") or {}
+
         receipt_data = {
             'order_id': order_id,
-            'restaurant_name': order_data["restaurants"]["name"],
-            'restaurant_phone': order_data["restaurants"].get("phone", ""),
-            'table_number': order_data["restaurant_tables"]["table_number"],
-            'customer_name': order_data["customer_name"],
+            'restaurant_name': restaurant.get("name", "Restaurant"),
+            'restaurant_phone': restaurant.get("phone", ""),
+            'table_number': restaurant_table.get("table_number") or format_order_location(order_data, include_type=True),
+            'customer_name': order_data.get("customer_name") or "Customer",
             'created_at': datetime.fromisoformat(order_data["created_at"].replace('Z', '+00:00')),
             'items': items,
             'subtotal': float(order_data["total_amount"]),
             'tax': 0,
             'total': float(order_data["total_amount"]),
-            'payment_method': order_data["payment_method"],
-            'payment_status': order_data["payment_status"]
+            'payment_method': order_data.get("payment_method") or "Unknown",
+            'payment_status': order_data.get("payment_status") or "unknown"
         }
         
         # Generate PDF

@@ -5,10 +5,25 @@ from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from html import escape
 import os
 
 def format_currency(amount):
-    return f"NGN {amount:,.0f}"
+    value = money_amount(amount)
+    return f"NGN {value:,.0f}"
+
+def money_amount(amount) -> Decimal:
+    try:
+        return Decimal(str(amount or 0))
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+
+def safe_text(value, fallback: str = ""):
+    return escape(str(value if value is not None else fallback))
+
+def plain_text(value, fallback: str = ""):
+    return str(value if value is not None else fallback)
 
 async def generate_receipt_pdf(order_data: dict, filename: str = None):
     """
@@ -64,11 +79,11 @@ async def generate_receipt_pdf(order_data: dict, filename: str = None):
     normal_style.fontSize = 10
     
     # Header - Restaurant Name
-    elements.append(Paragraph(order_data['restaurant_name'], title_style))
+    elements.append(Paragraph(safe_text(order_data.get('restaurant_name'), 'Restaurant'), title_style))
     
     # Restaurant Info
     if order_data.get('restaurant_phone'):
-        elements.append(Paragraph(f"Phone: {order_data['restaurant_phone']}", normal_style))
+        elements.append(Paragraph(f"Phone: {safe_text(order_data['restaurant_phone'])}", normal_style))
     elements.append(Spacer(1, 0.3*inch))
     
     # Receipt Title
@@ -79,8 +94,8 @@ async def generate_receipt_pdf(order_data: dict, filename: str = None):
     order_info = [
         ['Order ID:', f"#{order_data['order_id'][:8]}"],
         ['Date:', order_data['created_at'].strftime('%Y-%m-%d %H:%M:%S')],
-        ['Table:', order_data['table_number']],
-        ['Customer:', order_data['customer_name']],
+        ['Table:', plain_text(order_data.get('table_number'), 'N/A')],
+        ['Customer:', plain_text(order_data.get('customer_name'), 'Customer')],
     ]
     
     info_table = Table(order_info, colWidths=[2*inch, 4*inch])
@@ -103,7 +118,7 @@ async def generate_receipt_pdf(order_data: dict, filename: str = None):
     # Table rows
     for item in order_data['items']:
         items_data.append([
-            item['name'],
+            plain_text(item.get('name'), 'Item'),
             str(item['qty']),
             format_currency(item['price']),
             format_currency(item['total'])
@@ -136,13 +151,13 @@ async def generate_receipt_pdf(order_data: dict, filename: str = None):
     # Totals
     totals_data = []
     
-    if order_data.get('tax', 0) > 0:
+    if money_amount(order_data.get('tax', 0)) > 0:
         totals_data.append(['Subtotal:', format_currency(order_data['subtotal'])])
         totals_data.append(['Tax:', format_currency(order_data['tax'])])
     
     totals_data.append(['TOTAL:', format_currency(order_data['total'])])
-    totals_data.append(['Payment Method:', order_data['payment_method']])
-    totals_data.append(['Payment Status:', order_data['payment_status'].upper()])
+    totals_data.append(['Payment Method:', plain_text(order_data.get('payment_method'), 'Unknown')])
+    totals_data.append(['Payment Status:', plain_text(str(order_data.get('payment_status') or 'unknown').upper())])
     
     totals_table = Table(totals_data, colWidths=[4*inch, 2*inch])
     totals_table.setStyle(TableStyle([
