@@ -427,9 +427,10 @@ async def send_receipt_to_customer(user_id: int, order_id: str):
         
         # Prepare receipt data
         items = []
-        for item in order_data["order_items"]:
+        for item in order_data.get("order_items") or []:
+            menu_item = item.get("menu_items") or {}
             items.append({
-                'name': item["menu_items"]["name"],
+                'name': menu_item.get("name", "Item"),
                 'qty': item["quantity"],
                 'price': float(item["unit_price"]),
                 'total': float(item["subtotal"])
@@ -471,6 +472,8 @@ async def send_receipt_to_customer(user_id: int, order_id: str):
         return True
         
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         logging.error(f"Failed to send receipt: {e}")
         return False
 
