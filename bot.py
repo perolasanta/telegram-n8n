@@ -345,7 +345,7 @@ async def refresh_kitchen_order_board(restaurant_id: str):
             await send_rush_hour_alert_if_needed(restaurant, pending_count, today)
             return
         except Exception as e:
-            print(f"Failed to edit kitchen order board, creating a new one: {e}")
+            logging.error(f"Failed to edit kitchen order board, creating a new one: {e}")
 
     try:
         sent_message = await bot.send_message(kitchen_chat_id, board_text)
@@ -472,8 +472,6 @@ async def send_receipt_to_customer(user_id: int, order_id: str):
         return True
         
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         logging.error(f"Failed to send receipt: {e}")
         return False
 
@@ -1790,7 +1788,7 @@ async def handle_ready(callback_query: CallbackQuery):
     
     # Get order details
     order = supabase.table("orders")\
-        .select("telegram_user_id, customer_name, restaurant_id")\
+        .select("telegram_user_id, customer_name, restaurant_id, order_type")\
         .eq("id", order_id)\
         .execute()
 
@@ -1800,11 +1798,16 @@ async def handle_ready(callback_query: CallbackQuery):
         user_id = order.data[0]["telegram_user_id"]
         customer_name = order.data[0]["customer_name"]
         restaurant_id = order.data[0].get("restaurant_id")
+        order_type = order.data[0].get("order_type", "dine_in")
         
-        await bot.send_message(
-            user_id,
-            f"✅ Hi {customer_name}, your order #{order_short_id(order_id)} is ready! Please come pick it up."
-        )
+        if order_type == "dine_in":
+            ready_message = f"✅ Hi {customer_name}, your order #{order_short_id(order_id)} is ready! Your waiter will bring it to your table shortly."
+        elif order_type == "delivery":
+            ready_message = f"✅ Hi {customer_name}, your order #{order_short_id(order_id)} is ready and on its way to you! 🛵"
+        else:  # pickup
+            ready_message = f"✅ Hi {customer_name}, your order #{order_short_id(order_id)} is ready for collection! Please come pick it up at the counter."
+        
+        await bot.send_message(user_id, ready_message)
     
     # Update kitchen message
     if callback_query.message.photo:
