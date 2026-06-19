@@ -2,7 +2,7 @@ from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.utils.markdown import hbold 
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
@@ -55,6 +55,98 @@ class OrderStates(StatesGroup):
     waiting_for_payment_proof = State()
     waiting_for_address = State()
     waiting_for_restock_quantity = State()
+
+
+# ========== DELIVERY-ONLY BOT SUPPORT ==========
+
+delivery_dp = Dispatcher()
+delivery_entry_router = Router()
+
+
+async def start_delivery_session(message: types.Message, state: FSMContext, bot: Bot, delivery_restaurant_id: str):
+    restaurant = supabase.table("restaurants")\
+        .select("id, name, kitchen_chat_id")\
+        .eq("id", delivery_restaurant_id)\
+        .execute()
+
+    if not restaurant.data:
+        await message.answer("Sorry, this restaurant isn't set up yet. Please try again shortly.")
+        return
+
+    r = restaurant.data[0]
+
+    if not await is_subscription_active(r["id"]):
+        await message.answer(
+            "⚠️ We're not currently accepting orders. Please check back soon."
+        )
+        return
+
+    table = supabase.table("restaurant_tables")\
+        .select("id")\
+        .eq("restaurant_id", r["id"])\
+        .eq("table_number", "EXTERNAL")\
+        .eq("is_active", True)\
+        .execute()
+    table_id = table.data[0]["id"] if table.data else None
+
+    await state.update_data(
+        restaurant_id=r["id"],
+        restaurant_name=r["name"],
+        kitchen_chat_id=r["kitchen_chat_id"],
+        table_id=table_id,
+        table_number=None,
+        menu_filter=None,
+        order_type="delivery",
+        cart={}
+    )
+
+    if await load_pending_reorder(message, state):
+        return
+
+    await message.answer(
+        f"Welcome to {hbold(r['name'])}! 🛵\n\n"
+        f"📍 <b>Enter your delivery address</b>\n\n"
+        "You can either:\n\n"
+        "📌 <b>Share your location</b> — tap the 📎 paperclip icon "
+        "at the bottom of your screen → tap <b>Location</b> → "
+        "tap <b>Send My Current Location</b>\n\n"
+        "✍️ <b>Or type your address</b> — e.g:\n"
+        "<i>12 Adeola Street, Minna, Niger State</i>"
+    )
+    await state.set_state(OrderStates.waiting_for_address)
+
+
+@delivery_entry_router.message(CommandStart())
+async def delivery_start(message: types.Message, state: FSMContext, bot: Bot, delivery_restaurant_id: str):
+    await start_delivery_session(message, state, bot, delivery_restaurant_id)
+
+
+@delivery_entry_router.message(StateFilter(None), F.text)
+async def delivery_catch_all(message: types.Message, state: FSMContext, bot: Bot, delivery_restaurant_id: str):
+    await start_delivery_session(message, state, bot, delivery_restaurant_id)
+
+
+delivery_dp.include_router(delivery_entry_router)
+delivery_dp.include_router(router)  # reuse existing cart/payment/kitchen logic
+
+
+delivery_bots: dict[str, Bot] = {}
+
+
+async def load_delivery_bots():
+    """Spin up one Bot() per restaurant with a delivery_bot_token set."""
+    restaurants = supabase.table("restaurants")\
+        .select("id, delivery_bot_token")\
+        .not_.is_("delivery_bot_token", "null")\
+        .execute()
+    for r in restaurants.data or []:
+        rid = r["id"]
+        if rid not in delivery_bots:
+            delivery_bots[rid] = Bot(
+                token=r["delivery_bot_token"],
+                default=DefaultBotProperties(parse_mode="HTML")
+            )
+    return delivery_bots
 
 
 # ========== HELPER FUNCTIONS ==========
@@ -114,7 +206,7 @@ async def validate_cart_inventory(cart: dict):
     return shortages
 
 
-async def send_restock_alert(restaurant_id: str, kitchen_chat_id: int | None, low_stock_items: list[dict]):
+async def send_restock_alert(bot: Bot, restaurant_id: str, kitchen_chat_id: int | None, low_stock_items: list[dict]):
     if not low_stock_items:
         return
 
@@ -288,7 +380,7 @@ async def build_kitchen_order_board(restaurant_id: str) -> tuple[str, int]:
     return "\n".join(board), len(pending)
 
 
-async def send_rush_hour_alert_if_needed(restaurant: dict, pending_count: int, today: str):
+async def send_rush_hour_alert_if_needed(bot: Bot, restaurant: dict, pending_count: int, today: str):
     if pending_count <= RUSH_HOUR_PENDING_THRESHOLD:
         return
 
@@ -313,7 +405,7 @@ async def send_rush_hour_alert_if_needed(restaurant: dict, pending_count: int, t
         print(f"Failed to send rush hour alert: {e}")
 
 
-async def refresh_kitchen_order_board(restaurant_id: str):
+async def refresh_kitchen_order_board(bot: Bot, restaurant_id: str):
     restaurant_response = supabase.table("restaurants")\
         .select("id, name, kitchen_chat_id, manager_telegram_id, kitchen_board_message_id, kitchen_board_message_date, kitchen_board_pinned, kitchen_rush_alert_date")\
         .eq("id", restaurant_id)\
@@ -342,7 +434,7 @@ async def refresh_kitchen_order_board(restaurant_id: str):
                 chat_id=kitchen_chat_id,
                 message_id=int(message_id)
             )
-            await send_rush_hour_alert_if_needed(restaurant, pending_count, today)
+            await send_rush_hour_alert_if_needed(bot, restaurant, pending_count, today)
             return
         except Exception as e:
             logging.error(f"Failed to edit kitchen order board, creating a new one: {e}")
@@ -375,7 +467,7 @@ async def refresh_kitchen_order_board(restaurant_id: str):
         restaurant["kitchen_board_message_id"] = sent_message.message_id
         restaurant["kitchen_board_message_date"] = today
         restaurant["kitchen_board_pinned"] = board_pinned
-        await send_rush_hour_alert_if_needed(restaurant, pending_count, today)
+        await send_rush_hour_alert_if_needed(bot, restaurant, pending_count, today)
     except Exception as e:
         print(f"Failed to refresh kitchen order board: {e}")
 
@@ -411,7 +503,7 @@ async def get_cart_summary(user_id: int, restaurant_id: str):
     # We'll manage cart in memory via state since it's temporary
     return {}
 
-async def send_receipt_to_customer(user_id: int, order_id: str):
+async def send_receipt_to_customer(bot: Bot, user_id: int, order_id: str):
     """Generate and send PDF receipt to customer"""
     try:
         # Get order details
@@ -476,9 +568,9 @@ async def send_receipt_to_customer(user_id: int, order_id: str):
         return False
 
 
-async def try_send_receipt_after_order(message: types.Message, user_id: int, order_id: str):
+async def try_send_receipt_after_order(bot: Bot, message: types.Message, user_id: int, order_id: str):
     try:
-        receipt_sent = await send_receipt_to_customer(user_id, order_id)
+        receipt_sent = await send_receipt_to_customer(bot, user_id, order_id)
     except Exception as e:
         print(f"Receipt generation failed for order {order_id}: {e}")
         receipt_sent = False
@@ -538,67 +630,6 @@ async def load_pending_reorder(message: types.Message, state: FSMContext):
     )
     return True
 
-
-# ========== SCHEDULED REPORTS ==========
-
-async def send_daily_reports():
-    """Send daily reports to all restaurant managers"""
-    try:
-        restaurants = supabase.table("restaurants")\
-            .select("id, name, manager_telegram_id, manager_name")\
-            .eq("subscription_status", "active")\
-            .not_.is_("manager_telegram_id", "null")\
-            .execute()
-        
-        for restaurant in restaurants.data:
-            manager_id = restaurant.get("manager_telegram_id")
-            if not manager_id:
-                continue
-            
-            report = await generate_daily_report(supabase, restaurant["id"])
-            
-            try:
-                await bot.send_message(
-                    manager_id,
-                    report,
-                    parse_mode="Markdown"
-                )
-                logging.info(f"Daily report sent to manager of {restaurant['name']}")
-            except Exception as e:
-                logging.error(f"Failed to send daily report to manager of {restaurant['name']}: {e}")
-                
-    except Exception as e:
-        logging.error(f"Error in send_daily_reports: {e}")
-
-
-async def send_weekly_reports():
-    """Send weekly reports to all restaurant managers"""
-    try:
-        restaurants = supabase.table("restaurants")\
-            .select("id, name, manager_telegram_id, manager_name")\
-            .eq("subscription_status", "active")\
-            .not_.is_("manager_telegram_id", "null")\
-            .execute()
-        
-        for restaurant in restaurants.data:
-            manager_id = restaurant.get("manager_telegram_id")
-            if not manager_id:
-                continue
-            
-            report = await generate_weekly_report(supabase, restaurant["id"])
-            
-            try:
-                await bot.send_message(
-                    manager_id,
-                    report,
-                    parse_mode="Markdown"
-                )
-                logging.info(f"Weekly report sent to manager of {restaurant['name']}")
-            except Exception as e:
-                logging.error(f"Failed to send weekly report to manager of {restaurant['name']}: {e}")
-                
-    except Exception as e:
-        logging.error(f"Error in send_weekly_reports: {e}")
 
 # ========== CHECK SUBSCRIPTIONS AND UPDATE SUBCRIPTIONS ===============
 async def is_subscription_active(restaurant_id: str) -> bool:
@@ -1271,7 +1302,7 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
 
     
-async def create_order_in_db(user_id: int, state: FSMContext, payment_method: str, payment_proof_file_id: str = None):
+async def create_order_in_db(bot: Bot, user_id: int, state: FSMContext, payment_method: str, payment_proof_file_id: str = None):
     """Create order in database"""
     data = await state.get_data()
     cart = data.get("cart", {})
@@ -1351,7 +1382,7 @@ async def create_order_in_db(user_id: int, state: FSMContext, payment_method: st
     return order_id, order_response.data[0]
 
 
-async def send_order_to_kitchen(order_id: str, user_id: int, state: FSMContext, payment_proof_file_id: str = None):
+async def send_order_to_kitchen(bot: Bot, order_id: str, user_id: int, state: FSMContext, payment_proof_file_id: str = None):
     """Send order notification to kitchen"""
     data = await state.get_data()
     cart = data.get("cart", {})
@@ -1430,14 +1461,14 @@ async def send_order_to_kitchen(order_id: str, user_id: int, state: FSMContext, 
         )
 
     if restaurant_id:
-        await refresh_kitchen_order_board(restaurant_id)
+        await refresh_kitchen_order_board(bot, restaurant_id)
 
 
 # ========== ORDER CONFIRMATION & PAYMENT ==========
 # ====== PAYMENT HANDLERS SECTION ======
 
 @dp.callback_query(F.data == "pay_delivery")
-async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContext):
+async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContext, bot: Bot):
     """Handle Pay on Delivery payment method"""
     user_id = callback_query.from_user.id
     
@@ -1445,14 +1476,14 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
         await state.update_data(payment_method="Pay on Delivery")
         
         # CREATE ORDER IN DATABASE
-        order_id, order = await create_order_in_db(user_id, state, "Pay on Delivery")
+        order_id, order = await create_order_in_db(bot, user_id, state, "Pay on Delivery")
         
         # SEND TO KITCHEN
-        await send_order_to_kitchen(order_id, user_id, state)
+        await send_order_to_kitchen(bot, order_id, user_id, state)
 
         low_stock_items = await deduct_inventory_for_order(order_id)
         data = await state.get_data()
-        await send_restock_alert(data.get("restaurant_id"), data.get("kitchen_chat_id"), low_stock_items)
+        await send_restock_alert(bot, data.get("restaurant_id"), data.get("kitchen_chat_id"), low_stock_items)
 
         total_price = data.get("total_price", 0)
         
@@ -1466,7 +1497,7 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
         )
 
         # SEND RECEIPT TO CUSTOMER
-        await try_send_receipt_after_order(callback_query.message, user_id, order_id)
+        await try_send_receipt_after_order(bot, callback_query.message, user_id, order_id)
         
         # Clear cart
         await state.update_data(cart={})
@@ -1481,7 +1512,7 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
 
 
 @dp.callback_query(F.data == "pay_cash")
-async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
+async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext, bot: Bot):
     """Handle Cash Payment method"""
     user_id = callback_query.from_user.id
     
@@ -1489,14 +1520,14 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
         await state.update_data(payment_method="Cash Payment")
         
         # CREATE ORDER IN DATABASE
-        order_id, order = await create_order_in_db(user_id, state, "Cash Payment")
+        order_id, order = await create_order_in_db(bot, user_id, state, "Cash Payment")
         
         # SEND TO KITCHEN
-        await send_order_to_kitchen(order_id, user_id, state)
+        await send_order_to_kitchen(bot, order_id, user_id, state)
 
         low_stock_items = await deduct_inventory_for_order(order_id)
         data = await state.get_data()
-        await send_restock_alert(data.get("restaurant_id"), data.get("kitchen_chat_id"), low_stock_items)
+        await send_restock_alert(bot, data.get("restaurant_id"), data.get("kitchen_chat_id"), low_stock_items)
 
         total_price = data.get("total_price", 0)
         
@@ -1510,7 +1541,7 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext):
         )
 
         # SEND RECEIPT TO CUSTOMER
-        await try_send_receipt_after_order(callback_query.message, user_id, order_id)
+        await try_send_receipt_after_order(bot, callback_query.message, user_id, order_id)
         
         # Clear cart
         await state.update_data(cart={})
@@ -1572,7 +1603,7 @@ async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
 
 
 @dp.message(OrderStates.waiting_for_payment_proof, F.photo)
-async def receive_payment_proof(message: types.Message, state: FSMContext):
+async def receive_payment_proof(message: types.Message, state: FSMContext, bot: Bot):
     """Handle payment proof screenshot for bank transfer"""
     photo = message.photo[-1]
     file_id = photo.file_id
@@ -1580,13 +1611,13 @@ async def receive_payment_proof(message: types.Message, state: FSMContext):
     
     try:
         # CREATE ORDER with payment proof
-        order_id, order = await create_order_in_db(user_id, state, "Bank Transfer", file_id)
+        order_id, order = await create_order_in_db(bot, user_id, state, "Bank Transfer", file_id)
         
         data = await state.get_data()
         total_price = data.get("total_price", 0)
         
         # SEND TO KITCHEN with payment proof
-        await send_order_to_kitchen(order_id, user_id, state, file_id)
+        await send_order_to_kitchen(bot, order_id, user_id, state, file_id)
         
         await message.answer(
             f"✅ Order placed successfully!\n"
@@ -1621,7 +1652,7 @@ async def payment_proof_invalid(message: types.Message):
 # ========== KITCHEN CALLBACKS ==========
 
 @dp.callback_query(F.data.startswith("confirm_pay_"))
-async def confirm_payment_handler(callback_query: types.CallbackQuery):
+async def confirm_payment_handler(callback_query: types.CallbackQuery, bot: Bot):
     """Kitchen confirms payment for bank transfer"""
     order_id = callback_query.data.replace("confirm_pay_", "")
     
@@ -1653,7 +1684,7 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
         kitchen_chat_id = (order_data.get("restaurants") or {}).get("kitchen_chat_id")
 
         low_stock_items = await deduct_inventory_for_order(order_id)
-        await send_restock_alert(order_data.get("restaurant_id"), kitchen_chat_id, low_stock_items)
+        await send_restock_alert(bot, order_data.get("restaurant_id"), kitchen_chat_id, low_stock_items)
         
         try:
             await bot.send_message(
@@ -1663,7 +1694,7 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
             )
             
             # NOW SEND RECEIPT after payment confirmed
-            await send_receipt_to_customer(user_id, order_id)
+            await send_receipt_to_customer(bot, user_id, order_id)
             
         except Exception as e:
             print(f"Failed to notify customer: {e}")
@@ -1680,13 +1711,13 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery):
     )
 
     if restaurant_id:
-        await refresh_kitchen_order_board(restaurant_id)
+        await refresh_kitchen_order_board(bot, restaurant_id)
     
     await callback_query.answer("✅ Payment confirmed!")
 
 
 @dp.callback_query(F.data.startswith("reject_pay_"))
-async def reject_payment_handler(callback_query: types.CallbackQuery):
+async def reject_payment_handler(callback_query: types.CallbackQuery, bot: Bot):
     """Kitchen rejects payment"""
     order_id = callback_query.data.replace("reject_pay_", "")
     
@@ -1729,13 +1760,13 @@ async def reject_payment_handler(callback_query: types.CallbackQuery):
     )
 
     if restaurant_id:
-        await refresh_kitchen_order_board(restaurant_id)
+        await refresh_kitchen_order_board(bot, restaurant_id)
     
     await callback_query.answer("❌ Payment rejected!")
 
 
 @dp.callback_query(F.data.startswith("preparing_"))
-async def handle_preparing(callback_query: types.CallbackQuery):
+async def handle_preparing(callback_query: types.CallbackQuery, bot: Bot):
     order_id = callback_query.data.replace("preparing_", "")
     
     supabase.table("orders")\
@@ -1756,7 +1787,7 @@ async def handle_preparing(callback_query: types.CallbackQuery):
 
         restaurant_id = order.data[0].get("restaurant_id")
         if restaurant_id:
-            await refresh_kitchen_order_board(restaurant_id)
+            await refresh_kitchen_order_board(bot, restaurant_id)
 
     ready_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]
@@ -1776,7 +1807,7 @@ async def handle_preparing(callback_query: types.CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("ready_"))
-async def handle_ready(callback_query: CallbackQuery):
+async def handle_ready(callback_query: CallbackQuery, bot: Bot):
     """Kitchen marks order as ready"""
     order_id = callback_query.data.replace("ready_", "")
     
@@ -1822,7 +1853,7 @@ async def handle_ready(callback_query: CallbackQuery):
         )
 
     if restaurant_id:
-        await refresh_kitchen_order_board(restaurant_id)
+        await refresh_kitchen_order_board(bot, restaurant_id)
     
     await callback_query.answer("Done!")
 

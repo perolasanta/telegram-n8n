@@ -1,6 +1,8 @@
 from fastapi import FastAPI, Request
 from aiogram.types import Update
-from bot import bot, dp, supabase
+from bot import bot, dp, supabase, delivery_dp, delivery_bots, load_delivery_bots
+from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
 import os
 import logging
 import asyncio
@@ -154,6 +156,52 @@ async def webhook(request:Request):
     return {"ok": True}
 
 
+@app.post("/webhook/delivery/{restaurant_id}")
+async def delivery_webhook(restaurant_id: str, request: Request):
+    delivery_bot = delivery_bots.get(restaurant_id)
+    if not delivery_bot:
+        return {"ok": False, "error": "unknown restaurant"}
+    data = await request.json()
+    update = Update(**data)
+    await delivery_dp.feed_update(
+        bot=delivery_bot,
+        update=update,
+        delivery_restaurant_id=restaurant_id
+    )
+    return {"ok": True}
+
+@app.post("/admin/reload-delivery-bots")
+async def reload_delivery_bots(request: Request):
+    admin_key = request.headers.get("X-Admin-Key")
+    if admin_key != os.getenv("ADMIN_API_KEY"):
+        return {"ok": False, "error": "unauthorized"}
+
+    restaurants = supabase.table("restaurants")\
+        .select("id, delivery_bot_token")\
+        .not_.is_("delivery_bot_token", "null")\
+        .execute()
+
+    new_ids = set()
+    for r in restaurants.data or []:
+        rid, token = r["id"], r["delivery_bot_token"]
+        new_ids.add(rid)
+        if rid not in delivery_bots:
+            new_bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+            delivery_bots[rid] = new_bot
+            await new_bot.set_webhook(f"{FASTAPI_WEBHOOK_URL}/webhook/delivery/{rid}")
+            logger.info(f"Registered new delivery bot for restaurant {rid}")
+
+    removed = [rid for rid in delivery_bots if rid not in new_ids]
+    for rid in removed:
+        old_bot = delivery_bots.pop(rid)
+        try:
+            await old_bot.delete_webhook()
+            await old_bot.session.close()
+        except Exception as e:
+            logger.error(f"Failed to clean up bot for {rid}: {e}")
+
+    return {"ok": True, "active_delivery_bots": list(delivery_bots.keys()), "removed": removed}
+
 @app.get("/")
 async def root():
     """Health check endpoint"""
@@ -162,6 +210,10 @@ async def root():
 @app.on_event("startup")
 async def on_startup():
     await bot.set_webhook(f"{FASTAPI_WEBHOOK_URL}/webhook")
+    await load_delivery_bots()
+    for restaurant_id, dbot in delivery_bots.items():
+        await dbot.set_webhook(f"{FASTAPI_WEBHOOK_URL}/webhook/delivery/{restaurant_id}")
+        logger.info(f"Delivery bot webhook set for restaurant {restaurant_id}")
     print (f"Webhook set to {FASTAPI_WEBHOOK_URL}/webhook")
     asyncio.create_task(ping_n8n_periodically())
 
@@ -203,6 +255,9 @@ async def on_startup():
 async def on_shutdown():
     await bot.delete_webhook()
     await bot.session.close()
+    for dbot in delivery_bots.values():
+        await dbot.delete_webhook()
+        await dbot.session.close()
 
     # SHUTDOWN SCHEDULER
     scheduler.shutdown()
