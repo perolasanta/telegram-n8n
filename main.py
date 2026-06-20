@@ -1,12 +1,26 @@
 from fastapi import FastAPI, Request
 from aiogram.types import Update
-from bot import bot, dp, supabase, delivery_bots, load_delivery_bots
+from bot import (
+    bot,
+    dp,
+    supabase,
+    delivery_bots,
+    load_delivery_bots,
+    create_paystack_subaccount,
+    send_order_to_kitchen_from_db,
+    deduct_inventory_for_order,
+    send_restock_alert,
+    send_receipt_to_customer,
+)
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 import os
+import json
 import logging
 import asyncio
 import aiohttp
+import hmac
+import hashlib
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -16,6 +30,7 @@ from reports import generate_daily_report, generate_weekly_report
 
 
 FASTAPI_WEBHOOK_URL = os.getenv("FASTAPI_WEBHOOK_URL","https://telegram-n8n-restaurant-bot.onrender.com")  # Replace with your actual webhook URL
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 
 # URL of  n8n Heartbeat Webhook
 N8N_HEARTBEAT_URL=os.getenv("N8N_HEARTBEAT_URL", "https://n8n-atad.onrender.com/webhook/heartbeat")
@@ -158,6 +173,79 @@ async def webhook(request:Request):
         logger.error(f"Error processing main webhook update: {e}", exc_info=True)
 
     return {"ok": True}
+
+
+@app.post("/webhook/paystack")
+async def paystack_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("x-paystack-signature", "")
+    if not PAYSTACK_SECRET_KEY:
+        return {"status": "paystack not configured"}
+
+    expected_signature = hmac.new(
+        PAYSTACK_SECRET_KEY.encode(), body, hashlib.sha512
+    ).hexdigest()
+
+    if not hmac.compare_digest(signature, expected_signature):
+        logger.warning("Invalid Paystack webhook signature")
+        return {"status": "invalid signature"}
+
+    event = json.loads(body)
+    if event.get("event") != "charge.success":
+        return {"status": "ignored"}
+
+    data = event.get("data", {})
+    order_id = data.get("reference")
+    if not order_id:
+        return {"status": "missing reference"}
+
+    supabase.table("orders").update({"payment_status": "confirmed"}).eq("id", order_id).execute()
+    supabase.table("payments").update({
+        "status": "confirmed",
+        "paystack_reference": data.get("reference")
+    }).eq("order_id", order_id).eq("provider", "Paystack").execute()
+
+    order_result = supabase.table("orders")\
+        .select("telegram_user_id, restaurant_id, restaurants(kitchen_chat_id)")\
+        .eq("id", order_id).execute()
+
+    order_data = order_result.data[0] if order_result.data else {}
+    restaurant_id = order_data.get("restaurant_id")
+    kitchen_chat_id = (order_data.get("restaurants") or {}).get("kitchen_chat_id")
+    user_id = order_data.get("telegram_user_id")
+
+    try:
+        await send_order_to_kitchen_from_db(bot, order_id)
+    except Exception as e:
+        logger.error(f"Failed to send Paystack order to kitchen: {e}", exc_info=True)
+
+    try:
+        low_stock_items = await deduct_inventory_for_order(order_id)
+        await send_restock_alert(bot, restaurant_id, kitchen_chat_id, low_stock_items)
+    except Exception as e:
+        logger.error(f"Failed inventory deduction/alert for Paystack order {order_id}: {e}", exc_info=True)
+
+    if user_id:
+        try:
+            await send_receipt_to_customer(bot, user_id, order_id)
+        except Exception as e:
+            logger.error(f"Failed to send Paystack receipt for order {order_id}: {e}", exc_info=True)
+
+    return {"status": "ok"}
+
+
+@app.post("/admin/paystack/subaccount/{restaurant_id}")
+async def admin_create_paystack_subaccount(restaurant_id: str, request: Request):
+    admin_key = request.headers.get("X-Admin-Key")
+    if admin_key != os.getenv("ADMIN_API_KEY"):
+        return {"ok": False, "error": "unauthorized"}
+
+    try:
+        subaccount = await create_paystack_subaccount(restaurant_id)
+        return {"ok": True, "subaccount_code": subaccount.get("subaccount_code"), "data": subaccount}
+    except Exception as e:
+        logger.error(f"Failed to create Paystack subaccount for {restaurant_id}: {e}", exc_info=True)
+        return {"ok": False, "error": str(e)}
 
 
 @app.post("/webhook/delivery/{restaurant_id}")

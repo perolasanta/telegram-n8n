@@ -40,6 +40,10 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 RUSH_HOUR_PENDING_THRESHOLD = int(os.getenv("RUSH_HOUR_PENDING_THRESHOLD", "5"))
 
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
+PAYSTACK_COMMISSION_PERCENTAGE = int(os.getenv("PAYSTACK_COMMISSION_PERCENTAGE", "5"))
+PAYSTACK_API_BASE = "https://api.paystack.co"
+
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 dp.include_router(router)
@@ -281,6 +285,171 @@ def format_order_location(order: dict, include_type: bool = False) -> str:
     if include_type and order_type == "dine_in":
         return f"{label} — Dine-in"
     return label
+
+
+async def get_paystack_email_for_user(user_id: int) -> str:
+    try:
+        user = await bot.get_chat(user_id)
+        if user.username:
+            return f"{user.username}@telegram.paystack"
+    except Exception:
+        pass
+    return "guest@chowlin.com.ng"
+
+
+async def resolve_bank_code(bank_name: str) -> str | None:
+    if not PAYSTACK_SECRET_KEY:
+        return None
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{PAYSTACK_API_BASE}/bank",
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}
+        ) as resp:
+            data = await resp.json()
+
+    if not data.get("status") or not data.get("data"):
+        return None
+
+    normalized = bank_name.strip().lower()
+    for bank in data["data"]:
+        if bank.get("name", "").strip().lower() == normalized:
+            return bank.get("code")
+    return None
+
+
+async def create_paystack_subaccount(restaurant_id: str) -> dict:
+    if not PAYSTACK_SECRET_KEY:
+        raise ValueError("Paystack is not configured")
+
+    restaurant = supabase.table("restaurants")\
+        .select("name, bank_name, account_number, account_name")\
+        .eq("id", restaurant_id).execute()
+
+    if not restaurant.data:
+        raise ValueError("Restaurant not found")
+
+    restaurant_data = restaurant.data[0]
+    bank_code = await resolve_bank_code(restaurant_data.get("bank_name") or "")
+    if not bank_code:
+        raise ValueError("Could not resolve Paystack bank code for restaurant")
+
+    payload = {
+        "business_name": restaurant_data["name"],
+        "settlement_bank": bank_code,
+        "account_number": restaurant_data["account_number"],
+        "percentage_charge": PAYSTACK_COMMISSION_PERCENTAGE
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{PAYSTACK_API_BASE}/subaccount",
+            headers={
+                "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=payload
+        ) as resp:
+            result = await resp.json()
+
+    if not result.get("status") or not result.get("data"):
+        raise ValueError(result.get("message") or "Failed to create Paystack subaccount")
+
+    subaccount = result["data"]
+    supabase.table("restaurants").update({
+        "paystack_subaccount_code": subaccount["subaccount_code"],
+        "paystack_enabled": True
+    }).eq("id", restaurant_id).execute()
+
+    return subaccount
+
+
+async def create_paystack_payment_link(order_id: str, amount: float, email: str, subaccount_code: str) -> str:
+    if not PAYSTACK_SECRET_KEY:
+        raise ValueError("Paystack is not configured")
+    if not subaccount_code:
+        raise ValueError("Paystack subaccount is not configured")
+
+    callback_url = f"{os.getenv('FASTAPI_WEBHOOK_URL','https://telegram-n8n-restaurant-bot.onrender.com')}/webhook/paystack"
+    payload = {
+        "email": email,
+        "amount": int(amount * 100),
+        "reference": order_id,
+        "callback_url": callback_url,
+        "subaccount": subaccount_code,
+        "currency": "NGN"
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{PAYSTACK_API_BASE}/transaction/initialize",
+            headers={
+                "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+                "Content-Type": "application/json"
+            },
+            json=payload
+        ) as resp:
+            result = await resp.json()
+
+    if not result.get("status") or not result.get("data"):
+        raise ValueError(result.get("message") or "Failed to initialize Paystack payment")
+
+    return result["data"]["authorization_url"]
+
+
+async def send_order_to_kitchen_from_db(bot: Bot, order_id: str):
+    order_resp = supabase.table("orders")\
+        .select("*, order_items(quantity, menu_items(name)), restaurant_tables(table_number), restaurants(name, kitchen_chat_id)")\
+        .eq("id", order_id).execute()
+
+    if not order_resp.data:
+        return
+
+    order = order_resp.data[0]
+    kitchen_chat_id = (order.get("restaurants") or {}).get("kitchen_chat_id")
+    restaurant_name = (order.get("restaurants") or {}).get("name", "Restaurant")
+    order_type = order.get("order_type", "dine_in")
+    total_price = float(order.get("total_amount") or 0)
+    payment_method = order.get("payment_method", "Unknown")
+
+    if order_type == "delivery":
+        order_location = f"Delivery\n📍 {order.get('delivery_address') or 'No address provided'}"
+    elif order_type == "pickup":
+        order_location = "Pickup"
+    else:
+        table = order.get("restaurant_tables") or {}
+        order_location = f"Table {table.get('table_number') or 'Unknown'} — Dine-in"
+
+    if not kitchen_chat_id:
+        print("⚠️ No kitchen_chat_id configured for this restaurant")
+        return
+
+    user_id = order.get("telegram_user_id")
+    customer_name = order.get("customer_name") or "Customer"
+
+    order_text = f"🆕 <b>NEW ORDER  #{order_short_id(order_id)}</b>\n"
+    order_text += f"🏪 {escape(restaurant_name)}\n"
+    order_text += f"📍 {escape(order_location)}\n"
+    order_text += "─────────────────\n"
+
+    for item in order.get("order_items") or []:
+        menu_item = item.get("menu_items") or {}
+        qty = int(item.get("quantity") or 0)
+        name = menu_item.get("name", "Item")
+        order_text += f"• {escape(name)} × {qty}\n"
+
+    order_text += "─────────────────"
+    order_text += f"\n💰 {format_money(total_price)}  |  {escape(payment_method)}"
+    order_text += f"\n⏱ {datetime.now(pytz.timezone('Africa/Lagos')).strftime('%I:%M %p').lstrip('0')}"
+    order_text += f"\n👤 Customer: {escape(customer_name)}"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍳 Mark as Preparing", callback_data=f"preparing_{order_id}" )],
+        [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}" )]
+    ])
+
+    await bot.send_message(kitchen_chat_id, text=order_text, reply_markup=keyboard)
+    await refresh_kitchen_order_board(bot, order.get("restaurant_id"))
 
 
 async def build_kitchen_order_board(restaurant_id: str) -> tuple[str, int]:
@@ -1279,6 +1448,7 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
         payment_buttons.append([InlineKeyboardButton(text="💵 Pay on Delivery", callback_data="pay_delivery")])
     payment_buttons.append([InlineKeyboardButton(text="💰 Cash Payment", callback_data="pay_cash")])
     payment_buttons.append([InlineKeyboardButton(text="🏦 Bank Transfer", callback_data="pay_bank")])
+    payment_buttons.append([InlineKeyboardButton(text="💳 Pay with Paystack", callback_data="pay_paystack")])
     payment_buttons.append([InlineKeyboardButton(text="🔙 Back to Cart", callback_data="view_cart")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=payment_buttons)
@@ -1320,6 +1490,16 @@ async def create_order_in_db(bot: Bot, user_id: int, state: FSMContext, payment_
     customer_name = user.username or user.first_name or "Unknown"
     
     # Create order
+    initial_payment_status = "pending"
+    if payment_method == "Cash Payment":
+        initial_payment_status = "confirmed"
+    elif payment_method == "Bank Transfer":
+        initial_payment_status = "pending"
+    elif payment_method == "Pay on Delivery":
+        initial_payment_status = "pending"
+    elif payment_method == "Paystack":
+        initial_payment_status = "pending"
+
     order_response = supabase.table("orders").insert({
         "restaurant_id": restaurant_id,
         "table_id": table_id,
@@ -1327,7 +1507,7 @@ async def create_order_in_db(bot: Bot, user_id: int, state: FSMContext, payment_
         "customer_name": customer_name,
         "total_amount": str(total_price),
         "payment_method": payment_method,
-        "payment_status": "pending" if payment_method == "Bank Transfer" else "confirmed",
+        "payment_status": initial_payment_status,
         "order_status": "pending",
         "order_type": order_type,
         "delivery_address": delivery_address if order_type == "delivery" else None,
@@ -1541,6 +1721,73 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext, b
         print(f"Order error: {e}")
         await callback_query.message.answer("❌ Failed to place order. Please try again.")
     
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data == "pay_paystack")
+async def payment_paystack(callback_query: types.CallbackQuery, state: FSMContext):
+    """Handle Paystack payment method by creating a pending order and returning a payment link."""
+    data = await state.get_data()
+    restaurant_id = data.get("restaurant_id")
+    total_price = data.get("total_price", 0)
+    restaurant = supabase.table("restaurants")\
+        .select("paystack_enabled, paystack_subaccount_code")\
+        .eq("id", restaurant_id)\
+        .execute()
+
+    if not restaurant.data:
+        await callback_query.message.answer("⚠️ Could not load Paystack settings. Please try again later.")
+        await callback_query.answer()
+        return
+
+    restaurant_data = restaurant.data[0]
+    if not restaurant_data.get("paystack_enabled") or not restaurant_data.get("paystack_subaccount_code"):
+        await callback_query.message.answer(
+            "⚠️ Paystack is not available for this restaurant yet. "
+            "Please choose another payment method or contact the restaurant."
+        )
+        await callback_query.answer()
+        return
+
+    try:
+        await state.update_data(payment_method="Paystack")
+        order_id, order = await create_order_in_db(callback_query.bot, callback_query.from_user.id, state, "Paystack")
+
+        email = await get_paystack_email_for_user(callback_query.from_user.id)
+        payment_url = await create_paystack_payment_link(
+            order_id,
+            float(total_price),
+            email,
+            restaurant_data["paystack_subaccount_code"]
+        )
+
+        supabase.table("payments").insert({
+            "order_id": order_id,
+            "restaurant_id": restaurant_id,
+            "amount": str(total_price),
+            "provider": "Paystack",
+            "status": "pending",
+            "provider_reference": order_id,
+            "paystack_reference": order_id,
+            "paystack_subaccount_code": restaurant_data["paystack_subaccount_code"]
+        }).execute()
+
+        await callback_query.message.answer(
+            f"✅ Your order has been created and is pending payment.\n"
+            f"Order ID: #{order_id[:8]}\n"
+            f"💰 Total: ₦{total_price:,.0f}\n\n"
+            f"Please complete your payment using the link below:\n{payment_url}\n\n"
+            f"After Paystack confirms payment, your order will be sent to the kitchen."
+        )
+
+        await state.update_data(cart={})
+    except Exception as e:
+        print(f"Paystack order error: {e}")
+        await callback_query.message.answer(
+            "❌ Could not create Paystack payment link. "
+            "Please try again or choose another payment method."
+        )
+
     await callback_query.answer()
 
 
