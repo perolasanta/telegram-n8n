@@ -150,9 +150,13 @@ async def ping_n8n_periodically():
 
 @app.post("/webhook")
 async def webhook(request:Request):
-    data = await request.json()
-    update = Update(**data)
-    await dp.feed_update (bot=bot, update=update)
+    try:
+        data = await request.json()
+        update = Update(**data)
+        await dp.feed_update (bot=bot, update=update)
+    except Exception as e:
+        logger.error(f"Error processing main webhook update: {e}", exc_info=True)
+
     return {"ok": True}
 
 
@@ -161,13 +165,18 @@ async def delivery_webhook(restaurant_id: str, request: Request):
     delivery_bot = delivery_bots.get(restaurant_id)
     if not delivery_bot:
         return {"ok": False, "error": "unknown restaurant"}
-    data = await request.json()
-    update = Update(**data)
-    await dp.feed_update(
-        bot=delivery_bot,
-        update=update,
-        delivery_restaurant_id=restaurant_id
-    )
+    try:
+        data = await request.json()
+        update = Update(**data)
+        await dp.feed_update(
+            bot=delivery_bot,
+            update=update,
+            delivery_restaurant_id=restaurant_id
+        )
+    except Exception as e:
+        logger.error(f"Error processing delivery webhook for {restaurant_id}: {e}", exc_info=True)
+
+
     return {"ok": True}
 
 @app.post("/admin/reload-delivery-bots")

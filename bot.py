@@ -635,6 +635,9 @@ async def is_subscription_active(restaurant_id: str) -> bool:
     
     # Has expiry date — check it hasn't passed
     expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=pytz.utc)
+        
     return expiry > datetime.now(pytz.utc)
 
 async def upgrade_restaurant(restaurant_id: str, plan: str = "pro", days: int = 30):
