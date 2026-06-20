@@ -291,10 +291,10 @@ async def get_paystack_email_for_user(user_id: int) -> str:
     try:
         user = await bot.get_chat(user_id)
         if user.username:
-            return f"{user.username}@telegram.paystack"
+            return f"{user.username}@mail.com"
     except Exception:
         pass
-    return "guest@chowlin.com.ng"
+    return "guest@petbell.com.ng"
 
 
 async def resolve_bank_code(bank_name: str) -> str | None:
