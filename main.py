@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request
 from aiogram.types import Update
-from bot import bot, dp, supabase, delivery_dp, delivery_bots, load_delivery_bots
+from bot import bot, dp, supabase, delivery_bots, load_delivery_bots
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 import os
@@ -163,7 +163,7 @@ async def delivery_webhook(restaurant_id: str, request: Request):
         return {"ok": False, "error": "unknown restaurant"}
     data = await request.json()
     update = Update(**data)
-    await delivery_dp.feed_update(
+    await dp.feed_update(
         bot=delivery_bot,
         update=update,
         delivery_restaurant_id=restaurant_id

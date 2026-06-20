@@ -59,10 +59,6 @@ class OrderStates(StatesGroup):
 
 # ========== DELIVERY-ONLY BOT SUPPORT ==========
 
-delivery_dp = Dispatcher()
-delivery_entry_router = Router()
-
-
 async def start_delivery_session(message: types.Message, state: FSMContext, bot: Bot, delivery_restaurant_id: str):
     restaurant = supabase.table("restaurants")\
         .select("id, name, kitchen_chat_id")\
@@ -114,20 +110,6 @@ async def start_delivery_session(message: types.Message, state: FSMContext, bot:
         "<i>12 Adeola Street, Minna, Niger State</i>"
     )
     await state.set_state(OrderStates.waiting_for_address)
-
-
-@delivery_entry_router.message(CommandStart())
-async def delivery_start(message: types.Message, state: FSMContext, bot: Bot, delivery_restaurant_id: str):
-    await start_delivery_session(message, state, bot, delivery_restaurant_id)
-
-
-@delivery_entry_router.message(StateFilter(None), F.text)
-async def delivery_catch_all(message: types.Message, state: FSMContext, bot: Bot, delivery_restaurant_id: str):
-    await start_delivery_session(message, state, bot, delivery_restaurant_id)
-
-
-delivery_dp.include_router(delivery_entry_router)
-delivery_dp.include_router(router)  # reuse existing cart/payment/kitchen logic
 
 
 delivery_bots: dict[str, Bot] = {}
@@ -668,7 +650,11 @@ async def upgrade_restaurant(restaurant_id: str, plan: str = "pro", days: int = 
 
 # ========== COMMAND HANDLERS ==========
 @dp.message(CommandStart())
-async def start(message: types.Message, state: FSMContext):
+async def start(message: types.Message, state: FSMContext, bot: Bot, delivery_restaurant_id: str | None = None):
+    if delivery_restaurant_id:
+        await start_delivery_session(message, state, bot, delivery_restaurant_id)
+        return
+
     args = message.text.split()
     user_id = message.from_user.id
     
@@ -2674,3 +2660,12 @@ async def manual_order_board_refresh(message: types.Message):
 
     await refresh_kitchen_order_board(restaurant.data[0]["id"])
     await message.answer("📋 Live order board refreshed.")
+
+
+# Command to start a delivery session from any text message (for delivery-only bots)
+@dp.message(StateFilter(None), F.text)
+async def generic_text_entry(message: types.Message, state: FSMContext, bot: Bot, delivery_restaurant_id: str | None = None):
+    """Delivery-only bots: any text with no active session starts ordering.
+    No-ops for the main QR bot, since delivery_restaurant_id is None there."""
+    if delivery_restaurant_id:
+        await start_delivery_session(message, state, bot, delivery_restaurant_id)
