@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 from aiogram.types import Update
 from bot import (
     bot,
@@ -163,6 +164,13 @@ async def ping_n8n_periodically():
             await asyncio.sleep(600)
 
 
+async def get_bot_for_order(order_data: dict) -> Bot:
+    """Pick the correct Bot instance to reply with, based on which restaurant/channel the order came from."""
+    restaurant_id = order_data.get("restaurant_id")
+    if restaurant_id and restaurant_id in delivery_bots:
+        return delivery_bots[restaurant_id]
+    return bot  # fallback to main bot if no delivery bot is found
+
 @app.post("/webhook")
 async def webhook(request:Request):
     try:
@@ -213,23 +221,19 @@ async def paystack_webhook(request: Request):
     if not order_id:
         return {"status": "missing reference"}
 
-# Idempotency check: see if we've already processed this order's payment before doing any updates or notifications.
-# Only process charge.success events, and extract order_id from the reference    
-    if event["event"] == "charge.success":
-        order_id = event["data"]["reference"]
-
+    # Idempotency check: see if we've already processed this order's payment before doing any updates or notifications.
     current = supabase.table("orders").select("payment_status").eq("id", order_id).execute()
     if current.data and current.data[0]["payment_status"] == "confirmed":
         return {"status": "already processed"}  # stop here — avoid double-firing kitchen/receipt
 
-    # ...rest of your existing confirm logic
-
+    # Mark payment as confirmed in DB
     supabase.table("orders").update({"payment_status": "confirmed"}).eq("id", order_id).execute()
     supabase.table("payments").update({
         "status": "confirmed",
         "paystack_reference": data.get("reference")
     }).eq("order_id", order_id).eq("provider", "Paystack").execute()
 
+    # Load order info so we can resolve which bot should be used for notifications
     order_result = supabase.table("orders")\
         .select("telegram_user_id, restaurant_id, restaurants(kitchen_chat_id)")\
         .eq("id", order_id).execute()
@@ -239,20 +243,29 @@ async def paystack_webhook(request: Request):
     kitchen_chat_id = (order_data.get("restaurants") or {}).get("kitchen_chat_id")
     user_id = order_data.get("telegram_user_id")
 
+    # Resolve the correct Bot instance for this order (delivery bots vs main bot)
     try:
-        await send_order_to_kitchen_from_db(bot, order_id)
+        target_bot = await get_bot_for_order(order_data)
+    except Exception:
+        target_bot = bot
+
+    # Notify kitchen using the resolved bot
+    try:
+        await send_order_to_kitchen_from_db(target_bot, order_id)
     except Exception as e:
         logger.error(f"Failed to send Paystack order to kitchen: {e}", exc_info=True)
 
+    # Deduct inventory and send restock alerts using the resolved bot
     try:
         low_stock_items = await deduct_inventory_for_order(order_id)
-        await send_restock_alert(bot, restaurant_id, kitchen_chat_id, low_stock_items)
+        await send_restock_alert(target_bot, restaurant_id, kitchen_chat_id, low_stock_items)
     except Exception as e:
         logger.error(f"Failed inventory deduction/alert for Paystack order {order_id}: {e}", exc_info=True)
 
+    # Send receipt to customer using the resolved bot
     if user_id:
         try:
-            await send_receipt_to_customer(bot, user_id, order_id)
+            await send_receipt_to_customer(target_bot, user_id, order_id)
         except Exception as e:
             logger.error(f"Failed to send Paystack receipt for order {order_id}: {e}", exc_info=True)
 
