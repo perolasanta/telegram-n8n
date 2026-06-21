@@ -174,6 +174,20 @@ async def webhook(request:Request):
 
     return {"ok": True}
 
+@app.get("/paystack/callback")
+async def paystack_browser_callback(request: Request):
+    reference = request.query_params.get("reference") or request.query_params.get("trxref")
+    return HTMLResponse(
+        f"""
+        <html><body style="font-family:sans-serif;text-align:center;padding:40px">
+            <h2>✅ Payment received</h2>
+            <p>Reference: {reference}</p>
+            <p>You can close this tab and return to Telegram —
+               your order is being confirmed there.</p>
+        </body></html>
+        """
+    )
+
 
 @app.post("/webhook/paystack")
 async def paystack_webhook(request: Request):
@@ -198,6 +212,17 @@ async def paystack_webhook(request: Request):
     order_id = data.get("reference")
     if not order_id:
         return {"status": "missing reference"}
+
+# Idempotency check: see if we've already processed this order's payment before doing any updates or notifications.
+# Only process charge.success events, and extract order_id from the reference    
+    if event["event"] == "charge.success":
+        order_id = event["data"]["reference"]
+
+    current = supabase.table("orders").select("payment_status").eq("id", order_id).execute()
+    if current.data and current.data[0]["payment_status"] == "confirmed":
+        return {"status": "already processed"}  # stop here — avoid double-firing kitchen/receipt
+
+    # ...rest of your existing confirm logic
 
     supabase.table("orders").update({"payment_status": "confirmed"}).eq("id", order_id).execute()
     supabase.table("payments").update({

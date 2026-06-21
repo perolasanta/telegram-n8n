@@ -41,7 +41,7 @@ ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 RUSH_HOUR_PENDING_THRESHOLD = int(os.getenv("RUSH_HOUR_PENDING_THRESHOLD", "5"))
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
-PAYSTACK_COMMISSION_PERCENTAGE = int(os.getenv("PAYSTACK_COMMISSION_PERCENTAGE", "5"))
+PAYSTACK_COMMISSION_PERCENTAGE = float(os.getenv("PAYSTACK_COMMISSION_PERCENTAGE", "5"))
 PAYSTACK_API_BASE = "https://api.paystack.co"
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -370,7 +370,7 @@ async def create_paystack_payment_link(order_id: str, amount: float, email: str,
     if not subaccount_code:
         raise ValueError("Paystack subaccount is not configured")
 
-    callback_url = f"{os.getenv('FASTAPI_WEBHOOK_URL','https://telegram-n8n-restaurant-bot.onrender.com')}/webhook/paystack"
+    callback_url = f"{os.getenv('FASTAPI_WEBHOOK_URL','https://api.petbell.com.ng')}/paystack/callback"
     payload = {
         "email": email,
         "amount": int(amount * 100),
@@ -2275,7 +2275,23 @@ async def handle_reorder(callback_query: types.CallbackQuery, state: FSMContext)
         cart_text += f"\n💰 Total: ₦{total:,.0f}"
         if skipped:
             cart_text += f"\n⚠️ Unavailable (skipped): {', '.join(skipped)}"
-        cart_text += "\n\n📲 Please scan your table's QR code to place this reorder.\nYour items will be loaded automatically."
+        
+        order_type = order_data.get("order_type", "dine_in")
+
+        if order_type == "dine_in":
+            instruction = (
+                    "📲 Please scan your table's QR code to place this reorder.\n"
+                    "Your items will be loaded automatically."
+            )
+        else:
+            instruction = (
+                    "📲 Please scan the restaurant's QR code, or simply message this bot "
+                    "again if you're using a dedicated ordering bot, to place this reorder.\n"
+                    "Your items will be loaded automatically."
+                )
+
+        cart_text += f"\n\n{instruction}"
+        
 
         await callback_query.message.answer(cart_text)
 
