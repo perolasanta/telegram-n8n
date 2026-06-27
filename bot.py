@@ -1015,7 +1015,8 @@ async def start(message: types.Message, state: FSMContext, bot: Bot, delivery_re
                 "2️⃣ Add items to cart 🛒\n"
                 "3️⃣ Confirm & pay\n"
                 "4️⃣ Wait for notification when ready!\n\n"
-                "💡 Tip: You can /cancel anytime"
+                "💡 Tip: You can /cancel anytime\n\n"
+                "Ordering powered by Chowlin 🍽️"
             )
         
         # Check if this is external order (table_number is NULL or 'EXTERNAL')
@@ -1879,7 +1880,8 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💵 Payment Method: Pay on Delivery\n\n"
             f"Please have cash ready when your order arrives.\n"
-            f"📄 Receipt will be sent shortly."
+            f"📄 Receipt will be sent shortly.\n\n"
+            f"<i>Powered by Chowlin 🍽️</i>"
         )
 
         # SEND RECEIPT TO CUSTOMER
@@ -1923,7 +1925,8 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext, b
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💵 Payment Method: Cash Payment\n\n"
             f"Please pay cash when collecting your order.\n"
-            f"📄 Receipt will be sent shortly."
+            f"📄 Receipt will be sent shortly.\n\n"
+            f"<i>Powered by Chowlin 🍽️</i>"
         )
 
         # SEND RECEIPT TO CUSTOMER
@@ -1994,7 +1997,8 @@ async def payment_paystack(callback_query: types.CallbackQuery, state: FSMContex
             f"Order ID: #{order_id[:8]}\n"
             f"💰 Total: ₦{total_price:,.0f}\n\n"
             f"Please complete your payment using the link below:\n{payment_url}\n\n"
-            f"After Paystack confirms payment, your order will be sent to the kitchen."
+            f"After Paystack confirms payment, your order will be sent to the kitchen.\n\n"
+            f"<i>Powered by Chowlin 🍽️</i>"
         )
 
         await state.update_data(cart={})
@@ -2079,7 +2083,8 @@ async def receive_payment_proof(message: types.Message, state: FSMContext, bot: 
             f"💳 Payment Method: Bank Transfer\n\n"
             f"Your payment proof has been received and is being verified. "
             f"You will be notified once confirmed.\n"
-            f"📄 Receipt will be sent after payment confirmation."
+            f"📄 Receipt will be sent after payment confirmation.\n\n"
+            f"<i>Powered by Chowlin 🍽️</i>"
         )
         
         # Clear cart and state

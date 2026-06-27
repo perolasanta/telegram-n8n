@@ -187,6 +187,9 @@ async def generate_receipt_pdf(order_data: dict, filename: str = None):
     )
     elements.append(Paragraph("Thank you for your order!", footer_style))
     elements.append(Paragraph("Please come again!", footer_style))
+    elements.append(Paragraph("Ordering powered by Chowlin 🍽️", footer_style))
+
+
     
     # Build PDF
     doc.build(elements)
