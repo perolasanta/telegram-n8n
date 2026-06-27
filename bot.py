@@ -192,6 +192,122 @@ async def validate_cart_inventory(cart: dict):
     return shortages
 
 
+async def get_delivery_fee(restaurant_id: str, state: FSMContext) -> tuple[float, str | None]:
+    """Return the active delivery fee for the current restaurant and order context."""
+    if not restaurant_id:
+        return 0, None
+
+    restaurant = supabase.table("restaurants")\
+        .select("delivery_fee_type, delivery_fee_flat")\
+        .eq("id", restaurant_id)\
+        .execute()
+    if not restaurant.data:
+        return 0, None
+
+    r = restaurant.data[0]
+    fee_type = r.get("delivery_fee_type", "none")
+
+    if fee_type == "flat":
+        return float(r.get("delivery_fee_flat") or 0), None
+
+    if fee_type == "zone":
+        data = await state.get_data()
+        zone_fee = data.get("delivery_zone_fee", 0)
+        zone_name = data.get("delivery_zone_name")
+        return float(zone_fee), zone_name
+
+    return 0, None
+
+
+async def show_delivery_zones(message: types.Message, state: FSMContext):
+    """Show a zone picker for delivery orders when the restaurant uses zone pricing."""
+    data = await state.get_data()
+    restaurant_id = data.get("restaurant_id")
+
+    zones = supabase.table("delivery_zones")\
+        .select("id, zone_name, fee")\
+        .eq("restaurant_id", restaurant_id)\
+        .eq("is_active", True)\
+        .order("display_order")\
+        .execute()
+
+    if not zones.data:
+        await state.update_data(delivery_zone_fee=0, delivery_zone_name=None)
+        await show_menu_categories(message, state)
+        return
+
+    keyboard = InlineKeyboardBuilder()
+    for zone in zones.data:
+        label = f"{zone['zone_name']} — ₦{float(zone['fee']):,.0f}"
+        keyboard.add(InlineKeyboardButton(
+            text=label,
+            callback_data=f"zone_{zone['id']}"
+        ))
+    keyboard.adjust(1)
+
+    await message.answer(
+        "📍 <b>Select your delivery zone</b>\n\n"
+        "Choose the area closest to your delivery address:",
+        reply_markup=keyboard.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("zone_"))
+async def handle_zone_selection(callback_query: types.CallbackQuery, state: FSMContext):
+    zone_id = callback_query.data.replace("zone_", "")
+
+    zone = supabase.table("delivery_zones")\
+        .select("zone_name, fee")\
+        .eq("id", zone_id)\
+        .execute()
+
+    if not zone.data:
+        await callback_query.answer("Zone not found, please try again.")
+        return
+
+    z = zone.data[0]
+    await state.update_data(
+        delivery_zone_fee=float(z["fee"]),
+        delivery_zone_name=z["zone_name"]
+    )
+    await callback_query.message.answer(
+        f"✅ Zone selected: <b>{z['zone_name']}</b>\n"
+        f"🚚 Delivery fee: <b>₦{float(z['fee']):,.0f}</b>"
+    )
+    await show_menu_categories(callback_query.message, state)
+    await callback_query.answer()
+
+
+async def proceed_after_address(message: types.Message, state: FSMContext):
+    """Route the customer to the right next step after address confirmation."""
+    data = await state.get_data()
+    restaurant_id = data.get("restaurant_id")
+
+    if not restaurant_id:
+        await show_menu_categories(message, state)
+        return
+
+    restaurant = supabase.table("restaurants")\
+        .select("delivery_fee_type, delivery_fee_flat")\
+        .eq("id", restaurant_id)\
+        .execute()
+    fee_type = restaurant.data[0].get("delivery_fee_type", "none") if restaurant.data else "none"
+
+    if fee_type == "zone":
+        await show_delivery_zones(message, state)
+        return
+
+    if fee_type == "flat":
+        flat_fee = float(restaurant.data[0].get("delivery_fee_flat") or 0) if restaurant.data else 0
+        await state.update_data(delivery_zone_fee=flat_fee, delivery_zone_name=None)
+        if flat_fee > 0:
+            await message.answer(f"🚚 Delivery fee: <b>₦{flat_fee:,.0f}</b>")
+    else:
+        await state.update_data(delivery_zone_fee=0, delivery_zone_name=None)
+
+    await show_menu_categories(message, state)
+
+
 async def send_restock_alert(bot: Bot, restaurant_id: str, kitchen_chat_id: int | None, low_stock_items: list[dict]):
     if not low_stock_items:
         return
@@ -682,6 +798,10 @@ async def send_receipt_to_customer(bot: Bot, user_id: int, order_id: str):
         restaurant_table = order_data.get("restaurant_tables") or {}
         restaurant = order_data.get("restaurants") or {}
 
+        delivery_fee = float(order_data.get("delivery_fee") or 0)
+        order_total = float(order_data.get("total_amount") or 0)
+        item_subtotal = order_total - delivery_fee if order_total >= delivery_fee else order_total
+
         receipt_data = {
             'order_id': order_id,
             'restaurant_name': restaurant.get("name", "Restaurant"),
@@ -690,9 +810,10 @@ async def send_receipt_to_customer(bot: Bot, user_id: int, order_id: str):
             'customer_name': order_data.get("customer_name") or "Customer",
             'created_at': datetime.fromisoformat(order_data["created_at"].replace('Z', '+00:00')),
             'items': items,
-            'subtotal': float(order_data["total_amount"]),
+            'subtotal': item_subtotal,
             'tax': 0,
-            'total': float(order_data["total_amount"]),
+            'delivery_fee': delivery_fee,
+            'total': order_total,
             'payment_method': order_data.get("payment_method") or "Unknown",
             'payment_status': order_data.get("payment_status") or "unknown"
         }
@@ -1080,13 +1201,13 @@ async def receive_address(message: types.Message, state: FSMContext):
     )
     await message.answer(f"✅ Delivery address saved:\n<b>{address}</b>\n\nNow let's see the menu!")
     await state.set_state(None)
-    await show_menu_categories(message, state)
+    await proceed_after_address(message, state)
 
 
 @dp.callback_query(F.data == "address_confirmed")
 async def address_confirmed(callback_query: types.CallbackQuery, state: FSMContext):
     await state.set_state(None)
-    await show_menu_categories(callback_query.message, state)
+    await proceed_after_address(callback_query.message, state)
     await callback_query.answer()
 
 
@@ -1379,6 +1500,63 @@ async def handle_custom_quantity(message: types.Message, state: FSMContext):
 
 # ========== CART MANAGEMENT ==========
 
+@dp.message(Command("set_delivery_fee"))
+async def set_delivery_fee(message: types.Message):
+    """Admin: /set_delivery_fee <restaurant_id> flat <amount> or /set_delivery_fee <restaurant_id> none"""
+    if message.from_user.id != int(ADMIN_TELEGRAM_ID):
+        return
+
+    args = message.text.split()
+    if len(args) < 3:
+        await message.answer(
+            "Usage: /set_delivery_fee <restaurant_id> flat <amount>\n"
+            "       /set_delivery_fee <restaurant_id> none"
+        )
+        return
+
+    restaurant_id, fee_type = args[1], args[2]
+    if fee_type == "flat" and len(args) >= 4:
+        supabase.table("restaurants").update({
+            "delivery_fee_type": "flat",
+            "delivery_fee_flat": float(args[3])
+        }).eq("id", restaurant_id).execute()
+        await message.answer(f"✅ Flat delivery fee set to ₦{float(args[3]):,.0f}")
+    elif fee_type == "none":
+        supabase.table("restaurants").update({
+            "delivery_fee_type": "none",
+            "delivery_fee_flat": 0
+        }).eq("id", restaurant_id).execute()
+        await message.answer("✅ Delivery fee removed.")
+    elif fee_type == "zone":
+        supabase.table("restaurants").update({
+            "delivery_fee_type": "zone"
+        }).eq("id", restaurant_id).execute()
+        await message.answer("✅ Zone-based delivery enabled. Use /add_zone to add zones.")
+    else:
+        await message.answer("Unsupported fee type. Use flat, none, or zone.")
+
+
+@dp.message(Command("add_zone"))
+async def add_delivery_zone(message: types.Message):
+    """Admin: /add_zone <restaurant_id> <fee> <zone name>"""
+    if message.from_user.id != int(ADMIN_TELEGRAM_ID):
+        return
+
+    args = message.text.split(maxsplit=3)
+    if len(args) < 4:
+        await message.answer("Usage: /add_zone <restaurant_id> <fee> <zone name>")
+        return
+
+    restaurant_id, fee, zone_name = args[1], float(args[2]), args[3]
+    supabase.table("delivery_zones").insert({
+        "restaurant_id": restaurant_id,
+        "zone_name": zone_name,
+        "fee": fee,
+        "is_active": True
+    }).execute()
+    await message.answer(f"✅ Zone '{zone_name}' added — ₦{fee:,.0f}")
+
+
 @dp.callback_query(F.data == "view_cart")
 async def view_cart(callback_query: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -1439,23 +1617,57 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
         await callback_query.answer()
         return
 
-    total_price = sum(item["price"] * item["qty"] for item in cart.values())
+    subtotal = sum(item["price"] * item["qty"] for item in cart.values())
     order_type = data.get("order_type", "dine_in")
-    await state.update_data(total_price=total_price)
+
+    delivery_fee = 0
+    zone_name = None
+    if order_type == "delivery":
+        restaurant = supabase.table("restaurants")\
+            .select("delivery_fee_type")\
+            .eq("id", data.get("restaurant_id"))\
+            .execute()
+        fee_type = restaurant.data[0].get("delivery_fee_type", "none") if restaurant.data else "none"
+        if fee_type == "zone" and data.get("delivery_zone_fee") is None:
+            await callback_query.message.answer(
+                "📍 Please select your delivery zone before continuing."
+            )
+            await callback_query.answer()
+            return
+        delivery_fee, zone_name = await get_delivery_fee(data.get("restaurant_id"), state)
+
+    total = subtotal + delivery_fee
+    await state.update_data(total_price=total, delivery_fee=delivery_fee)
+
+    summary = f"🛒 Order Summary\n\n"
+    summary += f"Subtotal: ₦{subtotal:,.0f}\n"
+    if delivery_fee > 0:
+        zone_label = f" ({zone_name})" if zone_name else ""
+        summary += f"🚚 Delivery fee{zone_label}: ₦{delivery_fee:,.0f}\n"
+    summary += f"\n💰 <b>Total: ₦{total:,.0f}</b>\n\nSelect payment method:"
 
     payment_buttons = []
     if order_type == "delivery":
         payment_buttons.append([InlineKeyboardButton(text="💵 Pay on Delivery", callback_data="pay_delivery")])
     payment_buttons.append([InlineKeyboardButton(text="💰 Cash Payment", callback_data="pay_cash")])
     payment_buttons.append([InlineKeyboardButton(text="🏦 Bank Transfer", callback_data="pay_bank")])
-    payment_buttons.append([InlineKeyboardButton(text="💳 Pay with Paystack", callback_data="pay_paystack")])
+
+    show_paystack = False
+    if data.get("restaurant_id"):
+        restaurant_state = supabase.table("restaurants")\
+            .select("paystack_enabled")\
+            .eq("id", data["restaurant_id"])\
+            .execute()
+        if restaurant_state.data:
+            show_paystack = bool(restaurant_state.data[0].get("paystack_enabled"))
+    if show_paystack:
+        payment_buttons.append([InlineKeyboardButton(text="💳 Pay with Card (Paystack)", callback_data="pay_paystack")])
     payment_buttons.append([InlineKeyboardButton(text="🔙 Back to Cart", callback_data="view_cart")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=payment_buttons)
     
     await callback_query.message.answer(
-        f"💰 Total Amount: ₦{total_price:,.0f}\n\n"
-        "Please select your payment method:",
+        summary,
         reply_markup=keyboard
     )
     await callback_query.answer()
@@ -1512,7 +1724,8 @@ async def create_order_in_db(bot: Bot, user_id: int, state: FSMContext, payment_
         "order_type": order_type,
         "delivery_address": delivery_address if order_type == "delivery" else None,
         "delivery_lat": delivery_lat if order_type == "delivery" else None,
-        "delivery_lon": delivery_lon if order_type == "delivery" else None
+        "delivery_lon": delivery_lon if order_type == "delivery" else None,
+        "delivery_fee": data.get("delivery_fee", 0)
     }).execute()
     
     if not order_response.data:
@@ -1592,7 +1805,11 @@ async def send_order_to_kitchen(bot: Bot, order_id: str, user_id: int, state: FS
     
     order_text += "─────────────────"
     payment_method = data.get("payment_method", "Unknown")
-    order_text += f"\n💰 {format_money(total_price)}  |  {escape(payment_method)}"
+    delivery_fee = data.get("delivery_fee", 0)
+    order_text += f"\n💰 {format_money(total_price)}"
+    if delivery_fee > 0:
+        order_text += f" (incl. ₦{delivery_fee:,.0f} delivery)"
+    order_text += f"  |  {escape(payment_method)}"
     order_text += f"\n⏱ {datetime.now(pytz.timezone('Africa/Lagos')).strftime('%I:%M %p').lstrip('0')}"
     
     if payment_method == "Bank Transfer":

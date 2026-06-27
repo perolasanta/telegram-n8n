@@ -150,12 +150,17 @@ async def generate_receipt_pdf(order_data: dict, filename: str = None):
     
     # Totals
     totals_data = []
+    subtotal = money_amount(order_data.get('subtotal', 0))
+    delivery_fee = money_amount(order_data.get('delivery_fee', 0))
+    tax = money_amount(order_data.get('tax', 0))
+
+    totals_data.append(['Subtotal:', format_currency(subtotal)])
+    if delivery_fee > 0:
+        totals_data.append(['Delivery Fee:', format_currency(delivery_fee)])
+    if tax > 0:
+        totals_data.append(['Tax:', format_currency(tax)])
     
-    if money_amount(order_data.get('tax', 0)) > 0:
-        totals_data.append(['Subtotal:', format_currency(order_data['subtotal'])])
-        totals_data.append(['Tax:', format_currency(order_data['tax'])])
-    
-    totals_data.append(['TOTAL:', format_currency(order_data['total'])])
+    totals_data.append(['TOTAL:', format_currency(subtotal + delivery_fee + tax)])
     totals_data.append(['Payment Method:', plain_text(order_data.get('payment_method'), 'Unknown')])
     totals_data.append(['Payment Status:', plain_text(str(order_data.get('payment_status') or 'unknown').upper())])
     
