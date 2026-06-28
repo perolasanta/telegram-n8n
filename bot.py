@@ -63,30 +63,27 @@ class OrderStates(StatesGroup):
 
 # ========== DELIVERY-ONLY BOT SUPPORT ==========
 
-async def start_delivery_session(message: types.Message, state: FSMContext, bot: Bot, delivery_restaurant_id: str):
+async def start_delivery_session(message: types.Message, state: FSMContext,
+                                  bot: Bot, delivery_restaurant_id: str):
     restaurant = supabase.table("restaurants")\
-        .select("id, name, kitchen_chat_id")\
-        .eq("id", delivery_restaurant_id)\
-        .execute()
+        .select("id, name, kitchen_chat_id, pickup_enabled")\
+        .eq("id", delivery_restaurant_id).execute()
 
     if not restaurant.data:
-        await message.answer("Sorry, this restaurant isn't set up yet. Please try again shortly.")
+        await message.answer("Sorry, this restaurant isn't set up yet.")
         return
 
     r = restaurant.data[0]
 
     if not await is_subscription_active(r["id"]):
-        await message.answer(
-            "⚠️ We're not currently accepting orders. Please check back soon."
-        )
+        await message.answer("⚠️ We're not currently accepting orders. Please check back soon.")
         return
 
     table = supabase.table("restaurant_tables")\
         .select("id")\
         .eq("restaurant_id", r["id"])\
         .eq("table_number", "EXTERNAL")\
-        .eq("is_active", True)\
-        .execute()
+        .eq("is_active", True).execute()
     table_id = table.data[0]["id"] if table.data else None
 
     await state.update_data(
@@ -96,26 +93,35 @@ async def start_delivery_session(message: types.Message, state: FSMContext, bot:
         table_id=table_id,
         table_number=None,
         menu_filter=None,
-        order_type="delivery",
         cart={}
     )
 
     if await load_pending_reorder(message, state):
         return
 
-    await message.answer(
-        f"Welcome to {hbold(r['name'])}! 🛵\n\n"
-        f"📍 <b>Enter your delivery address</b>\n\n"
-        "You can either:\n\n"
-        "📌 <b>Share your location</b> — tap the 📎 paperclip icon "
-        "at the bottom of your screen → tap <b>Location</b> → "
-        "tap <b>Send My Current Location</b>\n\n"
-        "✍️ <b>Or type your address</b> — e.g:\n"
-        "<i>12 Adeola Street, Minna, Niger State</i>"
-    )
-    await state.set_state(OrderStates.waiting_for_address)
+    pickup_enabled = r.get("pickup_enabled", False)
 
-
+    if pickup_enabled:
+        # Show the choice — reuse existing callbacks order_type_delivery / order_type_pickup
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚗 Delivery", callback_data="order_type_delivery")],
+            [InlineKeyboardButton(text="🏃 Pickup", callback_data="order_type_pickup")]
+        ])
+        await message.answer(
+            f"Welcome to {hbold(r['name'])}! 👋\n\n"
+            f"How would you like to receive your order?",
+            reply_markup=keyboard
+        )
+    else:
+        # Delivery only — go straight to address
+        await state.update_data(order_type="delivery")
+        await message.answer(
+            f"Welcome to {hbold(r['name'])}! 🛵\n\n"
+            f"📍 <b>Enter your delivery address</b>\n\n"
+            "Share your location (📎 → Location) or type it, e.g:\n"
+            "<i>12 Adeola Street, Minna, Niger State</i>"
+        )
+        await state.set_state(OrderStates.waiting_for_address)
 delivery_bots: dict[str, Bot] = {}
 
 
