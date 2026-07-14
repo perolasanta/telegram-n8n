@@ -484,7 +484,7 @@ async def finalize_composite_selection(callback: CallbackQuery, state: FSMContex
     await callback.message.edit_text(f"Added to cart:\n{summary_text}")
     # -> hand off to your existing "review cart" step here
     await state.set_state(None)
-    await go_to_main_menu(callback.message, state)
+    await show_menu_categories(callback.message, state)
 
 async def finalize_composite_selection_via_message(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -513,7 +513,7 @@ async def finalize_composite_selection_via_message(message: types.Message, state
     await state.update_data(cart=cart)
     await message.answer(f"Added to cart:\n{summary_text}")
     await state.set_state(None)
-    await go_to_main_menu(message, state)
+    await show_menu_categories(message, state)
 
 @dp.callback_query(F.data.startswith("zone_"))
 async def handle_zone_selection(callback_query: types.CallbackQuery, state: FSMContext):
@@ -3246,7 +3246,7 @@ async def show_composite_item_admin(callback: CallbackQuery, menu_item_id: str, 
             kb.inline_keyboard.append([
                 InlineKeyboardButton(
                     text=f"{status} {opt['name']}",
-                    callback_data=f"toggle_mod_opt:{opt['id']}:{menu_item_id}",
+                    callback_data=f"toggle_mod_opt:{opt['id']}:{menu_item_id}:{short_cat}",
                 )
             ])
 
@@ -3265,7 +3265,7 @@ async def show_composite_item_admin(callback: CallbackQuery, menu_item_id: str, 
     )
 
 @dp.callback_query(F.data.startswith("kmadm_"))
-async def kitchen_open_composite_admin(callback_query: CallbackQuery):
+async def kitchen_open_composite_admin(callback_query: CallbackQuery, state: FSMContext):
     parts = callback_query.data.split("_")
     short_item, short_cat = parts[1], parts[2]
 
@@ -3281,7 +3281,7 @@ async def kitchen_open_composite_admin(callback_query: CallbackQuery):
     
 @dp.callback_query(F.data.startswith("toggle_mod_opt:"))
 async def on_toggle_modifier_option(callback: CallbackQuery):
-    _, option_id, menu_item_id = callback.data.split(":")
+    _, option_id, menu_item_id, short_cat = callback.data.split(":")
 
     current = (
         supabase.table("modifier_options")
@@ -3299,7 +3299,7 @@ async def on_toggle_modifier_option(callback: CallbackQuery):
         f"{current['name']} marked {'available' if new_status else 'out of stock'}"
     )
     # Refresh the admin view so the ✅/🚫 icon updates in place
-    await show_composite_item_admin(callback, menu_item_id)
+    await show_composite_item_admin(callback, menu_item_id, short_cat)
 
 
 @dp.callback_query(F.data.startswith("kmb_"))
