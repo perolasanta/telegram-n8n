@@ -16,6 +16,7 @@ from supabase import Client, create_client
 from decimal import Decimal
 from dotenv import load_dotenv
 import base64
+import uuid
 
 #from apscheduler.schedulers.asyncio import AsyncIOScheduler
 #from apscheduler.triggers.cron import CronTrigger
@@ -59,6 +60,11 @@ class OrderStates(StatesGroup):
     waiting_for_payment_proof = State()
     waiting_for_address = State()
     waiting_for_restock_quantity = State()
+
+class CompositeOrderStates(StatesGroup):
+    walking_groups = State()       # currently stepping through modifier_groups
+    entering_quantity = State()    # asking "how many pieces of X?" for allow_quantity options
+
 
 
 # ========== DELIVERY-ONLY BOT SUPPORT ==========
@@ -256,6 +262,190 @@ async def show_delivery_zones(message: types.Message, state: FSMContext):
         "Choose the area closest to your delivery address:",
         reply_markup=keyboard.as_markup()
     )
+
+
+# ---------------------------------------------------------------------
+# Entry point: called when customer selects a menu_item with item_type = 'composite'
+# instead of going straight to "enter quantity" like a simple item does.
+# ---------------------------------------------------------------------
+async def start_composite_item(callback: CallbackQuery, state: FSMContext, menu_item_id: str):
+    groups = (
+        supabase.table("modifier_groups")
+        .select("*, modifier_options(*)")
+        .eq("menu_item_id", menu_item_id)
+        .eq("is_active", True)
+        .order("display_order")
+        .execute()
+        .data
+    )
+
+    await state.update_data(
+        menu_item_id=menu_item_id,
+        groups=groups,
+        group_index=0,
+        selections={},   # { group_id: [ {option_id, name, price_delta, quantity} ] }
+    )
+    await state.set_state(CompositeOrderStates.walking_groups)
+    await show_current_group(callback, state)
+
+
+async def show_current_group(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    groups = data["groups"]
+    idx = data["group_index"]
+
+    if idx >= len(groups):
+        return await finalize_composite_selection(callback, state)
+
+    group = groups[idx]
+    options = [o for o in group["modifier_options"] if o["is_available"]]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for opt in options:
+        label = opt["name"]
+        if opt["price_delta"] > 0:
+            label += f" (+₦{opt['price_delta']:,.0f})"
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text=label, callback_data=f"mod_pick:{opt['id']}")
+        ])
+
+    # Optional groups (min_select = 0) get a Skip button — this is what lets
+    # a swallow be sold alone, or lets someone pick swallow with no soup, etc.
+    if group["min_select"] == 0:
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="⏭ Skip", callback_data="mod_skip")
+        ])
+
+    # Multi-select groups need an explicit "Done" once minimum is met
+    if group["selection_mode"] == "multi":
+        kb.inline_keyboard.append([
+            InlineKeyboardButton(text="✅ Done with this", callback_data="mod_group_done")
+        ])
+
+    await callback.message.edit_text(
+        f"*{group['name']}*\n(choose {'one' if group['selection_mode'] == 'single' else 'one or more'})",
+        reply_markup=kb,
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query(CompositeOrderStates.walking_groups, F.data.startswith("mod_pick:"))
+async def on_option_picked(callback: CallbackQuery, state: FSMContext):
+    option_id = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    groups = data["groups"]
+    group = groups[data["group_index"]]
+    option = next(o for o in group["modifier_options"] if o["id"] == option_id)
+
+    if group["allow_quantity"]:
+        # Stash the picked option and ask "how many?" before moving on
+        await state.update_data(pending_option=option)
+        await state.set_state(CompositeOrderStates.entering_quantity)
+        await callback.message.edit_text(f"How many {option['name']} ({option['unit_label'] or 'unit'})?")
+        return
+
+    selections = data["selections"]
+    selections.setdefault(group["id"], []).append({
+        "option_id": option["id"],
+        "name": option["name"],
+        "price_delta": option["price_delta"],
+        "quantity": 1,
+    })
+    await state.update_data(selections=selections)
+
+    if group["selection_mode"] == "single":
+        # single-select groups auto-advance after one pick
+        await advance_to_next_group(callback, state)
+    else:
+        await show_current_group(callback, state)  # stay, let them pick more or hit Done
+
+
+@dp.message(CompositeOrderStates.entering_quantity)
+async def on_quantity_entered(message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) < 1:
+        return await message.answer("Please enter a valid number, e.g. 3")
+
+    qty = int(message.text)
+    data = await state.get_data()
+    option = data["pending_option"]
+    groups = data["groups"]
+    group = groups[data["group_index"]]
+
+    selections = data["selections"]
+    selections.setdefault(group["id"], []).append({
+        "option_id": option["id"],
+        "name": option["name"],
+        "price_delta": option["price_delta"],
+        "quantity": qty,
+    })
+    await state.update_data(selections=selections, pending_option=None)
+    await state.set_state(CompositeOrderStates.walking_groups)
+
+    # after quantity entry, re-show group (multi) so they can add another
+    # protein type, or advance automatically for single-select groups
+    fake_cb_message = message  # in real code, reuse your message->edit helper
+    await show_current_group_via_message(message, state)
+
+
+@dp.callback_query(CompositeOrderStates.walking_groups, F.data == "mod_skip")
+async def on_skip(callback: CallbackQuery, state: FSMContext):
+    await advance_to_next_group(callback, state)
+
+
+@dp.callback_query(CompositeOrderStates.walking_groups, F.data == "mod_group_done")
+async def on_group_done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    group = data["groups"][data["group_index"]]
+    picked = data["selections"].get(group["id"], [])
+
+    if len(picked) < group["min_select"]:
+        return await callback.answer(
+            f"Please pick at least {group['min_select']} option(s).", show_alert=True
+        )
+
+    await advance_to_next_group(callback, state)
+
+
+async def advance_to_next_group(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(group_index=data["group_index"] + 1)
+    await show_current_group(callback, state)
+
+
+async def finalize_composite_selection(callback: CallbackQuery, state: FSMContext):
+    """Build the cart line: base item price + sum of all modifier price_delta * qty."""
+    data = await state.get_data()
+    menu_item = (
+        supabase.table("menu_items").select("*").eq("id", data["menu_item_id"]).single().execute().data
+    )
+
+    modifier_total = 0
+    summary_lines = []
+    for group_id, picks in data["selections"].items():
+        names = []
+        for p in picks:
+            modifier_total += p["price_delta"] * p["quantity"]
+            names.append(f"{p['name']} x{p['quantity']}" if p["quantity"] > 1 else p["name"])
+        summary_lines.append(", ".join(names))
+
+    line_total = menu_item["price"] + modifier_total
+    summary_text = f"{menu_item['name']} — " + " + ".join(summary_lines) + f" — ₦{line_total:,.0f}"
+
+    # Add to cart in FSM data (same place your existing simple-item flow stores cart items)
+    data = await state.get_data()
+    cart = data.get("cart", {})
+    cart_key = f"{data['menu_item_id']}_{uuid.uuid4().hex[:8]}"  # unique key for this composite selection
+    cart[cart_key] = {
+        
+        "name": menu_item["name"],
+        "price": line_total,  # use "price" (not "base_price") so existing cart code reads it correctly
+        "qty": 1,             # composite orders are always qty 1 per configured combo
+        "modifiers": data["selections"],
+    }
+    await state.update_data(cart=cart)
+
+    await callback.message.edit_text(f"Added to cart:\n{summary_text}")
+    # -> hand off to your existing "review cart" step here
 
 
 @dp.callback_query(F.data.startswith("zone_"))
@@ -1343,13 +1533,17 @@ async def select_quantity(callback_query: types.CallbackQuery, state: FSMContext
     
     # Get item details
     item = supabase.table("menu_items")\
-        .select("name, price")\
+        .select("name, price, item_type")\
         .eq("id", menu_item_id)\
         .execute()
     
     if not item.data:
         await callback_query.answer("Item not found!")
         return
+    
+    if item.data[0]["item_type"] == "composite":
+            await start_composite_item(callback_query, state, menu_item_id)
+            return
     
     # Store current item in state
     await state.update_data(current_item_id=menu_item_id)
@@ -1755,7 +1949,23 @@ async def create_order_in_db(bot: Bot, user_id: int, state: FSMContext, payment_
             "subtotal": str(subtotal)
         })
     
-    supabase.table("order_items").insert(order_items).execute()
+    order_items_response = supabase.table("order_items").insert(order_items).execute()
+
+    modifier_rows = []
+    for (cart_key, cart_item), inserted_row in zip(cart.items(), order_items_response.data):
+        if not cart_item.get("modifiers"):
+            continue
+        for group_id, picks in cart_item["modifiers"].items():
+            for p in picks:
+                modifier_rows.append({
+                    "order_item_id": inserted_row["id"],
+                    "modifier_option_id": p["option_id"],
+                    "quantity": p["quantity"],
+                    "unit_price": p["price_delta"],
+                })
+
+    if modifier_rows:
+        supabase.table("order_item_modifiers").insert(modifier_rows).execute()
     
     # If bank transfer, create payment record
     if payment_method == "Bank Transfer" and payment_proof_file_id:
@@ -1808,7 +2018,15 @@ async def send_order_to_kitchen(bot: Bot, order_id: str, user_id: int, state: FS
     for item in cart.values():
         qty = item["qty"]
         name = item["name"]
-        order_text += f"• {escape(name)} × {qty}\n"
+        if item.get("modifiers"):
+            parts = []
+            for group_id, picks in item["modifiers"].items():
+                for p in picks:
+                    parts.append(f"{p['name']} x{p['quantity']}" if p["quantity"] > 1 else p["name"])
+            modifiers_text = ", ".join(parts)
+            order_text += f"• {escape(name)} ({escape(modifiers_text)}) × {qty}\n"
+        else:
+            order_text += f"• {escape(name)} × {qty}\n"
     
     order_text += "─────────────────"
     payment_method = data.get("payment_method", "Unknown")
@@ -2270,7 +2488,8 @@ async def handle_preparing(callback_query: types.CallbackQuery, bot: Bot):
     await callback_query.answer("Marked as preparing!")
 
 
-@router.callback_query(F.data.startswith("ready_"))
+@dp.callback_query(F.data.startswith("ready_"))
+
 async def handle_ready(callback_query: CallbackQuery, bot: Bot):
     """Kitchen marks order as ready"""
     order_id = callback_query.data.replace("ready_", "")
@@ -2843,7 +3062,7 @@ async def kitchen_show_category_items(callback_query: types.CallbackQuery):
     restaurant_id = category_data["restaurant_id"]
 
     items = supabase.table("menu_items")\
-        .select("id, name, price, is_available")\
+        .select("id, name, price, is_available, item_type")\
         .eq("category_id", category_id)\
         .order("name")\
         .execute()
@@ -2938,6 +3157,82 @@ async def kitchen_toggle_item(callback_query: types.CallbackQuery):
     await callback_query.message.edit_reply_markup(
         reply_markup=keyboard.as_markup()
     )
+
+
+async def show_composite_item_admin(callback: CallbackQuery, menu_item_id: str, short_cat:str):
+    groups = (
+        supabase.table("modifier_groups")
+        .select("*, modifier_options(*)")
+        .eq("menu_item_id", menu_item_id)
+        .order("display_order")
+        .execute()
+        .data
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[])
+    for group in groups:
+        kb.inline_keyboard.append(
+            [InlineKeyboardButton(text=f"— {group['name']} —", callback_data="noop")]
+        )
+        for opt in sorted(group["modifier_options"], key=lambda o: o["display_order"]):
+            status = "✅" if opt["is_available"] else "🚫"
+            kb.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=f"{status} {opt['name']}",
+                    callback_data=f"toggle_mod_opt:{opt['id']}:{menu_item_id}",
+                )
+            ])
+
+    #kb.inline_keyboard.append([
+    #    InlineKeyboardButton(text="⬅ Back to menu", callback_data="kitchen_menu_back")
+    #])
+
+    kb.inline_keyboard.append([
+    InlineKeyboardButton(text="⬅ Back to menu", callback_data=f"kmc_{short_cat}")
+    ])
+    
+    await callback.message.edit_text(
+        "Tap any soup or protein to mark it in / out of stock.\n"
+        "The swallow itself stays orderable regardless.",
+        reply_markup=kb,
+    )
+
+@dp.callback_query(F.data.startswith("kmadm_"))
+async def kitchen_open_composite_admin(callback_query: CallbackQuery):
+    parts = callback_query.data.split("_")
+    short_item, short_cat = parts[1], parts[2]
+
+    full_id = await get_full_id("menu_items", short_item)
+    if not full_id:
+        await callback_query.answer("Item not found.")
+        return
+
+    await state.update_data(admin_category_short=short_cat)  # needed for the back button below
+    await show_composite_item_admin(callback_query, full_id, short_cat)
+    await callback_query.answer()
+
+    
+@dp.callback_query(F.data.startswith("toggle_mod_opt:"))
+async def on_toggle_modifier_option(callback: CallbackQuery):
+    _, option_id, menu_item_id = callback.data.split(":")
+
+    current = (
+        supabase.table("modifier_options")
+        .select("is_available, name")
+        .eq("id", option_id)
+        .single()
+        .execute()
+        .data
+    )
+    new_status = not current["is_available"]
+
+    supabase.table("modifier_options").update({"is_available": new_status}).eq("id", option_id).execute()
+
+    await callback.answer(
+        f"{current['name']} marked {'available' if new_status else 'out of stock'}"
+    )
+    # Refresh the admin view so the ✅/🚫 icon updates in place
+    await show_composite_item_admin(callback, menu_item_id)
 
 
 @dp.callback_query(F.data.startswith("kmb_"))
