@@ -289,17 +289,8 @@ async def start_composite_item(callback: CallbackQuery, state: FSMContext, menu_
     await show_current_group(callback, state)
 
 
-async def show_current_group(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    groups = data["groups"]
-    idx = data["group_index"]
-
-    if idx >= len(groups):
-        return await finalize_composite_selection(callback, state)
-
-    group = groups[idx]
+def build_group_prompt(group: dict) -> tuple[str, InlineKeyboardMarkup]:
     options = [o for o in group["modifier_options"] if o["is_available"]]
-
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for opt in options:
         label = opt["name"]
@@ -308,26 +299,32 @@ async def show_current_group(callback: CallbackQuery, state: FSMContext):
         kb.inline_keyboard.append([
             InlineKeyboardButton(text=label, callback_data=f"mod_pick:{opt['id']}")
         ])
-
-    # Optional groups (min_select = 0) get a Skip button — this is what lets
-    # a swallow be sold alone, or lets someone pick swallow with no soup, etc.
     if group["min_select"] == 0:
-        kb.inline_keyboard.append([
-            InlineKeyboardButton(text="⏭ Skip", callback_data="mod_skip")
-        ])
-
-    # Multi-select groups need an explicit "Done" once minimum is met
+        kb.inline_keyboard.append([InlineKeyboardButton(text="⏭ Skip", callback_data="mod_skip")])
     if group["selection_mode"] == "multi":
-        kb.inline_keyboard.append([
-            InlineKeyboardButton(text="✅ Done with this", callback_data="mod_group_done")
-        ])
+        kb.inline_keyboard.append([InlineKeyboardButton(text="✅ Done with this", callback_data="mod_group_done")])
+    text = f"*{group['name']}*\n(choose {'one' if group['selection_mode'] == 'single' else 'one or more'})"
+    return text, kb
 
-    await callback.message.edit_text(
-        f"*{group['name']}*\n(choose {'one' if group['selection_mode'] == 'single' else 'one or more'})",
-        reply_markup=kb,
-        parse_mode="Markdown",
-    )
 
+async def show_current_group(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    groups = data["groups"]
+    idx = data["group_index"]
+    if idx >= len(groups):
+        return await finalize_composite_selection(callback, state)
+    text, kb = build_group_prompt(groups[idx])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+
+
+async def show_current_group_via_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    groups = data["groups"]
+    idx = data["group_index"]
+    if idx >= len(groups):
+        return await finalize_composite_selection_via_message(message, state)
+    text, kb = build_group_prompt(groups[idx])
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(CompositeOrderStates.walking_groups, F.data.startswith("mod_pick:"))
 async def on_option_picked(callback: CallbackQuery, state: FSMContext):
@@ -338,10 +335,22 @@ async def on_option_picked(callback: CallbackQuery, state: FSMContext):
     option = next(o for o in group["modifier_options"] if o["id"] == option_id)
 
     if group["allow_quantity"]:
-        # Stash the picked option and ask "how many?" before moving on
         await state.update_data(pending_option=option)
         await state.set_state(CompositeOrderStates.entering_quantity)
-        await callback.message.edit_text(f"How many {option['name']} ({option['unit_label'] or 'unit'})?")
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[])
+        number_row = [
+            InlineKeyboardButton(text=str(i), callback_data=f"modqty_{i}")
+            for i in range(1, 6)
+        ]
+        kb.inline_keyboard.append(number_row)
+        kb.inline_keyboard.append([InlineKeyboardButton(text="Custom", callback_data="modqty_custom")])
+
+        unit = option['unit_label'] or 'unit'
+        await callback.message.edit_text(
+            f"How many {option['name']} ({unit})?",
+            reply_markup=kb
+        )
         return
 
     selections = data["selections"]
@@ -358,6 +367,34 @@ async def on_option_picked(callback: CallbackQuery, state: FSMContext):
         await advance_to_next_group(callback, state)
     else:
         await show_current_group(callback, state)  # stay, let them pick more or hit Done
+
+@dp.callback_query(CompositeOrderStates.entering_quantity, F.data.startswith("modqty_"))
+async def on_modifier_quantity_button(callback: CallbackQuery, state: FSMContext):
+    value = callback.data.replace("modqty_", "")
+
+    if value == "custom":
+        await callback.message.edit_text("Please type the quantity:")
+        await callback.answer()
+        return
+
+    qty = int(value)
+    data = await state.get_data()
+    option = data["pending_option"]
+    groups = data["groups"]
+    group = groups[data["group_index"]]
+
+    selections = data["selections"]
+    selections.setdefault(group["id"], []).append({
+        "option_id": option["id"],
+        "name": option["name"],
+        "price_delta": option["price_delta"],
+        "quantity": qty,
+    })
+    await state.update_data(selections=selections, pending_option=None)
+    await state.set_state(CompositeOrderStates.walking_groups)
+
+    await show_current_group(callback, state)
+    await callback.answer()
 
 
 @dp.message(CompositeOrderStates.entering_quantity)
@@ -383,7 +420,7 @@ async def on_quantity_entered(message, state: FSMContext):
 
     # after quantity entry, re-show group (multi) so they can add another
     # protein type, or advance automatically for single-select groups
-    fake_cb_message = message  # in real code, reuse your message->edit helper
+    
     await show_current_group_via_message(message, state)
 
 
