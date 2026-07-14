@@ -483,7 +483,37 @@ async def finalize_composite_selection(callback: CallbackQuery, state: FSMContex
 
     await callback.message.edit_text(f"Added to cart:\n{summary_text}")
     # -> hand off to your existing "review cart" step here
+    await state.set_state(None)
+    await go_to_main_menu(callback.message, state)
 
+async def finalize_composite_selection_via_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    menu_item = supabase.table("menu_items").select("*").eq("id", data["menu_item_id"]).single().execute().data
+
+    modifier_total = 0
+    summary_lines = []
+    for group_id, picks in data["selections"].items():
+        names = []
+        for p in picks:
+            modifier_total += p["price_delta"] * p["quantity"]
+            names.append(f"{p['name']} x{p['quantity']}" if p["quantity"] > 1 else p["name"])
+        summary_lines.append(", ".join(names))
+
+    line_total = menu_item["price"] + modifier_total
+    summary_text = f"{menu_item['name']} — " + " + ".join(summary_lines) + f" — ₦{line_total:,.0f}"
+
+    cart = data.get("cart", {})
+    cart_key = f"{data['menu_item_id']}_{uuid.uuid4().hex[:8]}"
+    cart[cart_key] = {
+        "name": menu_item["name"],
+        "price": line_total,
+        "qty": 1,
+        "modifiers": data["selections"],
+    }
+    await state.update_data(cart=cart)
+    await message.answer(f"Added to cart:\n{summary_text}")
+    await state.set_state(None)
+    await go_to_main_menu(message, state)
 
 @dp.callback_query(F.data.startswith("zone_"))
 async def handle_zone_selection(callback_query: types.CallbackQuery, state: FSMContext):
