@@ -183,10 +183,11 @@ async def get_tracked_inventory_items(restaurant_id: str):
 
 async def validate_cart_inventory(cart: dict):
     shortages = []
-    for menu_item_id, cart_item in cart.items():
+    for cart_key, cart_item in cart.items():
+        real_menu_item_id = cart_item.get("menu_item_id", cart_key)
         item = supabase.table("menu_items")\
             .select("name, inventory_count, track_inventory")\
-            .eq("id", menu_item_id)\
+            .eq("id", real_menu_item_id)\
             .execute()
         if not item.data:
             continue
@@ -478,6 +479,7 @@ async def finalize_composite_selection(callback: CallbackQuery, state: FSMContex
         "price": line_total,  # use "price" (not "base_price") so existing cart code reads it correctly
         "qty": 1,             # composite orders are always qty 1 per configured combo
         "modifiers": data["selections"],
+        "menu_item_id": data["menu_item_id"],
     }
     await state.update_data(cart=cart)
 
@@ -509,6 +511,7 @@ async def finalize_composite_selection_via_message(message: types.Message, state
         "price": line_total,
         "qty": 1,
         "modifiers": data["selections"],
+        "menu_item_id": data["menu_item_id"],
     }
     await state.update_data(cart=cart)
     await message.answer(f"Added to cart:\n{summary_text}")
@@ -1666,7 +1669,8 @@ async def add_to_cart(callback_query: types.CallbackQuery, state: FSMContext):
         cart[menu_item_id] = {
             "name": item_data["name"],
             "price": float(item_data["price"]),
-            "qty": quantity
+            "qty": quantity,
+            "menu_item_id": menu_item_id,   
         }
     
     await state.update_data(cart=cart)
@@ -1736,7 +1740,8 @@ async def handle_custom_quantity(message: types.Message, state: FSMContext):
         cart[menu_item_id] = {
             "name": item_data["name"],
             "price": float(item_data["price"]),
-            "qty": quantity
+            "qty": quantity,
+            "menu_item_id": menu_item_id,
         }
     
     await state.update_data(cart=cart)
@@ -2003,14 +2008,15 @@ async def create_order_in_db(bot: Bot, user_id: int, state: FSMContext, payment_
     
     # Create order items
     order_items = []
-    for menu_item_id, item in cart.items():
+    for cart_key, item in cart.items():
+        real_menu_item_id = item.get("menu_item_id", cart_key)
         unit_price = item["price"]
         quantity = item["qty"]
         subtotal = unit_price * quantity
         
         order_items.append({
             "order_id": order_id,
-            "menu_item_id": menu_item_id,
+            "menu_item_id": real_menu_item_id,
             "quantity": quantity,
             "unit_price": str(unit_price),
             "subtotal": str(subtotal)
