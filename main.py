@@ -28,6 +28,7 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 from datetime import datetime, timedelta
 from reports import generate_daily_report, generate_weekly_report
+from whatsapp import handle_whatsapp_webhook
 
 
 FASTAPI_WEBHOOK_URL = os.getenv("FASTAPI_WEBHOOK_URL","https://telegram-n8n-restaurant-bot.onrender.com")  # Replace with your actual webhook URL
@@ -181,6 +182,23 @@ async def webhook(request:Request):
         logger.error(f"Error processing main webhook update: {e}", exc_info=True)
 
     return {"ok": True}
+
+
+@app.get("/webhook/whatsapp")
+async def whatsapp_verify(request: Request):
+    params = request.query_params
+    if params.get("hub.verify_token") == os.getenv("WHATSAPP_VERIFY_TOKEN"):
+        return int(params.get("hub.challenge"))
+    return {"error": "invalid token"}
+
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook(request: Request):
+    payload = await request.json()
+    try:
+        await handle_whatsapp_webhook(payload, supabase, bot)  # bot = your existing Telegram bot
+    except Exception as e:
+        logger.error(f"WhatsApp webhook error: {e}", exc_info=True)
+    return {"status": "ok"}
 
 @app.get("/paystack/callback")
 async def paystack_browser_callback(request: Request):

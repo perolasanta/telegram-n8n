@@ -1946,8 +1946,19 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
 
     
-async def create_order_in_db(bot: Bot, user_id: int, state: FSMContext, payment_method: str, payment_proof_file_id: str = None):
-    """Create order in database"""
+async def create_order_in_db(
+    user_id: int | None,
+    state: FSMContext,
+    payment_method: str,
+    customer_name: str,
+    order_channel: str,
+    payment_proof_reference: str | None,
+    customer_contact: str | None = None,
+):
+    """Create an order from either Telegram or WhatsApp state.
+
+    Caller-supplied customer data keeps this persistence layer channel-agnostic.
+    """
     data = await state.get_data()
     cart = data.get("cart", {})
     restaurant_id = data.get("restaurant_id")
@@ -1970,10 +1981,6 @@ async def create_order_in_db(bot: Bot, user_id: int, state: FSMContext, payment_
         )
         raise ValueError(f"Insufficient stock: {details}")
     
-    # Get customer name
-    user = await bot.get_chat(user_id)
-    customer_name = user.username or user.first_name or "Unknown"
-    
     # Create order
     initial_payment_status = "pending"
     if payment_method == "Cash Payment":
@@ -1990,6 +1997,8 @@ async def create_order_in_db(bot: Bot, user_id: int, state: FSMContext, payment_
         "table_id": table_id,
         "telegram_user_id": user_id,
         "customer_name": customer_name,
+        "customer_contact": customer_contact,
+        "order_channel": order_channel,
         "total_amount": str(total_price),
         "payment_method": payment_method,
         "payment_status": initial_payment_status,
@@ -2041,82 +2050,90 @@ async def create_order_in_db(bot: Bot, user_id: int, state: FSMContext, payment_
         supabase.table("order_item_modifiers").insert(modifier_rows).execute()
     
     # If bank transfer, create payment record
-    if payment_method == "Bank Transfer" and payment_proof_file_id:
+    if payment_method == "Bank Transfer" and payment_proof_reference:
         supabase.table("payments").insert({
             "order_id": order_id,
             "restaurant_id": restaurant_id,
             "amount": str(total_price),
             "provider": "Bank Transfer",
             "status": "pending",
-            "provider_reference": payment_proof_file_id
+            "provider_reference": payment_proof_reference
         }).execute()
     
     return order_id, order_response.data[0]
 
 
-async def send_order_to_kitchen(bot: Bot, order_id: str, user_id: int, state: FSMContext, payment_proof_file_id: str = None):
-    """Send order notification to kitchen"""
-    data = await state.get_data()
+def build_kitchen_order_text(
+    order_id: str,
+    data: dict,
+    customer_name: str,
+    customer_contact: str | None = None,
+) -> str:
+    """Build the shared Telegram-kitchen notification for any order channel."""
     cart = data.get("cart", {})
     total_price = data.get("total_price", 0)
     table_number = data.get("table_number", "Unknown")
     restaurant_name = data.get("restaurant_name", "Restaurant")
-    restaurant_id = data.get("restaurant_id")
-    kitchen_chat_id = data.get("kitchen_chat_id")
     order_type = data.get("order_type", "dine_in")
 
     if order_type == "delivery":
-        delivery_address = data.get("delivery_address", "No address provided")
-        order_location = f"Delivery\n📍 {delivery_address}"
-        
+        order_location = f"Delivery\n📍 {data.get('delivery_address') or 'No address provided'}"
     elif order_type == "pickup":
         order_location = "Pickup"
     else:
         order_location = f"Table {table_number} — Dine-in"
-    
-    if not kitchen_chat_id:
-        print("⚠️ No kitchen_chat_id configured for this restaurant")
-        return
-    
-    # Get customer info
-    user = await bot.get_chat(user_id)
-    customer_name = user.username or user.first_name or "Unknown"
-    
-    # Build order message
+
     order_text = f"🆕 <b>NEW ORDER  #{order_short_id(order_id)}</b>\n"
     order_text += f"🏪 {escape(restaurant_name)}\n"
     order_text += f"📍 {escape(order_location)}\n"
     order_text += "─────────────────\n"
-    
     for item in cart.values():
-        qty = item["qty"]
-        name = item["name"]
         if item.get("modifiers"):
-            parts = []
-            for group_id, picks in item["modifiers"].items():
-                for p in picks:
-                    parts.append(f"{p['name']} x{p['quantity']}" if p["quantity"] > 1 else p["name"])
-            modifiers_text = ", ".join(parts)
-            order_text += f"• {escape(name)} ({escape(modifiers_text)}) × {qty}\n"
+            modifiers = ", ".join(
+                f"{pick['name']} x{pick['quantity']}" if pick["quantity"] > 1 else pick["name"]
+                for picks in item["modifiers"].values() for pick in picks
+            )
+            order_text += f"• {escape(item['name'])} ({escape(modifiers)}) × {item['qty']}\n"
         else:
-            order_text += f"• {escape(name)} × {qty}\n"
-    
-    order_text += "─────────────────"
+            order_text += f"• {escape(item['name'])} × {item['qty']}\n"
+
     payment_method = data.get("payment_method", "Unknown")
     delivery_fee = data.get("delivery_fee", 0)
+    order_text += "─────────────────"
     order_text += f"\n💰 {format_money(total_price)}"
     if delivery_fee > 0:
         order_text += f" (incl. ₦{delivery_fee:,.0f} delivery)"
     order_text += f"  |  {escape(payment_method)}"
     order_text += f"\n⏱ {datetime.now(pytz.timezone('Africa/Lagos')).strftime('%I:%M %p').lstrip('0')}"
-    
     if payment_method == "Bank Transfer":
         order_text += "\n⏳ Status: Pending Verification"
+    order_text += f"\n👤 Customer: {escape(customer_name)}"
+    if customer_contact:
+        order_text += f"\n📱 Contact: {escape(customer_contact)}"
+    return order_text
+
+
+async def send_order_to_kitchen(
+    bot: Bot,
+    order_id: str,
+    state: FSMContext,
+    customer_name: str,
+    customer_contact: str | None = None,
+    payment_proof: object | None = None,
+):
+    """Send a channel-agnostic order notification to the Telegram kitchen."""
+    data = await state.get_data()
+    restaurant_id = data.get("restaurant_id")
+    kitchen_chat_id = data.get("kitchen_chat_id")
+
+    if not kitchen_chat_id:
+        print("⚠️ No kitchen_chat_id configured for this restaurant")
+        return
     
-    order_text += f"\n👤 Customer: @{escape(customer_name)}" if user.username else f"\n👤 Customer: {escape(customer_name)}"
+    order_text = build_kitchen_order_text(order_id, data, customer_name, customer_contact)
     
     # Send to kitchen
-    if payment_proof_file_id:
+    if payment_proof:
         # Bank transfer - with payment proof
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -2127,7 +2144,7 @@ async def send_order_to_kitchen(bot: Bot, order_id: str, user_id: int, state: FS
         
         await bot.send_photo(
             kitchen_chat_id,
-            photo=payment_proof_file_id,
+            photo=payment_proof,
             caption=order_text,
             reply_markup=keyboard
         )
@@ -2160,10 +2177,13 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
         await state.update_data(payment_method="Pay on Delivery")
         
         # CREATE ORDER IN DATABASE
-        order_id, order = await create_order_in_db(bot, user_id, state, "Pay on Delivery")
+        customer_name = callback_query.from_user.username or callback_query.from_user.first_name or "Customer"
+        order_id, order = await create_order_in_db(
+            user_id, state, "Pay on Delivery", customer_name, "telegram", None
+        )
         
         # SEND TO KITCHEN
-        await send_order_to_kitchen(bot, order_id, user_id, state)
+        await send_order_to_kitchen(bot, order_id, state, customer_name)
 
         low_stock_items = await deduct_inventory_for_order(order_id)
         data = await state.get_data()
@@ -2205,10 +2225,13 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext, b
         await state.update_data(payment_method="Cash Payment")
         
         # CREATE ORDER IN DATABASE
-        order_id, order = await create_order_in_db(bot, user_id, state, "Cash Payment")
+        customer_name = callback_query.from_user.username or callback_query.from_user.first_name or "Customer"
+        order_id, order = await create_order_in_db(
+            user_id, state, "Cash Payment", customer_name, "telegram", None
+        )
         
         # SEND TO KITCHEN
-        await send_order_to_kitchen(bot, order_id, user_id, state)
+        await send_order_to_kitchen(bot, order_id, state, customer_name)
 
         low_stock_items = await deduct_inventory_for_order(order_id)
         data = await state.get_data()
@@ -2268,7 +2291,10 @@ async def payment_paystack(callback_query: types.CallbackQuery, state: FSMContex
 
     try:
         await state.update_data(payment_method="Paystack")
-        order_id, order = await create_order_in_db(callback_query.bot, callback_query.from_user.id, state, "Paystack")
+        customer_name = callback_query.from_user.username or callback_query.from_user.first_name or "Customer"
+        order_id, order = await create_order_in_db(
+            callback_query.from_user.id, state, "Paystack", customer_name, "telegram", None
+        )
 
         email = await get_paystack_email_for_user(callback_query.from_user.id)
         payment_url = await create_paystack_payment_link(
@@ -2365,13 +2391,16 @@ async def receive_payment_proof(message: types.Message, state: FSMContext, bot: 
     
     try:
         # CREATE ORDER with payment proof
-        order_id, order = await create_order_in_db(bot, user_id, state, "Bank Transfer", file_id)
+        customer_name = message.from_user.username or message.from_user.first_name or "Customer"
+        order_id, order = await create_order_in_db(
+            user_id, state, "Bank Transfer", customer_name, "telegram", file_id,
+        )
         
         data = await state.get_data()
         total_price = data.get("total_price", 0)
         
         # SEND TO KITCHEN with payment proof
-        await send_order_to_kitchen(bot, order_id, user_id, state, file_id)
+        await send_order_to_kitchen(bot, order_id, state, customer_name, payment_proof=file_id)
         
         await message.answer(
             f"✅ Order placed successfully!\n"
@@ -2406,6 +2435,20 @@ async def payment_proof_invalid(message: types.Message):
 
 # ========== KITCHEN CALLBACKS ==========
 
+async def notify_order_customer(bot: Bot, order: dict, message: str) -> None:
+    """Deliver an update through the channel that created the order."""
+    if order.get("order_channel") == "whatsapp":
+        restaurant = order.get("restaurants") or {}
+        contact = order.get("customer_contact")
+        phone_number_id = restaurant.get("whatsapp_phone_number_id")
+        token = restaurant.get("whatsapp_access_token")
+        if not (contact and phone_number_id and token):
+            raise ValueError("WhatsApp notification details are missing for this order")
+        from whatsapp import send_text
+        await send_text(phone_number_id, token, contact, message)
+    elif order.get("telegram_user_id"):
+        await bot.send_message(order["telegram_user_id"], message)
+
 @dp.callback_query(F.data.startswith("confirm_pay_"))
 async def confirm_payment_handler(callback_query: types.CallbackQuery, bot: Bot):
     """Kitchen confirms payment for bank transfer"""
@@ -2425,7 +2468,7 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery, bot: Bot)
     
     # Get order details
     order = supabase.table("orders")\
-        .select("telegram_user_id, customer_name, restaurant_id, restaurants(kitchen_chat_id)")\
+        .select("telegram_user_id, customer_contact, order_channel, restaurant_id, restaurants(kitchen_chat_id, whatsapp_phone_number_id, whatsapp_access_token)")\
         .eq("id", order_id)\
         .execute()
 
@@ -2434,22 +2477,21 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery, bot: Bot)
     if order.data:
         order_data = order.data[0]
         restaurant_id = order_data.get("restaurant_id")
-        user_id = order_data["telegram_user_id"]
-        customer_name = order_data["customer_name"]
         kitchen_chat_id = (order_data.get("restaurants") or {}).get("kitchen_chat_id")
 
         low_stock_items = await deduct_inventory_for_order(order_id)
         await send_restock_alert(bot, order_data.get("restaurant_id"), kitchen_chat_id, low_stock_items)
         
         try:
-            await bot.send_message(
-                user_id,
+            await notify_order_customer(
+                bot, order_data,
                 f"✅ Your payment has been verified!\n"
                 f"Order #{order_short_id(order_id)} has been sent to the kitchen. 🍳"
             )
             
             # NOW SEND RECEIPT after payment confirmed
-            await send_receipt_to_customer(bot, user_id, order_id)
+            if order_data.get("order_channel") != "whatsapp":
+                await send_receipt_to_customer(bot, order_data["telegram_user_id"], order_id)
             
         except Exception as e:
             print(f"Failed to notify customer: {e}")
@@ -2490,19 +2532,19 @@ async def reject_payment_handler(callback_query: types.CallbackQuery, bot: Bot):
     
     # Get order details
     order = supabase.table("orders")\
-        .select("telegram_user_id, restaurant_id")\
+        .select("telegram_user_id, customer_contact, order_channel, restaurant_id, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
         .eq("id", order_id)\
         .execute()
 
     restaurant_id = None
     
     if order.data:
-        restaurant_id = order.data[0].get("restaurant_id")
-        user_id = order.data[0]["telegram_user_id"]
+        order_data = order.data[0]
+        restaurant_id = order_data.get("restaurant_id")
         
         try:
-            await bot.send_message(
-                user_id,
+            await notify_order_customer(
+                bot, order_data,
                 f"❌ Your payment for Order #{order_short_id(order_id)} could not be verified.\n"
                 f"Please contact us or submit a new payment proof."
             )
@@ -2530,13 +2572,13 @@ async def handle_preparing(callback_query: types.CallbackQuery, bot: Bot):
         .execute()
     
     order = supabase.table("orders")\
-        .select("telegram_user_id, restaurant_id")\
+        .select("telegram_user_id, customer_contact, order_channel, restaurant_id, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
         .eq("id", order_id)\
         .execute()
     
     if order.data:
-        await bot.send_message(
-            order.data[0]["telegram_user_id"],
+        await notify_order_customer(
+            bot, order.data[0],
             f"🍳 Your order #{order_short_id(order_id)} is now being prepared!"
         )
 
@@ -2575,17 +2617,17 @@ async def handle_ready(callback_query: CallbackQuery, bot: Bot):
     
     # Get order details
     order = supabase.table("orders")\
-        .select("telegram_user_id, customer_name, restaurant_id, order_type")\
+        .select("telegram_user_id, customer_name, customer_contact, order_channel, restaurant_id, order_type, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
         .eq("id", order_id)\
         .execute()
 
     restaurant_id = None
     
     if order.data:
-        user_id = order.data[0]["telegram_user_id"]
-        customer_name = order.data[0]["customer_name"]
-        restaurant_id = order.data[0].get("restaurant_id")
-        order_type = order.data[0].get("order_type", "dine_in")
+        order_data = order.data[0]
+        customer_name = order_data["customer_name"]
+        restaurant_id = order_data.get("restaurant_id")
+        order_type = order_data.get("order_type", "dine_in")
         
         if order_type == "dine_in":
             ready_message = f"✅ Hi {customer_name}, your order #{order_short_id(order_id)} is ready! Your waiter will bring it to your table shortly."
@@ -2594,7 +2636,7 @@ async def handle_ready(callback_query: CallbackQuery, bot: Bot):
         else:  # pickup
             ready_message = f"✅ Hi {customer_name}, your order #{order_short_id(order_id)} is ready for collection! Please come pick it up at the counter."
         
-        await bot.send_message(user_id, ready_message)
+        await notify_order_customer(bot, order_data, ready_message)
     
     # Update kitchen message
     if callback_query.message.photo:

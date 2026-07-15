@@ -1,0 +1,28 @@
+ALTER TABLE restaurants
+  ADD COLUMN IF NOT EXISTS whatsapp_phone_number_id text,
+  ADD COLUMN IF NOT EXISTS whatsapp_business_account_id text,
+  ADD COLUMN IF NOT EXISTS whatsapp_access_token text;
+
+ALTER TABLE orders
+  ADD COLUMN IF NOT EXISTS order_channel text NOT NULL DEFAULT 'telegram', -- 'telegram' | 'whatsapp'
+  ADD COLUMN IF NOT EXISTS customer_contact text; -- WhatsApp phone number (or future channel-specific contact)
+
+ALTER TABLE menu_items
+  ADD COLUMN IF NOT EXISTS image_url text;
+
+
+CREATE TABLE whatsapp_sessions (
+  phone_number text NOT NULL,
+  restaurant_id uuid REFERENCES restaurants(id),
+  state text,              -- mimics FSM state name
+  data jsonb DEFAULT '{}', -- cart, delivery_address, payment_method, etc.
+  updated_at timestamptz DEFAULT now(),
+  PRIMARY KEY (phone_number, restaurant_id)
+);
+
+CREATE TABLE menu_item_catalog_map (
+  menu_item_id uuid REFERENCES menu_items(id),
+  restaurant_id uuid REFERENCES restaurants(id),
+  catalog_retailer_id text NOT NULL, -- the product ID in Meta's catalog feed
+  PRIMARY KEY (menu_item_id)
+);
