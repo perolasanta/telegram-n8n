@@ -578,6 +578,9 @@ async def send_restock_alert(bot: Bot, restaurant_id: str, kitchen_chat_id: int 
     if not low_stock_items:
         return
 
+    # Same reasoning as send_order_to_kitchen — resolve the correct bot
+    # instance for this restaurant before messaging its kitchen group.
+    bot = delivery_bots.get(restaurant_id, bot)
     lines = []
     for item in low_stock_items:
         count = int(item.get("inventory_count") or 0)
@@ -2129,7 +2132,11 @@ async def send_order_to_kitchen(
     if not kitchen_chat_id:
         print("⚠️ No kitchen_chat_id configured for this restaurant")
         return
-    
+
+    # Resolve the bot that's actually a member of this restaurant's kitchen
+    # chat — a restaurant may use a dedicated delivery_bot_token instead of
+    # the main bot, and the kitchen group is only ever added to one of them.
+    bot = delivery_bots.get(restaurant_id, bot)    
     order_text = build_kitchen_order_text(order_id, data, customer_name, customer_contact)
     
     # Send to kitchen
