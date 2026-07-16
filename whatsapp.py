@@ -1,286 +1,474 @@
-import httpx
+"""WhatsApp catalog ordering and customer notifications.
+
+Prices and availability always come from Chowlin's database. Meta catalog data is
+used only to identify a menu item and requested quantity.
+"""
+
+from decimal import Decimal, InvalidOperation
 import logging
+import os
+
+import httpx
 from aiogram.types import BufferedInputFile
+
 from whatsapp_state import WhatsAppState
+from receipt_generator import generate_receipt_pdf
 from bot import (
     create_order_in_db,
+    create_paystack_payment_link,
     deduct_inventory_for_order,
+    is_subscription_active,
     send_order_to_kitchen,
+    send_order_receipt,
     send_restock_alert,
 )
 
 GRAPH_API = "https://graph.facebook.com/v25.0"
+MAX_WHATSAPP_LIST_ROWS = 10
+
+
+def money(value) -> Decimal:
+    try:
+        return Decimal(str(value or 0))
+    except (InvalidOperation, ValueError):
+        return Decimal("0")
+
 
 async def send_whatsapp_message(phone_number_id: str, token: str, to: str, payload: dict):
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{GRAPH_API}/{phone_number_id}/messages",
             headers={"Authorization": f"Bearer {token}"},
-            json={"messaging_product": "whatsapp", "to": to, **payload}
+            json={"messaging_product": "whatsapp", "to": to, **payload},
         )
         response.raise_for_status()
 
-async def send_text(phone_number_id, token, to, text):
-    await send_whatsapp_message(phone_number_id, token, to,
-        {"type": "text", "text": {"body": text}})
 
-async def send_payment_buttons(phone_number_id, token, to):
+async def send_text(phone_number_id, token, to, text):
+    await send_whatsapp_message(phone_number_id, token, to, {"type": "text", "text": {"body": text}})
+
+
+async def send_list(phone_number_id: str, token: str, to: str, body: str, button_label: str, rows: list[dict]):
+    """Send a Meta interactive list; callers must explicitly handle over-limit data."""
+    if not rows or len(rows) > MAX_WHATSAPP_LIST_ROWS:
+        raise ValueError("WhatsApp interactive lists must contain 1–10 rows")
     await send_whatsapp_message(phone_number_id, token, to, {
         "type": "interactive",
         "interactive": {
-            "type": "button",
-            "body": {"text": "How would you like to pay?"},
-            "action": {"buttons": [
-                {"type": "reply", "reply": {"id": "pay_cash", "title": "💰 Cash"}},
-                {"type": "reply", "reply": {"id": "pay_bank", "title": "🏦 Bank Transfer"}},
-                {"type": "reply", "reply": {"id": "pay_pod", "title": "🚚 Pay on Delivery"}},
-            ]}
-        }
+            "type": "list",
+            "body": {"text": body},
+            "action": {"button": button_label, "sections": [{"title": "Options", "rows": rows}]},
+        },
     })
 
 
+async def send_payment_options(phone_number_id, token, to, order_type: str, paystack_enabled: bool):
+    rows = [
+        {"id": "pay_cash", "title": "Cash"},
+        {"id": "pay_bank", "title": "Bank transfer"},
+    ]
+    if order_type == "delivery":
+        rows.append({"id": "pay_pod", "title": "Pay on delivery"})
+    if paystack_enabled:
+        rows.append({"id": "pay_paystack", "title": "Pay with card"})
+    await send_list(phone_number_id, token, to, "How would you like to pay?", "Choose payment", rows)
+
+
+async def send_whatsapp_document(phone_number_id: str, token: str, to: str, content: bytes, filename: str, caption: str):
+    """Upload a document to Meta, then send it to a WhatsApp customer."""
+    async with httpx.AsyncClient() as client:
+        upload = await client.post(
+            f"{GRAPH_API}/{phone_number_id}/media",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"messaging_product": "whatsapp", "type": "application/pdf"},
+            files={"file": (filename, content, "application/pdf")},
+        )
+        upload.raise_for_status()
+        media_id = upload.json()["id"]
+    await send_whatsapp_message(phone_number_id, token, to, {
+        "type": "document",
+        "document": {"id": media_id, "filename": filename, "caption": caption},
+    })
+
+
+async def send_whatsapp_receipt(supabase, order: dict, order_id: str) -> bool:
+    """Generate and deliver a PDF receipt for a WhatsApp-originated order."""
+    restaurant = order.get("restaurants") or {}
+    contact = order.get("customer_contact")
+    if not (contact and restaurant.get("whatsapp_phone_number_id") and restaurant.get("whatsapp_access_token")):
+        return False
+
+    try:
+        result = supabase.table("orders").select(
+            "*, order_items(*, menu_items(name, price)), restaurant_tables(table_number), restaurants(name, phone)"
+        ).eq("id", order_id).execute()
+        if not result.data:
+            return False
+        data = result.data[0]
+        items = [{
+            "name": (item.get("menu_items") or {}).get("name", "Item"),
+            "qty": item["quantity"],
+            "price": float(item["unit_price"]),
+            "total": float(item["subtotal"]),
+        } for item in data.get("order_items") or []]
+        restaurant_data = data.get("restaurants") or {}
+        total = money(data.get("total_amount"))
+        fee = money(data.get("delivery_fee"))
+        receipt_path = await generate_receipt_pdf({
+            "order_id": order_id,
+            "restaurant_name": restaurant_data.get("name", "Restaurant"),
+            "restaurant_phone": restaurant_data.get("phone", ""),
+            "table_number": (data.get("restaurant_tables") or {}).get("table_number") or data.get("order_type", "delivery").title(),
+            "customer_name": data.get("customer_name", "Customer"),
+            "created_at": __import__("datetime").datetime.fromisoformat(data["created_at"].replace("Z", "+00:00")),
+            "items": items,
+            "subtotal": total - fee,
+            "delivery_fee": fee,
+            "tax": 0,
+            "total": total,
+            "payment_method": data.get("payment_method", "Unknown"),
+            "payment_status": data.get("payment_status", "unknown"),
+        })
+        try:
+            with open(receipt_path, "rb") as receipt_file:
+                await send_whatsapp_document(
+                    restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], contact,
+                    receipt_file.read(), f"receipt_{order_id[:8]}.pdf", f"Receipt for order #{order_id[:8]}",
+                )
+        finally:
+            if os.path.exists(receipt_path):
+                os.remove(receipt_path)
+        return True
+    except Exception:
+        logging.exception("Failed to send WhatsApp receipt for order %s", order_id)
+        return False
+
+
+def interactive_reply_id(msg: dict) -> str | None:
+    interactive = msg.get("interactive") or {}
+    return (interactive.get("button_reply") or interactive.get("list_reply") or {}).get("id")
+
+
 async def handle_whatsapp_webhook(payload: dict, supabase, bot):
-    """Main router — dispatches by message type."""
-    entry = payload["entry"][0]["changes"][0]["value"]
-    phone_number_id = entry["metadata"]["phone_number_id"]
-    if "messages" not in entry:
-        return  # status update, not a message
-
-    msg = entry["messages"][0]
-    from_number = msg["from"]
-    contact_name = entry.get("contacts", [{}])[0].get("profile", {}).get("name", "Customer")
-
-    restaurant = supabase.table("restaurants")\
-        .select("id, name, kitchen_chat_id, whatsapp_phone_number_id, whatsapp_access_token")\
-        .eq("whatsapp_phone_number_id", phone_number_id).execute()
-    if not restaurant.data:
+    """Dispatch a Meta webhook event for a configured restaurant number."""
+    entries = payload.get("entry") or []
+    changes = entries[0].get("changes") if entries else []
+    entry = (changes or [{}])[0].get("value") or {}
+    phone_number_id = (entry.get("metadata") or {}).get("phone_number_id")
+    messages = entry.get("messages") or []
+    if not phone_number_id or not messages:
         return
-    r = restaurant.data[0]
-    state = WhatsAppState(supabase, from_number, r["id"])
-    session = supabase.table("whatsapp_sessions")\
-        .select("state").eq("phone_number", from_number)\
-        .eq("restaurant_id", r["id"]).execute()
-    current_state = session.data[0]["state"] if session.data else None
 
-    if msg["type"] == "order":
-        await handle_cart_submission(msg, state, r, from_number, contact_name, supabase)
-    elif msg["type"] == "interactive":
-        await handle_payment_selection(msg, state, r, from_number, supabase, bot)
-    elif msg["type"] == "location":
-        await handle_location(msg, state, r, from_number)
-    elif msg["type"] == "text":
-        await handle_text(msg, state, r, from_number, current_state)
-    elif msg["type"] == "image":
-        await handle_payment_proof(msg, state, r, from_number, supabase, bot)
+    msg = messages[0]
+    from_number = msg.get("from")
+    if not from_number:
+        return
+    contact_name = ((entry.get("contacts") or [{}])[0].get("profile") or {}).get("name", "Customer")
+    response = supabase.table("restaurants").select(
+        "id, name, kitchen_chat_id, whatsapp_phone_number_id, whatsapp_access_token, "
+        "pickup_enabled, delivery_fee_type, delivery_fee_flat, paystack_enabled, paystack_subaccount_code"
+    ).eq("whatsapp_phone_number_id", phone_number_id).execute()
+    if not response.data:
+        return
+    restaurant = response.data[0]
+    state = WhatsAppState(supabase, from_number, restaurant["id"])
+    session = supabase.table("whatsapp_sessions").select("state").eq("phone_number", from_number).eq("restaurant_id", restaurant["id"]).execute()
+    current_state = session.data[0].get("state") if session.data else None
+
+    if msg.get("type") == "order":
+        await handle_cart_submission(msg, state, restaurant, from_number, contact_name, supabase)
+    elif msg.get("type") == "interactive":
+        await handle_interactive(msg, state, restaurant, from_number, supabase, bot, current_state)
+    elif msg.get("type") == "location":
+        await handle_location(msg, state, restaurant, from_number, current_state)
+    elif msg.get("type") == "text":
+        await handle_text(msg, state, restaurant, from_number, current_state)
+    elif msg.get("type") == "image":
+        await handle_payment_proof(msg, state, restaurant, from_number, supabase, bot, current_state)
+
+
+async def build_authoritative_cart(order_payload: dict, restaurant_id: str, supabase) -> tuple[dict, list[str]]:
+    cart: dict = {}
+    problems: list[str] = []
+    for item in order_payload.get("product_items") or []:
+        retailer_id = item.get("product_retailer_id")
+        try:
+            quantity = int(item.get("quantity"))
+        except (TypeError, ValueError):
+            quantity = 0
+        if not retailer_id or quantity <= 0:
+            problems.append("an item has an invalid quantity")
+            continue
+        mapped = supabase.table("menu_item_catalog_map").select(
+            "menu_item_id, menu_items(name, price, is_available)"
+        ).eq("catalog_retailer_id", retailer_id).eq("restaurant_id", restaurant_id).execute()
+        if not mapped.data:
+            problems.append("an item is no longer in this restaurant's catalog")
+            continue
+        menu_item = mapped.data[0].get("menu_items") or {}
+        if not menu_item.get("is_available"):
+            problems.append(f"{menu_item.get('name', 'an item')} is unavailable")
+            continue
+        item_id = mapped.data[0]["menu_item_id"]
+        if item_id in cart:
+            cart[item_id]["qty"] += quantity
+        else:
+            cart[item_id] = {"name": menu_item["name"], "price": float(money(menu_item["price"])), "qty": quantity}
+    return cart, problems
+
+
+async def recalculate_total(state: WhatsAppState, restaurant: dict) -> Decimal:
+    """Refresh item prices from menu_items and calculate the final total with Decimal."""
+    data = await state.get_data()
+    cart = data.get("cart") or {}
+    refreshed_cart = {}
+    subtotal = Decimal("0")
+    for key, line in cart.items():
+        menu_item_id = line.get("menu_item_id", key)
+        row = state.supabase.table("menu_items").select("id, name, price, is_available").eq("id", menu_item_id).eq("restaurant_id", restaurant["id"]).execute()
+        if not row.data or not row.data[0].get("is_available"):
+            raise ValueError(f"{line.get('name', 'An item')} is no longer available")
+        item = row.data[0]
+        quantity = int(line.get("qty") or 0)
+        if quantity <= 0:
+            raise ValueError("Cart contains an invalid quantity")
+        unit_price = money(item["price"])
+        refreshed_cart[key] = {**line, "menu_item_id": item["id"], "name": item["name"], "price": float(unit_price), "qty": quantity}
+        subtotal += unit_price * quantity
+
+    delivery_fee = money(data.get("delivery_fee")) if data.get("order_type") == "delivery" else Decimal("0")
+    total = subtotal + delivery_fee
+    await state.update_data(cart=refreshed_cart, total_price=float(total), delivery_fee=float(delivery_fee))
+    return total
 
 
 async def handle_cart_submission(msg, state, restaurant, from_number, contact_name, supabase):
-    """WhatsApp 'order' message = the cart the customer just sent."""
-    order_payload = msg["order"]  # {catalog_id, product_items: [{product_retailer_id, quantity, item_price}]}
-    cart = {}
-    for item in order_payload["product_items"]:
-        mapped = supabase.table("menu_item_catalog_map")\
-            .select("menu_item_id, menu_items(name, price)")\
-            .eq("catalog_retailer_id", item["product_retailer_id"])\
-            .eq("restaurant_id", restaurant["id"]).execute()
-        if not mapped.data:
-            continue
-        menu_item = mapped.data[0]["menu_items"]
-        cart[mapped.data[0]["menu_item_id"]] = {
-            "name": menu_item["name"], "price": float(menu_item["price"]), "qty": item["quantity"]
-        }
-
-    total_price = sum(i["price"] * i["qty"] for i in cart.values())
-    await state.update_data(
-        cart=cart, total_price=total_price, order_type="delivery",
-        restaurant_id=restaurant["id"], restaurant_name=restaurant["name"],
-        kitchen_chat_id=restaurant["kitchen_chat_id"], customer_name=contact_name
-    )
-    await state.set_state("waiting_for_address")
-    if not cart:
+    if not await is_subscription_active(restaurant["id"]):
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "We're not accepting orders right now. Please try again later.")
+        return
+    cart, problems = await build_authoritative_cart(msg.get("order") or {}, restaurant["id"], supabase)
+    if problems or not cart:
         await state.clear()
-        await send_text(
-            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            "⚠️ We couldn't find available items in that cart. Please try again."
-        )
+        detail = "\n• ".join(problems) if problems else "no available items were found"
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ We couldn't accept this cart:\n• {detail}\n\nPlease update it and send it again.")
         return
-
-    await send_text(
-        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-        "📍 Please share your delivery address or location pin."
+    await state.update_data(
+        cart=cart, restaurant_id=restaurant["id"], restaurant_name=restaurant["name"],
+        kitchen_chat_id=restaurant.get("kitchen_chat_id"), customer_name=contact_name, delivery_fee=0,
     )
+    if restaurant.get("pickup_enabled"):
+        await state.set_state("waiting_for_order_type")
+        await send_list(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                        "How would you like to receive your order?", "Choose order type", [
+                            {"id": "order_type_delivery", "title": "Delivery"},
+                            {"id": "order_type_pickup", "title": "Pickup"},
+                        ])
+    else:
+        await start_delivery_address_step(state, restaurant, from_number)
 
 
-async def request_payment_method(state: WhatsAppState, restaurant: dict, from_number: str, address: str):
-    await state.update_data(delivery_address=address)
+async def start_delivery_address_step(state, restaurant, from_number):
+    await state.update_data(order_type="delivery", delivery_fee=0, delivery_zone_id=None, delivery_zone_name=None)
+    await state.set_state("waiting_for_address")
+    await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                    "📍 Please share your delivery address or location pin.")
+
+
+async def choose_pickup(state, restaurant, from_number):
+    await state.update_data(order_type="pickup", delivery_fee=0, delivery_zone_id=None, delivery_zone_name=None)
+    await recalculate_total(state, restaurant)
     await state.set_state("waiting_for_payment_method")
-    await send_payment_buttons(
-        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number
-    )
+    await send_payment_options(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "pickup", bool(restaurant.get("paystack_enabled")))
 
 
-async def handle_location(msg: dict, state: WhatsAppState, restaurant: dict, from_number: str):
-    location = msg["location"]
-    address = location.get("address") or f"Shared location: {location['latitude']:.6f}, {location['longitude']:.6f}"
-    await state.update_data(delivery_lat=location["latitude"], delivery_lon=location["longitude"])
-    await request_payment_method(state, restaurant, from_number, address)
-
-
-async def handle_text(msg: dict, state: WhatsAppState, restaurant: dict, from_number: str, current_state: str | None):
-    if current_state != "waiting_for_address":
-        await send_text(
-            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            "Please add items from the catalog first, then send your delivery address."
-        )
+async def continue_after_delivery_address(state, restaurant, from_number):
+    fee_type = restaurant.get("delivery_fee_type") or "none"
+    if fee_type == "flat":
+        await state.update_data(delivery_fee=float(money(restaurant.get("delivery_fee_flat"))), delivery_zone_id=None, delivery_zone_name=None)
+        await request_payment_method(state, restaurant, from_number)
         return
-    address = msg.get("text", {}).get("body", "").strip()
-    if not address:
+    if fee_type != "zone":
+        await state.update_data(delivery_fee=0, delivery_zone_id=None, delivery_zone_name=None)
+        await request_payment_method(state, restaurant, from_number)
         return
-    await request_payment_method(state, restaurant, from_number, address)
+
+    zones = state.supabase.table("delivery_zones").select("id, zone_name, fee").eq("restaurant_id", restaurant["id"]).eq("is_active", True).order("display_order").execute().data or []
+    if len(zones) > MAX_WHATSAPP_LIST_ROWS:
+        logging.error("Restaurant %s has %s active delivery zones; WhatsApp supports at most %s", restaurant["id"], len(zones), MAX_WHATSAPP_LIST_ROWS)
+        await handle_unusable_zone_config(state, restaurant, from_number, "The delivery-zone setup needs attention")
+        return
+    if not zones:
+        await handle_unusable_zone_config(state, restaurant, from_number, "No active delivery zones are configured")
+        return
+    await state.set_state("waiting_for_delivery_zone")
+    await send_list(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                    "Choose the area closest to your delivery address.", "Choose zone", [
+                        {"id": f"zone:{zone['id']}", "title": zone["zone_name"], "description": f"₦{float(money(zone['fee'])):,.0f}"}
+                        for zone in zones
+                    ])
 
 
-async def handle_payment_selection(msg: dict, state: WhatsAppState, restaurant: dict,
-                                     from_number: str, supabase, bot):
-    """Customer tapped a payment-method button (pay_cash / pay_bank / pay_pod)."""
-    button_id = msg["interactive"]["button_reply"]["id"]
+async def handle_unusable_zone_config(state, restaurant, from_number, reason: str):
+    # A configured flat amount is the only safe fallback for a zone-priced delivery flow.
+    flat_fee = money(restaurant.get("delivery_fee_flat"))
+    if flat_fee > 0:
+        await state.update_data(delivery_fee=float(flat_fee), delivery_zone_id=None, delivery_zone_name=None)
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {reason}; using the restaurant's flat delivery fee of ₦{float(flat_fee):,.0f}.")
+        await request_payment_method(state, restaurant, from_number)
+    elif restaurant.get("pickup_enabled"):
+        await state.set_state("waiting_for_order_type")
+        await send_list(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {reason}. Delivery is unavailable; please choose pickup.", "Choose order type", [{"id": "order_type_pickup", "title": "Pickup"}])
+    else:
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {reason}. Delivery is temporarily unavailable; please contact the restaurant.")
+        await state.clear()
+
+
+async def request_payment_method(state, restaurant, from_number):
+    total = await recalculate_total(state, restaurant)
+    await state.set_state("waiting_for_payment_method")
+    await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"💰 Total: ₦{float(total):,.0f}")
     data = await state.get_data()
-    rest_id = restaurant["id"]
-    phone_number_id = restaurant["whatsapp_phone_number_id"]
-    token = restaurant["whatsapp_access_token"]
-    customer_name = data.get("customer_name", "Customer")
+    await send_payment_options(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, data.get("order_type", "delivery"), bool(restaurant.get("paystack_enabled")))
 
-    if button_id not in {"pay_cash", "pay_bank", "pay_pod"}:
-        await send_text(phone_number_id, token, from_number, "Please choose one of the payment options above.")
+
+async def handle_location(msg, state, restaurant, from_number, current_state):
+    if current_state != "waiting_for_address":
         return
+    location = msg.get("location") or {}
+    if "latitude" not in location or "longitude" not in location:
+        return
+    address = location.get("address") or f"Shared location: {float(location['latitude']):.6f}, {float(location['longitude']):.6f}"
+    await state.update_data(delivery_address=address, delivery_lat=location["latitude"], delivery_lon=location["longitude"])
+    await continue_after_delivery_address(state, restaurant, from_number)
 
-    if button_id == "pay_bank":
-        bank_info = supabase.table("restaurants")\
-            .select("bank_name, account_number, account_name")\
-            .eq("id", rest_id).execute()
-        info = bank_info.data[0] if bank_info.data else {}
 
-        if not info.get("bank_name") or not info.get("account_number"):
-            await send_text(phone_number_id, token, from_number,
-                "⚠️ Bank transfer isn't available right now. Please choose Cash or Pay on Delivery.")
+async def handle_text(msg, state, restaurant, from_number, current_state):
+    if current_state != "waiting_for_address":
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please add items from the catalog first, then choose delivery or pickup.")
+        return
+    address = ((msg.get("text") or {}).get("body") or "").strip()
+    if len(address) < 10:
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please send a complete delivery address or a location pin.")
+        return
+    await state.update_data(delivery_address=address, delivery_lat=None, delivery_lon=None)
+    await continue_after_delivery_address(state, restaurant, from_number)
+
+
+async def handle_interactive(msg, state, restaurant, from_number, supabase, bot, current_state):
+    reply_id = interactive_reply_id(msg)
+    if reply_id == "order_type_delivery" and current_state == "waiting_for_order_type":
+        await start_delivery_address_step(state, restaurant, from_number)
+    elif reply_id == "order_type_pickup" and current_state == "waiting_for_order_type":
+        await choose_pickup(state, restaurant, from_number)
+    elif reply_id and reply_id.startswith("zone:") and current_state == "waiting_for_delivery_zone":
+        zone_id = reply_id.split(":", 1)[1]
+        zone = supabase.table("delivery_zones").select("id, zone_name, fee").eq("id", zone_id).eq("restaurant_id", restaurant["id"]).eq("is_active", True).execute()
+        if not zone.data:
+            await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "That delivery zone is no longer available. Please choose another one.")
             return
+        selected = zone.data[0]
+        await state.update_data(delivery_zone_id=selected["id"], delivery_zone_name=selected["zone_name"], delivery_fee=float(money(selected["fee"])))
+        await request_payment_method(state, restaurant, from_number)
+    else:
+        await handle_payment_selection(reply_id, state, restaurant, from_number, supabase, bot, current_state)
 
+
+async def handle_payment_selection(button_id, state, restaurant, from_number, supabase, bot, current_state):
+    if current_state != "waiting_for_payment_method" or button_id not in {"pay_cash", "pay_bank", "pay_pod", "pay_paystack"}:
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please choose a payment option from the current order.")
+        return
+    data = await state.get_data()
+    if button_id == "pay_pod" and data.get("order_type") != "delivery":
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Pay on delivery is only available for delivery orders.")
+        return
+    try:
+        total = await recalculate_total(state, restaurant)
+    except ValueError as exc:
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {exc}. Please send a new catalog cart.")
+        return
+    customer_name = data.get("customer_name", "Customer")
+    if button_id == "pay_bank":
+        info = supabase.table("restaurants").select("bank_name, account_number, account_name").eq("id", restaurant["id"]).execute().data or [{}]
+        info = info[0]
+        if not info.get("bank_name") or not info.get("account_number"):
+            await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Bank transfer isn't available right now. Please choose another payment method.")
+            return
         await state.update_data(payment_method="Bank Transfer")
         await state.set_state("waiting_for_payment_proof")
-
-        total = data.get("total_price", 0)
-        await send_text(phone_number_id, token, from_number,
-            f"🏦 *Bank Transfer Details*\n\n"
-            f"💰 Amount: ₦{total:,.0f}\n\n"
-            f"Bank: {info['bank_name']}\n"
-            f"Account Number: {info['account_number']}\n"
-            f"Account Name: {info['account_name']}\n\n"
-            f"📸 After paying, please send a screenshot of your payment receipt."
-        )
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"Bank Transfer Details\n\nAmount: ₦{float(total):,.0f}\nBank: {info['bank_name']}\nAccount Number: {info['account_number']}\nAccount Name: {info['account_name']}\n\nSend a screenshot of your payment receipt.")
         return
-
+    if button_id == "pay_paystack":
+        await start_paystack_payment(state, restaurant, from_number, customer_name, total)
+        return
     payment_method = "Cash Payment" if button_id == "pay_cash" else "Pay on Delivery"
     await state.update_data(payment_method=payment_method)
+    await create_and_send_order(state, restaurant, from_number, customer_name, payment_method, bot, total)
 
+
+async def create_and_send_order(state, restaurant, from_number, customer_name, payment_method, bot, total):
     try:
-        order_id, order = await create_order_in_db(
-            user_id=None, state=state, payment_method=payment_method,
-            customer_name=customer_name, order_channel="whatsapp",
-            payment_proof_reference=None, customer_contact=from_number,
-        )
-
-        await send_order_to_kitchen(
-            bot=bot, order_id=order_id, state=state,
-            customer_name=customer_name, customer_contact=from_number,
-        )
-
+        order_id, _ = await create_order_in_db(None, state, payment_method, customer_name, "whatsapp", None, from_number)
+        await send_order_to_kitchen(bot, order_id, state, customer_name, from_number)
         low_stock_items = await deduct_inventory_for_order(order_id)
-        await send_restock_alert(bot, rest_id, restaurant.get("kitchen_chat_id"), low_stock_items)
-
-        total = data.get("total_price", 0)
-        await send_text(phone_number_id, token, from_number,
-            f"✅ Order placed!\n\n"
-            f"Order ID: #{order_id[:8]}\n"
-            f"💰 Total: ₦{total:,.0f}\n"
-            f"💵 Payment: {payment_method}\n\n"
-            f"We'll notify you as soon as it's ready. 🛵"
-        )
+        await send_restock_alert(bot, restaurant["id"], restaurant.get("kitchen_chat_id"), low_stock_items)
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\nPayment: {payment_method}\n\nWe'll notify you when it is ready.")
+        await send_order_receipt(bot, {
+            "order_channel": "whatsapp",
+            "customer_contact": from_number,
+            "restaurants": restaurant,
+        }, order_id)
         await state.clear()
+    except ValueError as exc:
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {exc}")
+    except Exception:
+        logging.exception("WhatsApp order error")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "❌ Something went wrong placing your order. Please try again or contact the restaurant.")
 
-    except ValueError as e:
-        await send_text(phone_number_id, token, from_number, f"⚠️ {e}")
-    except Exception as e:
-        logging.error(f"WhatsApp order error: {e}", exc_info=True)
-        await send_text(phone_number_id, token, from_number,
-            "❌ Something went wrong placing your order. Please try again or contact us directly.")
-        
 
+async def start_paystack_payment(state, restaurant, from_number, customer_name, total):
+    if not restaurant.get("paystack_enabled") or not restaurant.get("paystack_subaccount_code"):
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Paystack is not available for this restaurant. Please choose another payment method.")
+        return
+    try:
+        await state.update_data(payment_method="Paystack")
+        order_id, _ = await create_order_in_db(None, state, "Paystack", customer_name, "whatsapp", None, from_number)
+        # WhatsApp has no verified email field. This documented deterministic placeholder meets Paystack's required email input.
+        email = f"{''.join(character for character in from_number if character.isdigit())}@chowlin.ng"
+        payment_url = await create_paystack_payment_link(order_id, float(total), email, restaurant["paystack_subaccount_code"])
+        state.supabase.table("payments").insert({"order_id": order_id, "restaurant_id": restaurant["id"], "amount": str(total), "provider": "Paystack", "status": "pending", "provider_reference": order_id, "paystack_reference": order_id, "paystack_subaccount_code": restaurant["paystack_subaccount_code"]}).execute()
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order #{order_id[:8]} is pending payment.\nTotal: ₦{float(total):,.0f}\n\nComplete payment here:\n{payment_url}\n\nWe'll confirm payment and send your order to the kitchen.")
+        await state.clear()
+    except Exception:
+        logging.exception("WhatsApp Paystack setup failed")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "❌ Could not create a Paystack payment link. Please choose another payment method.")
 
 
 async def download_whatsapp_media(media_id: str, token: str) -> tuple[bytes, str]:
-    """Resolve a WhatsApp media ID to (bytes, mime_type)."""
     async with httpx.AsyncClient() as client:
-        meta_resp = await client.get(
-            f"{GRAPH_API}/{media_id}",
-            headers={"Authorization": f"Bearer {token}"}
-        )
-        meta_resp.raise_for_status()
-        media_url = meta_resp.json()["url"]
-        mime_type = meta_resp.json().get("mime_type", "image/jpeg")
-
-        file_resp = await client.get(media_url, headers={"Authorization": f"Bearer {token}"})
-        file_resp.raise_for_status()
-        return file_resp.content, mime_type
+        meta = await client.get(f"{GRAPH_API}/{media_id}", headers={"Authorization": f"Bearer {token}"})
+        meta.raise_for_status()
+        media = await client.get(meta.json()["url"], headers={"Authorization": f"Bearer {token}"})
+        media.raise_for_status()
+        return media.content, meta.json().get("mime_type", "image/jpeg")
 
 
-async def handle_payment_proof(msg: dict, state: WhatsAppState, restaurant: dict,
-                                 from_number: str, supabase, bot):
-    """Customer sent a bank transfer payment screenshot."""
-    phone_number_id = restaurant["whatsapp_phone_number_id"]
-    token = restaurant["whatsapp_access_token"]
-    media_id = msg["image"]["id"]
-    rest_id = restaurant["id"]
-
-    data = await state.get_data()
-    if data.get("payment_method") != "Bank Transfer":
-        await send_text(phone_number_id, token, from_number,
-            "Please choose Bank Transfer and wait for the payment instructions before sending a receipt.")
+async def handle_payment_proof(msg, state, restaurant, from_number, supabase, bot, current_state):
+    if current_state != "waiting_for_payment_proof" or (await state.get_data()).get("payment_method") != "Bank Transfer":
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please choose Bank Transfer before sending a payment receipt.")
         return
-    customer_name = data.get("customer_name", "Customer")
-
-    try:
-        image_bytes, mime_type = await download_whatsapp_media(media_id, token)
-    except Exception as e:
-        logging.error(f"Failed to download WhatsApp payment proof: {e}")
-        await send_text(phone_number_id, token, from_number,
-            "⚠️ We couldn't read that image. Please try sending the screenshot again.")
+    media_id = (msg.get("image") or {}).get("id")
+    if not media_id:
         return
-
     try:
-        order_id, order = await create_order_in_db(
-            user_id=None, state=state, payment_method="Bank Transfer",
-            customer_name=customer_name, order_channel="whatsapp",
-            payment_proof_reference=f"wa_media:{media_id}", customer_contact=from_number,
-        )
-
-        proof_file = BufferedInputFile(image_bytes, filename="payment_proof.jpg")
-        await send_order_to_kitchen(
-            bot=bot, order_id=order_id, state=state, customer_name=customer_name,
-            customer_contact=from_number, payment_proof=proof_file,
-        )
-
-        total = data.get("total_price", 0)
-        await send_text(phone_number_id, token, from_number,
-            f"✅ Order placed!\n\n"
-            f"Order ID: #{order_id[:8]}\n"
-            f"💰 Total: ₦{total:,.0f}\n\n"
-            f"Your payment proof has been received and is being verified. "
-            f"You'll be notified once confirmed."
-        )
+        image_bytes, _ = await download_whatsapp_media(media_id, restaurant["whatsapp_access_token"])
+        data = await state.get_data()
+        total = await recalculate_total(state, restaurant)
+        order_id, _ = await create_order_in_db(None, state, "Bank Transfer", data.get("customer_name", "Customer"), "whatsapp", f"wa_media:{media_id}", from_number)
+        await send_order_to_kitchen(bot, order_id, state, data.get("customer_name", "Customer"), from_number, BufferedInputFile(image_bytes, filename="payment_proof.jpg"))
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\n\nYour payment proof is being verified.")
         await state.clear()
-
-    except ValueError as e:
-        await send_text(phone_number_id, token, from_number, f"⚠️ {e}")
-    except Exception as e:
-        logging.error(f"WhatsApp bank transfer order error: {e}", exc_info=True)
-        await send_text(phone_number_id, token, from_number,
-            "❌ Something went wrong. Please try again or contact us directly.")
+    except ValueError as exc:
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {exc}")
+    except Exception:
+        logging.exception("WhatsApp bank-transfer order error")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "❌ Something went wrong. Please try again or contact the restaurant.")

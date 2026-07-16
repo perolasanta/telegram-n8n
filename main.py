@@ -11,7 +11,8 @@ from bot import (
     send_order_to_kitchen_from_db,
     deduct_inventory_for_order,
     send_restock_alert,
-    send_receipt_to_customer,
+    notify_order_customer,
+    send_order_receipt,
 )
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -208,8 +209,8 @@ async def paystack_browser_callback(request: Request):
         <html><body style="font-family:sans-serif;text-align:center;padding:40px">
             <h2>✅ Payment received</h2>
             <p>Reference: {reference}</p>
-            <p>You can close this tab and return to Telegram —
-               your order is being confirmed there.</p>
+            <p>You can close this tab and return to the chat where you placed
+               your order. Your payment is being confirmed there.</p>
         </body></html>
         """
     )
@@ -251,15 +252,14 @@ async def paystack_webhook(request: Request):
         "paystack_reference": data.get("reference")
     }).eq("order_id", order_id).eq("provider", "Paystack").execute()
 
-    # Load order info so we can resolve which bot should be used for notifications
+    # Load channel and restaurant details for kitchen work and customer notification.
     order_result = supabase.table("orders")\
-        .select("telegram_user_id, restaurant_id, restaurants(kitchen_chat_id)")\
+        .select("telegram_user_id, customer_contact, order_channel, restaurant_id, restaurants(kitchen_chat_id, whatsapp_phone_number_id, whatsapp_access_token)")\
         .eq("id", order_id).execute()
 
     order_data = order_result.data[0] if order_result.data else {}
     restaurant_id = order_data.get("restaurant_id")
     kitchen_chat_id = (order_data.get("restaurants") or {}).get("kitchen_chat_id")
-    user_id = order_data.get("telegram_user_id")
 
     # Resolve the correct Bot instance for this order (delivery bots vs main bot)
     try:
@@ -280,12 +280,17 @@ async def paystack_webhook(request: Request):
     except Exception as e:
         logger.error(f"Failed inventory deduction/alert for Paystack order {order_id}: {e}", exc_info=True)
 
-    # Send receipt to customer using the resolved bot
-    if user_id:
-        try:
-            await send_receipt_to_customer(target_bot, user_id, order_id)
-        except Exception as e:
-            logger.error(f"Failed to send Paystack receipt for order {order_id}: {e}", exc_info=True)
+    # Notify and receipt-deliver through the channel that created the order.
+    try:
+        await notify_order_customer(
+            target_bot,
+            order_data,
+            f"✅ Your payment for order #{order_id.replace('-', '')[:4].upper()} has been confirmed. "
+            "Your order has been sent to the kitchen. 🍳",
+        )
+        await send_order_receipt(target_bot, order_data, order_id)
+    except Exception as e:
+        logger.error(f"Failed to notify/send receipt for Paystack order {order_id}: {e}", exc_info=True)
 
     return {"status": "ok"}
 

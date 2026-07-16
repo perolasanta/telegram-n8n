@@ -1109,6 +1109,18 @@ async def send_receipt_to_customer(bot: Bot, user_id: int, order_id: str):
         return False
 
 
+async def send_order_receipt(bot: Bot, order: dict, order_id: str) -> bool:
+    """Send a receipt through the customer channel recorded on an order."""
+    if order.get("order_channel") == "whatsapp":
+        from whatsapp import send_whatsapp_receipt
+        return await send_whatsapp_receipt(supabase, order, order_id)
+
+    user_id = order.get("telegram_user_id")
+    if not user_id:
+        return False
+    return await send_receipt_to_customer(bot, user_id, order_id)
+
+
 async def try_send_receipt_after_order(bot: Bot, message: types.Message, user_id: int, order_id: str):
     try:
         receipt_sent = await send_receipt_to_customer(bot, user_id, order_id)
@@ -2455,6 +2467,8 @@ async def notify_order_customer(bot: Bot, order: dict, message: str) -> None:
         await send_text(phone_number_id, token, contact, message)
     elif order.get("telegram_user_id"):
         await bot.send_message(order["telegram_user_id"], message)
+    else:
+        raise ValueError("Customer notification details are missing for this order")
 
 @dp.callback_query(F.data.startswith("confirm_pay_"))
 async def confirm_payment_handler(callback_query: types.CallbackQuery, bot: Bot):
@@ -2496,9 +2510,7 @@ async def confirm_payment_handler(callback_query: types.CallbackQuery, bot: Bot)
                 f"Order #{order_short_id(order_id)} has been sent to the kitchen. 🍳"
             )
             
-            # NOW SEND RECEIPT after payment confirmed
-            if order_data.get("order_channel") != "whatsapp":
-                await send_receipt_to_customer(bot, order_data["telegram_user_id"], order_id)
+            await send_order_receipt(bot, order_data, order_id)
             
         except Exception as e:
             print(f"Failed to notify customer: {e}")

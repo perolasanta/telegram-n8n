@@ -1,664 +1,177 @@
-# Chowlin Context — Complete AI Guide
-
-## 🎯 Project Overview
-
-**Chowlin** is a **multi-tenant Telegram-based food ordering SaaS** for Nigerian restaurants. It enables customers to scan QR codes and order food directly via Telegram, with restaurant owners managing orders, inventory, and subscriptions. The platform supports multiple order types (dine-in, delivery, pickup) and payment methods (cash, bank transfer, pay-on-delivery).
-
-- **Owner**: Peter Bello (Petbell Integrated Services)
-- **Current Status**: Live on Render (free tier), migrating to Docker VPS in Frankfurt
-- **Domain**: chowlin.com.ng (planned, not yet registered as of June 2026)
-- **Multi-tenant**: Each restaurant has isolated menus, orders, and kitchen groups
-- **Integration**: Linked to n8n for notifications (Render free tier), Supabase for persistence
-
----
-
-## 🏗️ Tech Stack
-
-| Component | Technology | Notes |
-|-----------|-----------|-------|
-| **Bot Framework** | aiogram 3.x (async) | Handles Telegram interactions asynchronously |
-| **Web Server** | FastAPI | Receives Telegram webhook updates, serves API endpoints |
-| **Database** | Supabase (PostgreSQL) | Same account as Bursara, separate schema/tables |
-| **Async Tasks** | APScheduler (AsyncIOScheduler) | Scheduled reports, subscription checks (Lagos timezone) |
-| **PDF Generation** | ReportLab | Generates receipts for orders |
-| **QR Codes** | qrcode + Pillow | Generate public_code QR images for tables |
-| **Notifications** | n8n | Sends order updates to Google Sheets (Render-specific) |
-| **Containerization** | Docker + docker-compose | For VPS deployment |
-| **Reverse Proxy** | Nginx | Routes chowlin.com.ng → localhost:8001 on VPS |
-
----
-
-## 📊 Architecture Overview
-
-```
-┌─────────────────┐
-│   Telegram      │
-│   Customer      │
-└────────┬────────┘
-         │
-         ▼ (POST /webhook)
-    ┌─────────────────────────┐
-    │   FastAPI (main.py)     │
-    │   - Webhook endpoint    │
-    │   - Scheduler startup   │
-    └─────────────┬───────────┘
-                  │
-         ▼ (updates)
-    ┌──────────────────────┐
-    │  aiogram Dispatcher  │
-    │  - Routes updates    │
-    │  - Manages handlers  │
-    │  - FSM states        │
-    └──────────┬───────────┘
-               │
-         ▼ (queries)
-    ┌──────────────────────┐
-    │  Supabase Client     │
-    │  - Restaurants       │
-    │  - Orders            │
-    │  - Menu items        │
-    │  - Inventory         │
-    └──────────┬───────────┘
-               │
-         ▼ (PostgreSQL)
-    ┌──────────────────────┐
-    │  Supabase Database   │
-    │  - All persistent    │
-    │    data              │
-    └──────────────────────┘
-
-APScheduler:
-  ├─ Daily reports (9 PM WAT)
-  ├─ Weekly reports (Monday 9 AM WAT)
-  ├─ Subscription expiry checks
-  └─ Subscription warnings (3 days before)
-```
-
----
-
-## 📁 Key Files & Their Responsibilities
-
-| File | Purpose | Key Functions |
-|------|---------|---|
-| **main.py** | FastAPI app entry point | - Webhook endpoint at `/webhook`<br>- Scheduler initialization<br>- Startup/shutdown lifecycle<br>- n8n heartbeat (Render-only) |
-| **bot.py** | ALL Telegram handlers | - `/start` handler (table lookup)<br>- Menu browsing (categories → items)<br>- Cart management<br>- Payment flows<br>- Kitchen order board<br>- FSM states for user flows |
-| **reports.py** | Sales & analytics | - `generate_daily_report()` → revenue, payment methods, top items, inventory<br>- `generate_weekly_report()` → same, weekly timeframe |
-| **receipt_generator.py** | PDF generation | - `generate_receipt_pdf()` → creates receipts for orders<br>- Formats order details, items, totals, payment info |
-| **generate_qr_codes.py** | QR code images | - Creates public_code QR images for restaurant tables<br>- Used during setup |
-| **generate_short_codes.py** | Short codes | - Helper for referral/promo codes |
-| **docker-compose.yml** | Container orchestration | - Defines chowlin service (port 8001, health checks) |
-| **Dockerfile** | Container image | - Python 3.11, installs requirements, runs FastAPI |
-
----
-
-## 🗄️ Database Schema (Supabase PostgreSQL)
-
-### Core Tables
-
-#### `restaurants`
-```sql
-id (uuid, PK)
-name (text)
-manager_telegram_id (bigint) — manager's Telegram user ID
-manager_name (text)
-kitchen_chat_id (bigint) — Telegram group ID for kitchen notifications
-phone (text)
-bank_name, account_number, account_name (text) — for bank transfers
-subscription_status (text: trialing | active | expired)
-subscription_expires_at (timestamptz)
-plan (text) — plan type (e.g., "starter", "professional")
-onboarding_fee_paid (boolean)
-
--- Added in Migration 004 (Kitchen Board)
-kitchen_board_message_id (bigint) — pinned order board message
-kitchen_board_message_date (date) — when board was last updated
-kitchen_board_pinned (boolean) — is board currently pinned?
-kitchen_rush_alert_date (date) — when last rush alert was sent
-```
-
-#### `restaurant_tables`
-```sql
-id (uuid, PK)
-restaurant_id (uuid, FK) → restaurants.id
-table_number (integer | NULL) — NULL or 'EXTERNAL' = delivery/pickup
-public_code (text, unique) — QR code identifier
-is_active (boolean)
-
--- Added in Migration 002
-menu_filter (text) — filter for menu items (optional)
-```
-
-#### `menu_categories`
-```sql
-id (uuid, PK)
-restaurant_id (uuid, FK) → restaurants.id
-name (text)
-is_active (boolean)
-display_order (integer)
-```
-
-#### `menu_items`
-```sql
-id (uuid, PK)
-restaurant_id (uuid, FK) → restaurants.id
-category_id (uuid, FK) → menu_categories.id
-name (text)
-description (text)
-price (numeric)
-is_available (boolean) — kitchen can toggle availability
-
--- Added in Migration 003 (Inventory)
-inventory_count (integer) — qty on hand
-restock_threshold (integer) — alert qty
-track_inventory (boolean) — enable tracking for this item?
-```
-
-#### `orders`
-```sql
-id (uuid, PK)
-restaurant_id (uuid, FK) → restaurants.id
-table_id (uuid, FK) → restaurant_tables.id (NULL for delivery/pickup)
-telegram_user_id (bigint) — customer's Telegram user ID
-customer_name (text)
-total_amount (numeric)
-payment_method (text: cash | bank_transfer | pay_on_delivery)
-payment_status (text: pending | confirmed | rejected)
-order_status (text: pending | preparing | ready | collected | cancelled)
-order_type (text: dine_in | delivery | pickup)
-created_at (timestamptz)
-
--- Added in Migration 001 (Delivery)
-delivery_address (text)
-delivery_lat (numeric)
-delivery_lon (numeric)
-
--- Added in Migration 003
-inventory_deducted (boolean) — has inventory been deducted for this order?
-```
-
-#### `order_items`
-```sql
-id (uuid, PK)
-order_id (uuid, FK) → orders.id
-menu_item_id (uuid, FK) → menu_items.id
-quantity (integer)
-unit_price (numeric) — price at order time
-subtotal (numeric) — qty × unit_price
-```
-
-#### `payments`
-```sql
-id (uuid, PK)
-order_id (uuid, FK) → orders.id
-restaurant_id (uuid, FK) → restaurants.id
-amount (numeric)
-provider (text) — payment gateway identifier
-status (text)
-provider_reference (text) — bank transfer proof file_id or reference
-```
-
-### Database Functions (PostgreSQL)
-
-#### `deduct_order_inventory(p_order_id uuid)`
-- **When**: Called after payment confirmed for orders with tracked items
-- **What**: Deducts item quantities from `inventory_count`, marks `inventory_deducted = true`
-- **Returns**: Low-stock items (below restock_threshold) for alerts
-- **Migration**: 003_Add_Menu_Item_Inventory.sql
-
----
-
-## 🔄 Data Flow & User Journeys
-
-### 1. **Customer Order Flow**
-
-```
-1. Customer scans QR code (table public_code in TG message)
-   ↓
-2. /start handler receives public_code param
-   ↓
-3. Bot looks up restaurant_tables by public_code
-   ├─ If not found → "Invalid QR code"
-   ├─ If table_number is NULL/EXTERNAL → go to step 4a
-   └─ If table_number exists → go to step 5
-   ↓
-4a. [DELIVERY/PICKUP] Bot asks: "Delivery or Pickup?"
-   ├─ Delivery → Bot asks for delivery address (text or location pin)
-   ├─ Pickup → Bot records order_type = "pickup"
-   └─ → Go to step 5
-   ↓
-5. [BROWSE MENU] Bot shows restaurant menu categories
-   ├─ Customer selects category
-   ├─ Bot shows menu_items for that category
-   ├─ Customer selects item → FSM state: waiting_for_quantity
-   ├─ Customer enters qty → added to cart
-   └─ Repeat until satisfied → go to step 6
-   ↓
-6. [REVIEW CART] Bot displays cart: items × qty, subtotal
-   ├─ Customer can remove items, adjust qty, or proceed
-   ├─ Proceed → FSM state: waiting_for_payment_method
-   ├─ → Bot shows payment buttons:
-   │  ├─ 💵 Cash Payment
-   │  ├─ 🏦 Bank Transfer
-   │  └─ 🚚 Pay on Delivery (delivery orders only)
-   └─ → Go to step 7
-   ↓
-7. [PAYMENT SELECTION]
-   ├─ CASH → Order created, payment_status = "confirmed" → step 8
-   ├─ PAY_ON_DELIVERY → Order created, payment_status = "confirmed" → step 8
-   └─ BANK_TRANSFER → FSM state: waiting_for_payment_proof
-      └─ Customer uploads screenshot/proof → step 7a
-      ↓
-7a. [BANK TRANSFER PROOF]
-    ├─ Bot saves file_id as payments.provider_reference
-    ├─ Order created with payment_status = "pending"
-    ├─ Kitchen sees order with photo + "Approve/Reject" buttons
-    └─ On Approve → payment_status = "confirmed" → step 8
-    └─ On Reject → payment_status = "rejected" → customer notified
-   ↓
-8. [ORDER CREATED & INVENTORY DEDUCTED]
-    ├─ Order inserted with all items
-    ├─ deduct_order_inventory() called
-    ├─ Items marked unavailable if inventory_count → 0
-    ├─ Low-stock alerts sent to kitchen & manager
-    └─ → Step 9
-   ↓
-9. [KITCHEN NOTIFICATION]
-    ├─ Order formatted and sent to kitchen_chat_id (Telegram group)
-    ├─ Buttons: "Mark as Ready" (cash/delivery) or "Approve/Reject" (bank transfer)
-    ├─ Kitchen staff marks ready when food is done
-    └─ Customer notified: "Your order is ready!"
-   ↓
-10. [CUSTOMER PICKUP/DELIVERY]
-    ├─ Dine-in: Customer arrives at table, eats
-    ├─ Pickup: Customer collects at restaurant counter
-    └─ Delivery: Driver delivers to address (future: delivery tracking)
-    └─ Receipt sent to customer (PDF or formatted message)
-```
-
-### 2. **Kitchen/Manager Flow**
-
-```
-[KITCHEN GROUP (kitchen_chat_id)]
-├─ Receives new orders with items, location, payment proof (if bank transfer)
-├─ Buttons: "Mark as Ready", "Approve", "Reject"
-├─ /menu command → shows all items with availability toggle
-├─ /restock command → update inventory counts and thresholds
-└─ Sees live order board (pinned message, updated in real-time)
-
-[MANAGER DASHBOARD (via DM with bot)]
-├─ /daily_report → yesterday's sales breakdown
-├─ /weekly_report → last 7 days
-├─ /monthly_report → last 30 days
-├─ /register_manager → shows their Telegram ID for admin setup
-├─ Subscription expiry warnings (auto-sent 3 days before expiry)
-└─ Low-stock alerts from kitchen
-```
-
----
-
-## 🎯 Order Types & Payment Methods
-
-### Order Types
-| Type | Triggered By | Table Logic | Location |
-|------|-------------|------------|----------|
-| **Dine-in** | Scanning QR on physical table | table_number > 0 | Restaurant |
-| **Delivery** | Scanning EXTERNAL QR + selecting Delivery | table_number = NULL | Customer address |
-| **Pickup** | Scanning EXTERNAL QR + selecting Pickup | table_number = NULL | Restaurant |
-
-### Payment Methods
-| Method | Flow | Payment Status | Notes |
-|--------|------|---|---|
-| **Cash** | Customer pays at restaurant | confirmed immediately | Kitchen notified right away |
-| **Bank Transfer** | Customer uploads proof → kitchen approves | pending → confirmed | High-touch, prevents fraud |
-| **Pay on Delivery** | Driver collects payment | confirmed immediately | Only for delivery orders |
-
----
-
-## 📅 Scheduled Jobs (APScheduler)
-
-| Job | Trigger | Timezone | What It Does |
-|-----|---------|----------|------------|
-| **send_daily_reports** | Daily 9:00 PM | Lagos (WAT) | Emails daily sales to all managers |
-| **send_weekly_reports** | Monday 9:00 AM | Lagos (WAT) | Emails weekly sales to all managers |
-| **expire_subscriptions** | Daily 12:05 AM | Lagos (WAT) | Marks trialing/active → expired if past expiry_date |
-| **notify_expiring_subscriptions** | Daily 9:00 AM | Lagos (WAT) | Warns managers 3 days before expiry |
-
----
-
-## 🔐 Subscription System
-
-- **Status**: `trialing` → `active` → `expired`
-- **Check**: On every `/start`, verify restaurant.subscription_status == "active" and subscription_expires_at > now()
-- **Expired Access**: Customers see "This restaurant is not currently accepting orders"
-- **Manager Activation**: `/activate <restaurant_id> <days>` extends subscription_expires_at
-- **Auto-Warnings**: Sent 3 days before expiry via scheduled job
-
----
-
-## 🛒 Advanced Features
-
-### Reorder / Order History
-- `/history` command → shows customer's last 5 orders
-- Each order has "Reorder" button
-- Reorder loads previous cart items (skips if now unavailable)
-- Merges into active session if same restaurant, or saves as pending
-
-### Inventory Management
-- Items can be marked for tracking: `track_inventory = true`
-- Kitchen uses `/restock` to update `inventory_count` and `restock_threshold`
-- Low-stock alerts sent to kitchen & manager when count ≤ threshold
-- After payment confirmed, `deduct_order_inventory()` auto-deducts quantities
-
-### Kitchen Order Board
-- Pinned message in kitchen_chat_id showing live order summary
-- Sections: 🔴 PENDING, 🟡 PREPARING, ✅ READY
-- Auto-updates every time order status changes
-- Rush hour alerts (🔥 if pending > threshold) sent to manager
-
-### Menu Filtering
-- `restaurant_tables.menu_filter` allows per-table menu restrictions
-- E.g., table_number = 5 might filter out alcohol items for minors
-- Applied at menu browse stage
-
----
-
-## 🚀 Deployment Architecture
-
-### Current (Render Free Tier)
-- Single dyno running FastAPI + aiogram
-- n8n pinged every 10 min to stay alive (Render kills idle services)
-- Domain: `telegram-n8n-restaurant-bot.onrender.com`
-- Custom domain: chowlin.com.ng (planned)
-
-### Target (VPS + Docker)
-- Docker container on Frankfurt VPS (same as Bursara)
-- Port 8001 (internal) exposed on 127.0.0.1
-- Nginx reverse proxy: `chowlin.com.ng` → `http://127.0.0.1:8001`
-- SSL via Let's Encrypt
-- Health checks every 30s
-- Restart policy: unless-stopped
-
-### Docker Setup
-```yaml
-chowlin:
-  build: ./chowlin
-  container_name: chowlin_bot
-  restart: unless-stopped
-  env_file: .env
-  ports:
-    - "127.0.0.1:8001:8001"
-  healthcheck:
-    test: ["CMD", "curl", "-f", "http://localhost:8001/"]
-    interval: 30s
-    retries: 3
-```
-
-### Nginx Configuration
-```nginx
-server {
-    server_name chowlin.com.ng www.chowlin.com.ng;
-    listen 443 ssl;
-    ssl_certificate /etc/letsencrypt/live/chowlin.com.ng/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/chowlin.com.ng/privkey.pem;
-
-    location / {
-        proxy_pass http://127.0.0.1:8001;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-```
-
----
-
-## 🔧 Environment Variables
-
-```bash
-# Telegram
-TOKEN=<bot_token>
-
-# Supabase
-SUPABASE_URL=<project_url>
-SUPABASE_SERVICE_KEY=<service_role_key>
-
-# FastAPI
-FASTAPI_WEBHOOK_URL=https://chowlin.com.ng
-
-# n8n (Render-specific, remove for VPS)
-N8N_WEBHOOK_URL=<n8n_new_order_webhook>
-N8N_UPDATE_WEBHOOK_URL=<n8n_update_sheet_webhook>
-N8N_HEARTBEAT_URL=<n8n_heartbeat_url>
-
-# Admin
-ADMIN_TELEGRAM_ID=<admin_user_id>
-
-# Thresholds
-RUSH_HOUR_PENDING_THRESHOLD=5
-```
-
----
-
-## ⚠️ Known Issues & Technical Debt
-
-### Issues
-1. **Duplicate Scheduler**: `bot.py` defines scheduler but `main.py` also defines one. Only main.py's runs; bot.py's should be deleted.
-2. **Duplicate "/" Route**: Two `@app.get("/")` in main.py. Remove first (health check), keep second (webhook info).
-3. **n8n Heartbeat**: `ping_n8n_periodically()` only needed on Render. Remove for VPS.
-4. **Domain Not Registered**: chowlin.com.ng still not registered as of June 2026.
-
-### TODO
-- [ ] Register chowlin.com.ng domain
-- [ ] Update FASTAPI_WEBHOOK_URL to https://chowlin.com.ng post-registration
-- [ ] Deploy to VPS Docker setup
-- [ ] Remove Render-specific code (n8n heartbeat, ping logic)
-- [ ] Implement location sharing for delivery (Telegram native + OpenStreetMap reverse geocoding)
-- [ ] Add delivery tracking UI
-- [ ] Implement multi-language support (English + Yoruba + Igbo)
-- [ ] Add customer refund/dispute workflow
-- [ ] Add promo codes / referral system
-- [ ] Implement subscription plan tiers (Starter, Professional, Enterprise)
-- [ ] Add analytics dashboard for managers
-
----
-
-## 🎓 Understanding the Flow: AI Quick Reference
-
-### When a customer scans a QR:
-1. Telegram sends `/start public_code` to bot
-2. bot.py looks up restaurant_tables by public_code
-3. Verifies restaurant subscription is active
-4. Loads menu or asks delivery/pickup
-5. Customer adds items to cart
-6. Selects payment method
-7. Order created, inventory deducted
-8. Kitchen notified via kitchen_chat_id group
-
-### When kitchen marks order ready:
-1. Kitchen presses "Mark as Ready" button in Telegram
-2. bot.py updates orders.order_status = "ready"
-3. APScheduler sends message to customer
-4. Customer collects food
-
-### When daily report runs (9 PM Lagos time):
-1. APScheduler triggers send_daily_reports()
-2. Queries all active restaurants with managers
-3. Fetches orders from start-of-day to end-of-day
-4. Calculates revenue, payment breakdown, top items
-5. Sends formatted report to manager_telegram_id
-
----
-
-## 🤝 Multi-Tenant Isolation
-
-Each restaurant is isolated by:
-- `restaurant_id` FK on all tables (restaurants, menu_categories, menu_items, orders)
-- Each restaurant has its own `kitchen_chat_id` (separate Telegram group)
-- Each restaurant has its own `manager_telegram_id` (separate manager)
-- QR codes are unique by `public_code` (per table)
-- Reports are per-restaurant (by restaurant_id filter)
-
----
-
-## 📞 Integration Points
-
-- **Telegram Bot API**: Webhook mode (POST /webhook with Telegram updates)
-- **Supabase PostgreSQL**: REST API via Python client, RPC for stored procedures
-- **n8n**: Webhooks for order notifications + Google Sheets updates (Render-only)
-- **OpenStreetMap Nominatim**: Planned for delivery address reverse geocoding
-
----
-
-## 🎯 For New AI Assistants
-
-When working on Chowlin:
-1. **Always check subscription_status** before allowing orders
-2. **Verify restaurant exists** before any table lookup
-3. **Deduct inventory immediately** after payment confirmed
-4. **Send alerts to both kitchen and manager** for low stock
-5. **Use Lagos timezone (Africa/Lagos)** for all timestamps
-6. **Query orders with order_status filters** (pending/preparing/ready/collected)
-7. **Test with FSM states** for multi-step flows (waiting_for_quantity, waiting_for_address, etc.)
-8. **Remember: webhook mode, not polling** — all updates pushed by Telegram
-9. **Supabase FKs must match**: restaurant_id, table_id, category_id, etc.
-10. **n8n removal is planned** — remove hardcoded webhook calls before VPS deployment
-
-## Order Types
-1. **Dine-in** — QR code on table has table_number → customer scans → orders for that table
-2. **Delivery** — QR code is EXTERNAL type → customer chooses delivery → enters address
-3. **Pickup** — QR code is EXTERNAL type → customer chooses pickup → collects at restaurant
-
-## Payment Methods
-1. **Cash Payment** — order confirmed immediately, kitchen notified
-2. **Pay on Delivery** — only for delivery orders, kitchen notified
-3. **Bank Transfer** — customer uploads payment screenshot → kitchen sees photo + approve/reject buttons → on approval, customer notified + receipt sent
-
-## Order Flow
-1. Customer scans QR code → /start with public_code param
-2. Bot looks up restaurant_tables by public_code
-3. Checks restaurant subscription is active
-4. Dine-in: shows menu categories directly
-5. External: asks Delivery or Pickup first
-6. Customer browses categories → items → quantity → cart
-7. Confirm order → select payment method
-8. Order created in DB → sent to kitchen_chat_id (Telegram group)
-9. Kitchen marks ready → customer notified
-10. Bank transfer: kitchen approves/rejects payment proof
-
-## Kitchen Features
-- Kitchen receives orders in a Telegram group (kitchen_chat_id)
-- Bank transfer orders: photo + Confirm/Reject buttons
-- Cash/delivery orders: "Mark as Ready" button
-- /menu command in kitchen group → toggle item availability on/off
-- Kitchen can mark items unavailable (e.g. sold out)
-
-## Scheduled Jobs (APScheduler)
-- Daily reports: 10:00 PM WAT → sent to manager_telegram_id
-- Weekly reports: Monday 9:00 AM WAT → sent to manager_telegram_id
-- Subscription expiry check: 12:05 AM WAT daily
-- Expiry warnings: 9:00 AM WAT daily (3 days before expiry)
-
-## Manager Features
-- /daily_report — manual daily sales report
-- /weekly_report — manual weekly report
-- /monthly_report — last 30 days report
-- /register_manager — shows their Telegram ID for admin to register them
-- /activate <restaurant_id> <days> — extend subscription
-
-## Subscription System
-- Restaurants have subscription_status: trialing / active / expired
-- subscription_expires_at controls access
-- is_subscription_active() checked on every /start
-- Expired restaurants → customers see "subscription inactive" message
-
-## Reorder Feature
-- /history shows last 5 orders with "Reorder" button per order
-- Reorder loads previous cart items (skips unavailable items)
-- If same restaurant session active → merges into current cart
-- If different restaurant → warns user to /cancel first
-- If no active session → saves as pending_reorder, loads when QR scanned
-
-## Current Issues / TODO
-- [ ] Move from Render to VPS (Dockerize)
-- [ ] Add location sharing for delivery orders (Telegram native location → reverse geocode)
-- [ ] Remove n8n heartbeat ping (not needed on VPS, n8n will be local)
-- [ ] Update FASTAPI_WEBHOOK_URL to chowlin.com.ng after domain setup
-- [ ] Register chowlin.com.ng domain
-- [ ] Remove duplicate scheduler code (scheduler defined in both main.py and bot.py — only main.py should have it)
-- [ ] Two duplicate health check routes on "/" in main.py — remove one
-
-## Known Code Issues
-1. **Duplicate scheduler** — bot.py imports and defines scheduler but main.py also defines one. Only main.py scheduler should run. bot.py scheduler should be removed.
-2. **Duplicate "/" route** in main.py — two @app.get("/") decorated functions. Remove the first one (health check), keep the second (root with webhook info).
-3. **n8n heartbeat** — ping_n8n_periodically() is only needed on Render free tier. Remove on VPS since n8n will run as a local Docker container.
-4. **No Dockerfile yet** — needs to be created for VPS deployment.
-5. **No docker-compose entry yet** — needs to be added to Bursara's docker-compose.yml.
-
-## VPS Deployment Plan
-The bot will run alongside Bursara on the same Frankfurt VPS.
-
-### Docker service to add to docker-compose.yml:
-```yaml
-chowlin:
-  build: ./chowlin
-  container_name: chowlin_bot
-  restart: unless-stopped
-  env_file: ./chowlin/.env
-  ports:
-    - "127.0.0.1:8001:8001"
-  healthcheck:
-    test: ["CMD", "curl", "-f", "http://localhost:8001/"]
-    interval: 30s
-    timeout: 10s
-    retries: 3
-```
-
-### NGINX block to add to bursara.conf:
-```nginx
-server {
-    server_name chowlin.com.ng www.chowlin.com.ng;
-
-    location / {
-        proxy_pass         http://127.0.0.1:8001;
-        proxy_http_version 1.1;
-        proxy_set_header   Host $host;
-        proxy_set_header   X-Real-IP $remote_addr;
-        proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $scheme;
-    }
-
-    listen 443 ssl;
-    ssl_certificate /etc/letsencrypt/live/chowlin.com.ng/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/chowlin.com.ng/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-}
-
-server {
-    if ($host = chowlin.com.ng) { return 301 https://$host$request_uri; }
-    if ($host = www.chowlin.com.ng) { return 301 https://$host$request_uri; }
-    listen 80;
-    server_name chowlin.com.ng www.chowlin.com.ng;
-    return 404;
-}
-```
-
-## Location Feature (Planned)
-Telegram supports native location sharing:
-- Customer taps paperclip → Location → Share current location
-- Bot receives message.location with latitude and longitude
-- Reverse geocode using OpenStreetMap Nominatim (free):
-  GET https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json
-- Returns human-readable address
-- Store as delivery_address in orders table
-- Add new FSM state: waiting_for_location
-- Allow both location pin AND typed address
-
-## Pitching Together with Bursara
-- Bursara: school fee management SaaS
-- Chowlin: restaurant ordering SaaS
-- Both under Petbell Integrated Services
-- Both on same VPS, same Supabase account
-- Demonstrates ability to build and run multiple SaaS products
-- Target: school canteens could use both products together
+# Chowlin — AI Engineering Context
+
+## Purpose
+
+Use this file as the working context for an AI making changes to this repository. It describes the code that is present in the repository, not an aspirational product specification. Verify behavior in the referenced files before making a non-trivial change.
+
+## Product and boundaries
+
+Chowlin is a multi-tenant Nigerian restaurant-ordering service. Customers order through:
+
+- Telegram: QR/table ordering and optional restaurant-specific delivery bots.
+- WhatsApp: Meta catalog cart submission, followed by delivery address and payment selection.
+
+Restaurant data is isolated with `restaurant_id`. Supabase/PostgreSQL is the persistent system of record. Telegram kitchen groups receive operational order notifications for orders from either channel.
+
+The application is an async Python service. It is deployed behind FastAPI webhooks rather than Telegram polling.
+
+## Technology
+
+| Area | Implementation |
+|---|---|
+| HTTP application | FastAPI in `main.py` |
+| Telegram | aiogram 3 dispatcher and FSM in `bot.py` |
+| WhatsApp | Meta Graph API, `httpx`, and Supabase-backed state in `whatsapp.py` / `whatsapp_state.py` |
+| Database | Supabase Python client against PostgreSQL |
+| Payments | Manual bank-transfer proof, cash/pay-on-delivery, and Telegram-only Paystack |
+| Jobs | APScheduler using the `Africa/Lagos` timezone |
+| Reporting | Text sales/inventory reports in `reports.py` |
+| Receipts | ReportLab PDF generation in `receipt_generator.py` |
+| Deployment | Docker + Compose; Nginx example config is in `nginx/` |
+
+## Entry points and request flow
+
+`main.py` owns the FastAPI app and routes:
+
+| Route | Function |
+|---|---|
+| `POST /webhook` | Feeds updates from the shared Telegram bot into `dp`. |
+| `GET /webhook/whatsapp` | Meta webhook verification using `WHATSAPP_VERIFY_TOKEN`. |
+| `POST /webhook/whatsapp` | Passes Meta events to `handle_whatsapp_webhook`. Status-only events are ignored. |
+| `POST /webhook/paystack` | Verifies Paystack HMAC, confirms an order idempotently, notifies the kitchen, deducts stock, and sends a Telegram receipt. |
+| `GET /paystack/callback` | Simple browser confirmation page; it does not confirm a payment. |
+| `POST /webhook/delivery/{restaurant_id}` | Routes Telegram updates to a restaurant-specific delivery bot. |
+| `POST /admin/paystack/subaccount/{restaurant_id}` | Creates a Paystack subaccount; requires `X-Admin-Key`. |
+| `POST /admin/reload-delivery-bots` | Loads/removes dedicated delivery bots; requires `X-Admin-Key`. |
+| `GET /` | Health response. |
+
+On startup the service sets webhooks, loads delivery bots, starts the scheduler, and starts an n8n heartbeat task. Scheduled work sends daily reports at 21:00 WAT, weekly reports Monday 08:00 WAT, expires subscriptions shortly after midnight, and sends expiry warnings at 09:00 WAT.
+
+## Repository map
+
+| File | Responsibility |
+|---|---|
+| `bot.py` | Shared Supabase client, aiogram dispatcher, Telegram customer flow, kitchen actions, inventory, payment, Paystack helpers, reports, and delivery-bot support. This is the largest and most coupled module. |
+| `main.py` | FastAPI lifecycle, webhook endpoints, scheduler, Paystack webhook handling. |
+| `whatsapp.py` | WhatsApp webhook parsing, catalog-cart conversion, address collection, payments, proof download, and kitchen handoff. |
+| `whatsapp_state.py` | `WhatsAppState`, an async-shaped FSM adapter backed by `whatsapp_sessions`. |
+| `reports.py` | Daily/weekly reports and inventory summary. |
+| `receipt_generator.py` | Builds a PDF file under `/tmp`; callers are responsible for sending/deleting it. |
+| `migrations/` | Additive database migrations. Migration 010 creates WhatsApp-specific tables/columns. |
+| `generate_qr_codes.py` | Creates QR code images for table `public_code` values. |
+| `catalog_csv_generator.py` | Helper for generating catalog CSV data. |
+| `docker-compose.yml`, `Dockerfile` | Container deployment configuration. |
+
+Other Python files in the repository may be experiments or utilities. Do not assume they are runtime imports without checking the deployment files and imports.
+
+## Data model
+
+The base tables predate the migration folder. The following is the application-level model used in code; migrations are authoritative for later additions.
+
+| Table | Important fields / role |
+|---|---|
+| `restaurants` | Tenant, manager and kitchen Telegram ids, subscription fields, bank details, kitchen-board state, optional delivery bot token, delivery fee/pickup configuration, Paystack configuration, and WhatsApp credentials. |
+| `restaurant_tables` | Tenant table/Qr mapping: `public_code`, `table_number`, active status, optional `menu_filter`. `NULL` or `EXTERNAL` represents external delivery/pickup ordering. |
+| `menu_categories` | Tenant categories with active flag and display order. |
+| `menu_items` | Tenant category items: price, availability, inventory fields, image URL, and `item_type` (`simple` or `composite`). |
+| `orders` | Restaurant/table/customer/order totals, payment and fulfilment states, delivery data, inventory flag, source channel, and customer contact. |
+| `order_items` | Snapshotted menu item quantity, unit price, and subtotal. |
+| `payments` | Bank-transfer/Paystack payment records and provider references. |
+| `delivery_zones` | Per-restaurant active named delivery fees. |
+| `modifier_groups`, `modifier_options` | Choices for composite menu items. |
+| `order_item_modifiers` | Snapshots selected modifier quantities and prices for an order item. |
+| `whatsapp_sessions` | Composite primary key `(phone_number, restaurant_id)`, current state, JSONB session data, timestamp. |
+| `menu_item_catalog_map` | Maps Meta catalog retailer ids to Chowlin menu items and restaurants. |
+
+### Important persistence rules
+
+- `create_order_in_db()` in `bot.py` is intentionally channel-agnostic. Both Telegram and WhatsApp call it. Preserve that interface when adding a channel feature.
+- It validates tracked inventory before insertion and creates `order_items` plus modifier snapshots when present.
+- Cash orders are stored as `payment_status = confirmed`; bank transfer, pay-on-delivery, and Paystack begin pending.
+- `deduct_order_inventory(order_id)` calls the PostgreSQL function from migration 003. That function only deducts confirmed orders and is idempotent through `orders.inventory_deducted`.
+- In the current implementation, cash and pay-on-delivery flows call inventory deduction immediately. For pay-on-delivery, the database function does not deduct because that payment remains pending.
+- All customer-visible money is Nigerian naira (`₦`). Use `Decimal` or database numeric values for new money calculations when practical; do not introduce float rounding errors.
+
+## Telegram functionality (implemented)
+
+### Customer ordering
+
+1. `/start <public_code>` resolves an active table QR code, verifies the restaurant subscription, and initializes an aiogram FSM session.
+2. Table QR codes start a dine-in order. External QR codes start delivery/pickup selection. Dedicated delivery bots start a delivery session without a QR code and only offer pickup when `pickup_enabled` is true.
+3. Delivery accepts typed addresses or Telegram locations. Telegram attempts reverse geocoding with Nominatim and asks the customer to confirm a shared location.
+4. Customers browse active categories and available items, choose quantities, manage/clear a cart, and confirm the order.
+5. Composite items walk customers through modifier groups, selection limits, and optional modifier quantities. Selections are persisted in `order_item_modifiers`.
+6. Payment choices are cash, bank transfer with photo proof, pay-on-delivery, and Paystack when the restaurant has a configured subaccount.
+7. Customers can use `/cancel`, `/history`, `/status`, and reorder from history after availability checks. Telegram sends PDF receipts after applicable orders and after confirmed Paystack webhooks.
+
+### Kitchen and manager operations
+
+- Every submitted order is sent to the restaurant kitchen Telegram group. Bank-transfer orders contain proof plus confirm/reject controls; other orders contain preparing/ready controls.
+- Kitchen status actions update the order and notify Telegram customers. A pinned live board tracks pending, preparing, and recent ready orders. A manager rush alert is sent once per day above `RUSH_HOUR_PENDING_THRESHOLD`.
+- Kitchen commands include `/pending`, `/board`, `/menu`, and `/restock`; menu controls toggle item availability and composite-option availability.
+- Manager/reporting commands include `/daily_report`, `/weekly_report`, `/monthly_report`, `/register_manager`, and `/set_manager`. `/activate` is restricted by `ADMIN_TELEGRAM_ID`.
+- Delivery staff configuration commands include `/set_delivery_fee` and `/add_zone` in the kitchen group.
+
+## WhatsApp functionality (implemented)
+
+WhatsApp is not a Telegram UI clone. It begins when Meta sends an `order` message after a customer adds catalog items and sends the catalog cart.
+
+1. `handle_whatsapp_webhook()` identifies the restaurant by the receiving `whatsapp_phone_number_id`.
+2. Catalog `product_retailer_id` values are resolved through `menu_item_catalog_map`; mapped items form the cart. The current flow sets `order_type = delivery`.
+3. The customer provides a typed delivery address or WhatsApp location pin. Coordinates are stored; no reverse geocoding or confirmation screen is implemented.
+4. Interactive buttons offer cash, bank transfer, and pay-on-delivery.
+5. Cash/pay-on-delivery create `order_channel = whatsapp`, carry the phone number in `customer_contact`, send a Telegram kitchen notification, and attempt inventory deduction.
+6. Bank transfer sends bank details, accepts an image proof, downloads it from Meta, creates the order/payment record, and forwards the proof to the Telegram kitchen for manual confirmation.
+7. State lives in Supabase, so it survives service restarts. `WhatsAppState` offers `get_data`, `update_data`, `set_state`, and `clear` so it can be passed to shared persistence/kitchen functions.
+
+## Telegram-to-WhatsApp parity backlog
+
+Use this as the implementation order. It reflects the feature delta observed in the code, not a promise that every Telegram interaction can be copied literally to WhatsApp.
+
+1. **Fix channel-aware status notifications first.** `notify_order_customer()` currently assumes a Telegram id. Store/message through an order-channel notification adapter so WhatsApp customers receive payment-confirmed/rejected, preparing, ready, and cancellation updates. This is the highest-impact parity gap.
+2. **Send WhatsApp receipts.** Reuse the receipt data/query logic, but add a Meta media upload/send-document helper. Do not call `send_receipt_to_customer()` for WhatsApp orders because it requires a Telegram user id.
+3. **Add WhatsApp Paystack.** Create a pending order, initialize Paystack with an email/contact appropriate for WhatsApp, send the checkout URL, and update the Paystack webhook to send its outcome via the order-channel adapter. Keep the existing idempotency check.
+4. **Add catalog validation before order creation.** The WhatsApp cart mapping currently does not reject inactive/unavailable items and does not support composite modifiers. Query current `is_available`, aggregate duplicate retailer ids safely, validate inventory, and give a clear resubmit-cart response.
+5. **Support pickup and delivery configuration.** Before address collection, present delivery/pickup only when `pickup_enabled` is true. Carry external-table context or make `table_id` nullable by design. Apply `delivery_fee_type`, flat fee, and zone selection consistently with Telegram.
+6. **Support delivery zones and totals.** WhatsApp must select/validate a zone, save `delivery_fee`, and update `total_price` before payment. Avoid trusting a Meta catalog price as the final order price; price from `menu_items` is the server authority.
+7. **Add customer commands/menu actions that fit WhatsApp.** At minimum: start/help, current-order status, recent orders/reorder, cancel before preparation, and a way to recover an abandoned session. Use WhatsApp list/button constraints and conversational text rather than Telegram callbacks.
+8. **Handle composite items.** Meta catalog orders cannot represent modifier choices in the current mapping. A practical approach is detecting `item_type = composite` after catalog submission, then running a WhatsApp interactive-list/text state machine for `modifier_groups`, persisting the same `cart[item].modifiers` shape that Telegram uses.
+9. **Add a WhatsApp operations layer only if required.** Telegram kitchen controls, reports, inventory, subscription alerts, and kitchen board are deliberately Telegram-oriented. If staff must use WhatsApp, build explicit staff authorization and commands rather than exposing those controls to every customer number.
+
+## Safe implementation guidance
+
+- Check subscription activity for WhatsApp before accepting a cart, matching Telegram behavior.
+- Treat all Meta webhooks as untrusted input: avoid direct indexing of optional arrays/objects, handle duplicate delivery, and log a safe event id/message id for idempotency.
+- Validate that any interactive reply belongs to the expected `whatsapp_sessions.state`; do not create an order merely because a reply id matches a payment option.
+- Keep state and order writes tenant-scoped by restaurant id and avoid selecting all tenants when a scoped query is possible.
+- Use one notification abstraction for customer messages (`telegram_user_id` versus `customer_contact` / WhatsApp) before adding more cross-channel states.
+- Preserve kitchen notifications as Telegram unless a new explicit channel is requested. `send_order_to_kitchen()` already accepts channel-neutral order data and an optional proof.
+- Do not store, print, commit, or place secrets in `context.md`. Credentials belong in `.env` and are accessed through environment variables.
+- Add or update tests for any changed payment/order state transition. The repository currently has only lightweight test scripts, so prioritize pure helper tests and webhook-payload fixtures when extending it.
+
+## Environment configuration
+
+Names observed in runtime code include:
+
+`TOKEN`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `FASTAPI_WEBHOOK_URL`, `N8N_WEBHOOK_URL`, `N8N_UPDATE_WEBHOOK_URL`, `N8N_HEARTBEAT_URL`, `ADMIN_TELEGRAM_ID`, `ADMIN_API_KEY`, `RUSH_HOUR_PENDING_THRESHOLD`, `PAYSTACK_SECRET_KEY`, `PAYSTACK_COMMISSION_PERCENTAGE`, and `WHATSAPP_VERIFY_TOKEN`.
+
+WhatsApp restaurant credentials are stored per tenant in `restaurants`: `whatsapp_phone_number_id`, `whatsapp_business_account_id`, and `whatsapp_access_token`.
+
+Paystack requires an email address. For WhatsApp orders, use the documented deterministic placeholder `<digits-only WhatsApp number>@chowlin.ng`; do not derive an email from a customer name or invent a new pattern per call site.
+
+## Known implementation notes for future work
+
+- The FastAPI app title and README still describe the service as Telegram-only; update them when WhatsApp becomes a supported product surface.
+- `Dockerfile` copies only the runtime modules it currently imports. If a new runtime module/asset is added, include it in the image build.
+- Migration 010 has no `.sql` extension but contains SQL and is the WhatsApp schema migration. Keep migration execution/documentation aware of that filename.
+- The existing report implementation totals all orders in its time range; it does not filter to confirmed payments. Clarify the desired revenue definition before changing financial reporting.
+- Current WhatsApp text responses use Markdown-like asterisks but the Graph API text payload does not specify formatting. Prefer plain text or supported WhatsApp formatting intentionally.
+- `whatsapp_sessions` state updates and data updates are separate upserts. If extending concurrent webhook behavior, consider a single atomic state/data update or optimistic versioning.
+
+## Change checklist
+
+1. Read the handlers and migration that own the affected flow.
+2. Keep tenant, channel, payment, order-status, and inventory semantics intact.
+3. Apply additive migrations for schema changes; do not edit already-applied migrations to retrofit production state.
+4. Run at least syntax/import checks and focused tests or payload simulations.
+5. Document any new endpoint, environment variable, state value, and operational setup step in the README/context as appropriate.
