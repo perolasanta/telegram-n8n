@@ -9,7 +9,7 @@ from bot import (
     send_restock_alert,
 )
 
-GRAPH_API = "https://graph.facebook.com/v21.0"
+GRAPH_API = "https://graph.facebook.com/v25.0"
 
 async def send_whatsapp_message(phone_number_id: str, token: str, to: str, payload: dict):
     async with httpx.AsyncClient() as client:
