@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from aiogram.types import Update
 from bot import (
     bot,
@@ -187,9 +187,9 @@ async def webhook(request:Request):
 @app.get("/webhook/whatsapp")
 async def whatsapp_verify(request: Request):
     params = request.query_params
-    if params.get("hub.verify_token") == os.getenv("WHATSAPP_VERIFY_TOKEN"):
-        return int(params.get("hub.challenge"))
-    return {"error": "invalid token"}
+    if params.get ("hub.mode") == "subscribe" and params.get("hub.verify_token") == os.getenv("WHATSAPP_VERIFY_TOKEN"):
+        return PlainTextResponse(params.get("hub.challenge"))
+    return PlainTextResponse("Verification failed", status_code=403)
 
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
