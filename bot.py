@@ -2154,7 +2154,7 @@ async def send_order_to_kitchen(
             [InlineKeyboardButton(text="🍳 Mark as Preparing", callback_data=f"preparing_{order_id}")],
             [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]
         ])
-        
+        print(f"DEBUG kitchen_chat_id={kitchen_chat_id!r} type={type(kitchen_chat_id)}")
         await bot.send_message(
             kitchen_chat_id,
             text=order_text,
