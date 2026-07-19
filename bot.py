@@ -2250,6 +2250,11 @@ async def dispatch_to_rider_handler(callback_query: types.CallbackQuery, bot: Bo
     ])
 
     await bot.send_message(dispatch_group_id, text="\n".join(lines), reply_markup=keyboard)
+    if callback_query.message.text:
+        await callback_query.message.edit_reply_markup(
+            reply_markup=None,
+        )
+    
 
     staff = callback_query.from_user
     supabase.table("orders").update({
@@ -2711,9 +2716,10 @@ async def handle_preparing(callback_query: types.CallbackQuery, bot: Bot):
         if restaurant_id:
             await refresh_kitchen_order_board(bot, restaurant_id)
 
-    ready_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]
-    ])
+    ready_keyboard_buttons = [[InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]]
+    if order.data and order.data[0].get("order_type") == "delivery":
+        ready_keyboard_buttons.append([InlineKeyboardButton(text="🛵 Send to Rider", callback_data=f"dispatch_{order_id}")])
+    ready_keyboard = InlineKeyboardMarkup(inline_keyboard=ready_keyboard_buttons)
     if callback_query.message.photo:
         await callback_query.message.edit_caption(
             caption=f"{callback_query.message.caption}\n\n🍳 Order marked as preparing.",
@@ -2747,7 +2753,14 @@ async def handle_ready(callback_query: CallbackQuery, bot: Bot):
         .execute()
 
     restaurant_id = None
-    
+
+    # Determine if we need to show the "Send to Rider" button for delivery orders    
+    final_keyboard = None
+    if order.data and order.data[0].get("order_type") == "delivery":
+        final_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛵 Send to Rider", callback_data=f"dispatch_{order_id}")]
+        ])
+
     if order.data:
         order_data = order.data[0]
         customer_name = order_data["customer_name"]
@@ -2767,12 +2780,12 @@ async def handle_ready(callback_query: CallbackQuery, bot: Bot):
     if callback_query.message.photo:
         await callback_query.message.edit_caption(
             caption=f"{callback_query.message.caption}\n\n🍽️ Order marked as ready. Customer notified.",
-            reply_markup=None
+            reply_markup=final_keyboard
         )
     else:
         await callback_query.message.edit_text(
             text=f"{callback_query.message.text}\n\n🍽️ Order marked as ready. Customer notified.",
-            reply_markup=None
+            reply_markup=final_keyboard
         )
 
     if restaurant_id:
