@@ -21,6 +21,8 @@ from bot import (
     send_order_to_kitchen,
     send_order_receipt,
     send_restock_alert,
+    reverse_geocode,
+    format_delivery_coordinates,
 )
 
 GRAPH_API = "https://graph.facebook.com/v25.0"
@@ -62,6 +64,20 @@ async def send_list(phone_number_id: str, token: str, to: str, body: str, button
     })
 
 
+async def send_buttons(phone_number_id: str, token: str, to: str, body: str, buttons: list[dict]):
+    """Send a Meta interactive quick-reply message. Meta allows at most 3 buttons."""
+    if not buttons or len(buttons) > 3:
+        raise ValueError("WhatsApp interactive buttons must contain 1-3 options")
+    await send_whatsapp_message(phone_number_id, token, to, {
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body},
+            "action": {"buttons": [{"type": "reply", "reply": b} for b in buttons]},
+        },
+    })
+
+
 async def send_payment_options(phone_number_id, token, to, order_type: str, paystack_enabled: bool):
     rows = [
         {"id": "pay_cash", "title": "Cash"},
@@ -89,6 +105,51 @@ async def send_whatsapp_document(phone_number_id: str, token: str, to: str, cont
         "type": "document",
         "document": {"id": media_id, "filename": filename, "caption": caption},
     })
+
+
+async def sync_catalog_item_availability(menu_item_id: str, is_available: bool, supabase) -> None:
+    """Best-effort push of an item's availability to the Meta catalog.
+
+    Called whenever a kitchen toggles a menu item's availability (from either
+    channel). This keeps the WhatsApp catalog from showing items customers can't
+    actually order, so carts are rejected less often at submission time.
+
+    This is deliberately best-effort: catalog sync can lag or fail without
+    blocking the kitchen's own availability toggle, and server-side re-validation
+    in build_authoritative_cart remains the actual safety net regardless of
+    whether this sync succeeded.
+    """
+    mapping = supabase.table("menu_item_catalog_map").select(
+        "catalog_retailer_id, restaurant_id, restaurants(whatsapp_access_token, whatsapp_catalog_id)"
+    ).eq("menu_item_id", menu_item_id).execute()
+    if not mapping.data:
+        return  # item isn't mapped to a WhatsApp catalog product; nothing to sync
+
+    row = mapping.data[0]
+    restaurant = row.get("restaurants") or {}
+    token = restaurant.get("whatsapp_access_token")
+    catalog_id = restaurant.get("whatsapp_catalog_id")
+    retailer_id = row.get("catalog_retailer_id")
+    if not (token and catalog_id and retailer_id):
+        return  # catalog not configured for this restaurant yet
+
+    availability = "in stock" if is_available else "out of stock"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{GRAPH_API}/{catalog_id}/items_batch",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "item_type": "PRODUCT_ITEM",
+                    "requests": [{
+                        "method": "UPDATE",
+                        "data": {"id": retailer_id, "availability": availability},
+                    }],
+                },
+            )
+            response.raise_for_status()
+    except Exception:
+        logging.exception("Failed to sync catalog availability for retailer_id=%s (menu_item_id=%s)", retailer_id, menu_item_id)
 
 
 async def send_whatsapp_receipt(supabase, order: dict, order_id: str) -> bool:
@@ -149,6 +210,28 @@ def interactive_reply_id(msg: dict) -> str | None:
     return (interactive.get("button_reply") or interactive.get("list_reply") or {}).get("id")
 
 
+async def already_processed(supabase, message_id: str) -> bool:
+    """Best-effort idempotency check against whatsapp_processed_messages.
+
+    Meta redelivers webhooks on timeout/error, and a manual customer resend looks
+    identical to a fresh message. This uses an insert-or-skip on a unique message_id
+    so a genuine retry of the same Meta event is not reprocessed. If the table is
+    missing or the check itself errors, we fail open (process the message) rather
+    than risk silently dropping a legitimate order.
+    """
+    if not message_id:
+        return False
+    try:
+        supabase.table("whatsapp_processed_messages").insert({"message_id": message_id}).execute()
+        return False
+    except Exception as e:
+        # Unique violation means we've already handled this exact Meta message id.
+        if "duplicate key" in str(e).lower() or "23505" in str(e):
+            return True
+        logging.warning("whatsapp_processed_messages check failed, processing anyway: %s", e)
+        return False
+
+
 async def handle_whatsapp_webhook(payload: dict, supabase, bot):
     """Dispatch a Meta webhook event for a configured restaurant number."""
     entries = payload.get("entry") or []
@@ -160,31 +243,54 @@ async def handle_whatsapp_webhook(payload: dict, supabase, bot):
         return
 
     msg = messages[0]
+    message_id = msg.get("id")
     from_number = msg.get("from")
     if not from_number:
         return
+    if await already_processed(supabase, message_id):
+        logging.info("Skipping already-processed WhatsApp message %s from %s", message_id, from_number)
+        return
+
     contact_name = ((entry.get("contacts") or [{}])[0].get("profile") or {}).get("name", "Customer")
     response = supabase.table("restaurants").select(
         "id, name, kitchen_chat_id, whatsapp_phone_number_id, whatsapp_access_token, "
         "pickup_enabled, delivery_fee_type, delivery_fee_flat, paystack_enabled, paystack_subaccount_code"
     ).eq("whatsapp_phone_number_id", phone_number_id).execute()
     if not response.data:
+        logging.error("No restaurant configured for whatsapp_phone_number_id=%s (message_id=%s)", phone_number_id, message_id)
         return
     restaurant = response.data[0]
-    state = WhatsAppState(supabase, from_number, restaurant["id"])
-    session = supabase.table("whatsapp_sessions").select("state").eq("phone_number", from_number).eq("restaurant_id", restaurant["id"]).execute()
-    current_state = session.data[0].get("state") if session.data else None
 
-    if msg.get("type") == "order":
-        await handle_cart_submission(msg, state, restaurant, from_number, contact_name, supabase)
-    elif msg.get("type") == "interactive":
-        await handle_interactive(msg, state, restaurant, from_number, supabase, bot, current_state)
-    elif msg.get("type") == "location":
-        await handle_location(msg, state, restaurant, from_number, current_state)
-    elif msg.get("type") == "text":
-        await handle_text(msg, state, restaurant, from_number, current_state)
-    elif msg.get("type") == "image":
-        await handle_payment_proof(msg, state, restaurant, from_number, supabase, bot, current_state)
+    try:
+        state = WhatsAppState(supabase, from_number, restaurant["id"])
+        session = supabase.table("whatsapp_sessions").select("state").eq("phone_number", from_number).eq("restaurant_id", restaurant["id"]).execute()
+        current_state = session.data[0].get("state") if session.data else None
+
+        if msg.get("type") == "order":
+            await handle_cart_submission(msg, state, restaurant, from_number, contact_name, supabase)
+        elif msg.get("type") == "interactive":
+            await handle_interactive(msg, state, restaurant, from_number, supabase, bot, current_state)
+        elif msg.get("type") == "location":
+            await handle_location(msg, state, restaurant, from_number, current_state)
+        elif msg.get("type") == "text":
+            await handle_text(msg, state, restaurant, from_number, current_state)
+        elif msg.get("type") == "image":
+            await handle_payment_proof(msg, state, restaurant, from_number, supabase, bot, current_state)
+    except Exception:
+        # Never let the customer see total silence. Log with enough context to trace
+        # the specific failed order, then send a plain apology so they know to retry
+        # rather than assuming the bot never got their message.
+        logging.exception(
+            "WhatsApp webhook dispatch failed: restaurant_id=%s from_number=%s message_id=%s type=%s",
+            restaurant.get("id"), from_number, message_id, msg.get("type"),
+        )
+        try:
+            await send_text(
+                restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                "⚠️ Something went wrong on our end processing that. Please try again in a moment, or resend your message.",
+            )
+        except Exception:
+            logging.exception("Also failed to send the fallback error message to %s", from_number)
 
 
 async def build_authoritative_cart(order_payload: dict, restaurant_id: str, supabase) -> tuple[dict, list[str]]:
@@ -337,21 +443,53 @@ async def handle_location(msg, state, restaurant, from_number, current_state):
     location = msg.get("location") or {}
     if "latitude" not in location or "longitude" not in location:
         return
-    address = location.get("address") or f"Shared location: {float(location['latitude']):.6f}, {float(location['longitude']):.6f}"
-    await state.update_data(delivery_address=address, delivery_lat=location["latitude"], delivery_lon=location["longitude"])
-    await continue_after_delivery_address(state, restaurant, from_number)
+    lat = float(location["latitude"])
+    lon = float(location["longitude"])
+
+    # Save coordinates immediately so we never lose them, even if reverse geocoding fails
+    # or the customer never responds to the confirm prompt below.
+    fallback_address = location.get("address") or format_delivery_coordinates(lat, lon)
+    await state.update_data(delivery_address=fallback_address, delivery_lat=lat, delivery_lon=lon)
+
+    resolved = await reverse_geocode(lat, lon)
+    address = resolved or fallback_address
+    await state.update_data(delivery_address=address)
+
+    # Nominatim results can be rough for Nigerian addresses, so confirm before
+    # proceeding — mirrors the Telegram flow's confirm/retype step.
+    await state.set_state("confirming_address")
+    await send_buttons(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                        f"📍 We found this address:\n\n{address}\n\nIs this correct?", [
+                            {"id": "address_confirmed", "title": "Yes, correct"},
+                            {"id": "address_retype", "title": "No, retype"},
+                        ])
 
 
 async def handle_text(msg, state, restaurant, from_number, current_state):
-    if current_state != "waiting_for_address":
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please add items from the catalog first, then choose delivery or pickup.")
+    if current_state not in ("waiting_for_address", "confirming_address"):
+        await handle_freeform_message(msg, state, restaurant, from_number, current_state)
         return
     address = ((msg.get("text") or {}).get("body") or "").strip()
     if len(address) < 10:
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please send a complete delivery address or a location pin.")
         return
     await state.update_data(delivery_address=address, delivery_lat=None, delivery_lon=None)
+    await state.set_state("waiting_for_address")
     await continue_after_delivery_address(state, restaurant, from_number)
+
+
+async def handle_freeform_message(msg, state, restaurant, from_number, current_state):
+    """Handle idle-session text: no active checkout in progress.
+
+    This is the seam for a future AI/RAG assistant (menu questions, hours, FAQs).
+    It must stay read-only: never create orders, touch payment state, or write to
+    whatsapp_sessions here. If a future agent wants to nudge someone toward
+    ordering, have it reply with a prompt rather than attempting to build a cart.
+    Kept as a simple, safe fallback until that agent is wired in.
+    """
+    await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                    f"Hi! To order from {restaurant['name']}, please browse our WhatsApp catalog and send your cart. "
+                    "Need help? Just ask and we'll get back to you.")
 
 
 async def handle_interactive(msg, state, restaurant, from_number, supabase, bot, current_state):
@@ -360,6 +498,12 @@ async def handle_interactive(msg, state, restaurant, from_number, supabase, bot,
         await start_delivery_address_step(state, restaurant, from_number)
     elif reply_id == "order_type_pickup" and current_state == "waiting_for_order_type":
         await choose_pickup(state, restaurant, from_number)
+    elif reply_id == "address_confirmed" and current_state == "confirming_address":
+        await continue_after_delivery_address(state, restaurant, from_number)
+    elif reply_id == "address_retype" and current_state == "confirming_address":
+        await state.set_state("waiting_for_address")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                        "✍️ Please type your delivery address, or share a location pin again.")
     elif reply_id and reply_id.startswith("zone:") and current_state == "waiting_for_delivery_zone":
         zone_id = reply_id.split(":", 1)[1]
         zone = supabase.table("delivery_zones").select("id, zone_name, fee").eq("id", zone_id).eq("restaurant_id", restaurant["id"]).eq("is_active", True).execute()

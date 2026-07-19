@@ -153,6 +153,34 @@ def format_delivery_coordinates(lat: float, lon: float) -> str:
     """Build a readable fallback address from shared coordinates."""
     return f"Shared location: {lat:.6f}, {lon:.6f}"
 
+
+def format_maps_link(lat: float, lon: float) -> str:
+    """Build a tappable Google Maps link from raw coordinates for dispatch/kitchen use."""
+    return f"https://maps.google.com/?q={lat},{lon}"
+
+
+async def reverse_geocode(lat: float, lon: float) -> str | None:
+    """Resolve coordinates to a human-readable address via Nominatim.
+
+    Shared by both the Telegram and WhatsApp location flows so reverse-geocoding
+    behavior never diverges between channels. Returns None on any failure; callers
+    are responsible for falling back to raw coordinates.
+    """
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://nominatim.openstreetmap.org/reverse",
+                params={"lat": lat, "lon": lon, "format": "json"},
+                headers={"User-Agent": "ChowlinBot/1.0"}
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        return data.get("display_name") or None
+    except Exception as e:
+        logging.warning("Reverse geocoding failed for %s,%s: %s", lat, lon, e)
+        return None
+
 async def get_restaurant_by_kitchen_chat(chat_id: int):
     response = supabase.table("restaurants")\
         .select("id, name, kitchen_chat_id")\
@@ -1441,20 +1469,8 @@ async def receive_location(message: types.Message, state: FSMContext):
         delivery_lon=lon
     )
 
-    address = fallback_address
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                "https://nominatim.openstreetmap.org/reverse",
-                params={"lat": lat, "lon": lon, "format": "json"},
-                headers={"User-Agent": "ChowlinBot/1.0"}
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-        address = data.get("display_name") or fallback_address
-    except Exception as e:
-        logging.warning("Reverse geocoding failed for delivery location: %s", e)
+    resolved = await reverse_geocode(lat, lon)
+    address = resolved or fallback_address
 
     # Update the address if we resolved a more user-friendly label.
     await state.update_data(delivery_address=address)
@@ -2093,6 +2109,10 @@ def build_kitchen_order_text(
 
     if order_type == "delivery":
         order_location = f"Delivery\n📍 {data.get('delivery_address') or 'No address provided'}"
+        delivery_lat = data.get("delivery_lat")
+        delivery_lon = data.get("delivery_lon")
+        if delivery_lat is not None and delivery_lon is not None:
+            order_location += f"\n🗺 {format_maps_link(float(delivery_lat), float(delivery_lon))}"
     elif order_type == "pickup":
         order_location = "Pickup"
     else:
@@ -2169,10 +2189,13 @@ async def send_order_to_kitchen(
         )
     else:
         # Other payment methods
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        kitchen_buttons = [
             [InlineKeyboardButton(text="🍳 Mark as Preparing", callback_data=f"preparing_{order_id}")],
             [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]
-        ])
+        ]
+        if data.get("order_type") == "delivery":
+            kitchen_buttons.append([InlineKeyboardButton(text="🛵 Send to Rider", callback_data=f"dispatch_{order_id}")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=kitchen_buttons)
         print(f"DEBUG kitchen_chat_id={kitchen_chat_id!r} type={type(kitchen_chat_id)}")
         await bot.send_message(
             kitchen_chat_id,
@@ -2182,6 +2205,89 @@ async def send_order_to_kitchen(
 
     if restaurant_id:
         await refresh_kitchen_order_board(bot, restaurant_id)
+
+
+@dp.callback_query(F.data.startswith("dispatch_"))
+async def dispatch_to_rider_handler(callback_query: types.CallbackQuery, bot: Bot):
+    """Kitchen sends a delivery order's details to the restaurant's dispatch group."""
+    order_id = callback_query.data.replace("dispatch_", "")
+
+    order = supabase.table("orders").select(
+        "id, customer_name, customer_contact, delivery_address, delivery_lat, delivery_lon, "
+        "total_amount, order_type, restaurant_id, restaurants(name, dispatch_group_id)"
+    ).eq("id", order_id).execute()
+
+    if not order.data:
+        await callback_query.answer("Order not found.", show_alert=True)
+        return
+
+    order_data = order.data[0]
+    restaurant = order_data.get("restaurants") or {}
+    dispatch_group_id = restaurant.get("dispatch_group_id")
+
+    if not dispatch_group_id:
+        await callback_query.answer(
+            "No dispatch group configured for this restaurant yet. Set restaurants.dispatch_group_id to enable this.",
+            show_alert=True,
+        )
+        return
+
+    lines = [
+        f"🛵 <b>DISPATCH  #{order_short_id(order_id)}</b>",
+        f"🏪 {escape(restaurant.get('name', 'Restaurant'))}",
+        f"👤 {escape(order_data.get('customer_name') or 'Customer')}",
+    ]
+    if order_data.get("customer_contact"):
+        lines.append(f"📱 {escape(str(order_data['customer_contact']))}")
+    lines.append(f"📍 {escape(order_data.get('delivery_address') or 'No address provided')}")
+    lat, lon = order_data.get("delivery_lat"), order_data.get("delivery_lon")
+    if lat is not None and lon is not None:
+        lines.append(f"🗺 {format_maps_link(float(lat), float(lon))}")
+    lines.append(f"💰 {format_money(order_data.get('total_amount', 0))}")
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Delivered", callback_data=f"delivered_{order_id}")]
+    ])
+
+    await bot.send_message(dispatch_group_id, text="\n".join(lines), reply_markup=keyboard)
+
+    staff = callback_query.from_user
+    supabase.table("orders").update({
+        "dispatch_sent_at": datetime.now(pytz.timezone("Africa/Lagos")).isoformat(),
+        "dispatch_sent_by": staff.username or str(staff.id),
+    }).eq("id", order_id).execute()
+
+    await callback_query.answer("Sent to dispatch ✅", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("delivered_"))
+async def rider_marked_delivered_handler(callback_query: types.CallbackQuery, bot: Bot):
+    """Rider confirms delivery from the dispatch group, closing the order loop."""
+    order_id = callback_query.data.replace("delivered_", "")
+
+    order = supabase.table("orders").select(
+        "id, telegram_user_id, customer_name, customer_contact, order_channel, restaurant_id, "
+        "restaurants(whatsapp_phone_number_id, whatsapp_access_token)"
+    ).eq("id", order_id).execute()
+
+    supabase.table("orders").update({"order_status": "delivered"}).eq("id", order_id).execute()
+
+    if order.data:
+        order_data = order.data[0]
+        try:
+            await notify_order_customer(
+                bot, order_data,
+                f"✅ Hi {order_data.get('customer_name', 'there')}, your order #{order_short_id(order_id)} has been delivered. Enjoy your meal!",
+            )
+        except ValueError:
+            logging.warning("Could not notify customer of delivery for order %s (missing contact details)", order_id)
+
+    if callback_query.message.text:
+        await callback_query.message.edit_text(
+            text=f"{callback_query.message.text}\n\n✅ Delivered.",
+            reply_markup=None,
+        )
+    await callback_query.answer("Marked delivered ✅")
 
 
 # ========== ORDER CONFIRMATION & PAYMENT ==========
@@ -3258,6 +3364,14 @@ async def kitchen_toggle_item(callback_query: types.CallbackQuery):
         .update({"is_available": new_status})\
         .eq("id", item_data["id"])\
         .execute()
+
+    # Best-effort: keep the WhatsApp catalog in sync so unavailable items stop
+    # showing there too. Never let a sync failure block the kitchen toggle itself.
+    try:
+        from whatsapp import sync_catalog_item_availability
+        await sync_catalog_item_availability(item_data["id"], new_status, supabase)
+    except Exception:
+        logging.exception("Catalog availability sync failed for menu_item_id=%s", item_data["id"])
 
     status_text = "✅ Available" if new_status else "❌ Unavailable"
     await callback_query.answer(f"{item_data['name']} → {status_text}", show_alert=True)
