@@ -338,18 +338,17 @@ def build_group_prompt(group: dict) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def compute_composite_totals(base_price, selections: dict) -> tuple[float, list[str]]:
-    line_total = Decimal(str(base_price or 0))
+    line_total = float(base_price)
     summary_parts = []
     for picks in selections.values():
         names = []
         for pick in picks:
             quantity = int(pick.get("quantity") or 0)
-            line_total += Decimal(str(pick.get("price_delta") or 0)) * quantity
+            line_total += float(pick.get("price_delta") or 0) * quantity
             name = pick.get("name", "")
             names.append(f"{name} x{quantity}" if quantity > 1 else name)
-        if names:
-            summary_parts.append(", ".join(names))
-    return float(line_total), summary_parts
+        summary_parts.append(", ".join(names))
+    return line_total, summary_parts
 
 
 def build_composite_cart_line(menu_item: dict, selections: dict) -> tuple[str, dict, str]:
