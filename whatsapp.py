@@ -33,7 +33,7 @@ GRAPH_API = "https://graph.facebook.com/v25.0"
 MAX_WHATSAPP_LIST_ROWS = 10
 MAX_LINE_QTY = 50
 MAX_COMPOSITE_UNITS = 5
-WHATSAPP_COMPOSITES_ENABLED = True
+WHATSAPP_COMPOSITES_ENABLED = os.getenv("WHATSAPP_COMPOSITES_ENABLED", "false").lower() == "true"
 
 
 def money(value) -> Decimal:
@@ -115,12 +115,10 @@ def expand_composite_queue(composites: list[dict], max_units: int = MAX_COMPOSIT
     queue = []
     for item in composites:
         quantity = max(0, int(item.get("qty") or 0))
-        for unit_no in range(1, quantity + 1):
+        for _ in range(quantity):
             queue.append({
                 "menu_item_id": item.get("menu_item_id"),
                 "name": item.get("name", "Item"),
-                "unit_no": unit_no,
-                "units_total": quantity,
             })
     return queue, False
 
@@ -736,7 +734,10 @@ async def begin_composite_configuration(state, restaurant, from_number):
     data = await state.get_data()
     queue, exceeded = expand_composite_queue(data.get("pending_composites") or [])
     if exceeded:
-        await state.update_data(pending_composites=[], composite_queue=[], active_unit=None)
+        await state.update_data(
+            pending_composites=[], composite_queue=[], active_unit=None,
+            same_for_all_template=None,
+        )
         await send_text(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
             f"Please order fewer composite items per cart (maximum {MAX_COMPOSITE_UNITS} units). "
@@ -755,15 +756,30 @@ async def next_composite_unit(state, restaurant, from_number):
     data = await state.get_data()
     queue = data.get("composite_queue") or []
     if not queue:
-        await state.update_data(pending_composites=[], composite_queue=[], active_unit=None)
+        await state.update_data(
+            pending_composites=[], composite_queue=[], active_unit=None,
+            same_for_all_template=None,
+        )
         await begin_delivery_or_pickup(state, restaurant, from_number)
         return
 
     active_unit = queue[0]
     await state.update_data(composite_queue=queue[1:], active_unit=None)
+    pending_composites = data.get("pending_composites") or []
+    units_total = sum(
+        int(item.get("qty") or 0)
+        for item in pending_composites
+        if item.get("menu_item_id") == active_unit.get("menu_item_id")
+    )
+    remaining_same_units = sum(
+        1 for unit in queue[1:]
+        if unit.get("menu_item_id") == active_unit.get("menu_item_id")
+    )
     groups = await fetch_composite_groups(state, active_unit.get("menu_item_id"), restaurant)
     active_unit = {
         **active_unit,
+        "unit_no": max(1, units_total - remaining_same_units),
+        "units_total": max(1, units_total),
         "group_index": 0,
         "selections": {},
         "option_page": 0,
@@ -987,7 +1003,7 @@ async def handle_cart_submission(msg, state, restaurant, from_number, contact_na
             {"menu_item_id": item.get("menu_item_id"), "name": item.get("name", "Item"), "qty": int(item.get("qty") or 0)}
             for item in composites
         ] if WHATSAPP_COMPOSITES_ENABLED else [],
-        composite_queue=[], active_unit=None,
+        composite_queue=[], active_unit=None, same_for_all_template=None,
     )
     if problems:
         await state.set_state("confirming_partial_cart")

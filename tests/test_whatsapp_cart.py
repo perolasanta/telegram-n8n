@@ -213,9 +213,8 @@ class TestCompositeFlowHelpers(unittest.TestCase):
         ])
         self.assertFalse(exceeded)
         self.assertEqual(len(queue), 3)
-        self.assertEqual(queue[0]["unit_no"], 1)
-        self.assertEqual(queue[1]["unit_no"], 2)
-        self.assertEqual(queue[1]["units_total"], 2)
+        self.assertEqual(queue[0], {"menu_item_id": "combo", "name": "Combo"})
+        self.assertEqual(set(queue[1]), {"menu_item_id", "name"})
 
         too_many, exceeded = expand_composite_queue([
             {"menu_item_id": "combo", "name": "Combo", "qty": MAX_COMPOSITE_UNITS + 1},
