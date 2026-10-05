@@ -607,7 +607,7 @@ def price_composite_line(base_price, modifiers: dict, fresh_options_by_id: dict)
             unit_price += price_delta * quantity
             refreshed_picks.append({
                 **pick,
-                "price_delta": float(price_delta),
+                "price_delta": price_delta,
             })
         refreshed_modifiers[group_id] = refreshed_picks
     return unit_price, refreshed_modifiers
@@ -651,6 +651,13 @@ async def recalculate_total(state: WhatsAppState, restaurant: dict) -> Decimal:
             unit_price, refreshed_modifiers = price_composite_line(
                 item["price"], modifiers, fresh_options_by_id
             )
+            session_modifiers = {
+                group_id: [
+                    {**pick, "price_delta": float(money(pick.get("price_delta")))}
+                    for pick in picks
+                ]
+                for group_id, picks in refreshed_modifiers.items()
+            }
         else:
             unit_price = money(item["price"])
         refreshed_line = {
@@ -661,7 +668,7 @@ async def recalculate_total(state: WhatsAppState, restaurant: dict) -> Decimal:
             "qty": quantity,
         }
         if modifiers:
-            refreshed_line["modifiers"] = refreshed_modifiers
+            refreshed_line["modifiers"] = session_modifiers
         refreshed_cart[key] = refreshed_line
         subtotal += unit_price * quantity
 

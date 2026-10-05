@@ -84,8 +84,18 @@ class TestPriceCompositeLine(unittest.TestCase):
         )
 
         self.assertEqual(str(unit_price), "137.50")
-        self.assertEqual(modifiers["protein"][0]["price_delta"], 12.5)
+        self.assertEqual(str(modifiers["protein"][0]["price_delta"]), "12.50")
         self.assertEqual(modifiers["protein"][0]["quantity"], 3)
+
+    def test_float_price_delta_from_database_is_supported(self):
+        unit_price, modifiers = price_composite_line(
+            100,
+            {"protein": [{"option_id": "o1", "name": "Chicken", "quantity": 2}]},
+            {"o1": {"name": "Chicken", "price_delta": 12.5, "is_available": True}},
+        )
+
+        self.assertEqual(str(unit_price), "125.0")
+        self.assertEqual(str(modifiers["protein"][0]["price_delta"]), "12.5")
 
     def test_unavailable_option_raises(self):
         with self.assertRaisesRegex(ValueError, "Chicken is no longer available"):
