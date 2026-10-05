@@ -184,3 +184,157 @@ Paystack requires an email address. For WhatsApp orders, use the documented dete
 3. Apply additive migrations for schema changes; do not edit already-applied migrations to retrofit production state.
 4. Run at least syntax/import checks and focused tests or payload simulations.
 5. Document any new endpoint, environment variable, state value, and operational setup step in the README/context as appropriate.
+
+# Product & Pricing Update — August 2026
+
+## Current commercial plans
+
+### Starter
+- Setup: ₦50,000.
+- Monthly: ₦20,000.
+- First monthly subscription under current introductory offer: ₦10,000.
+- Positioning: small restaurants and cafés.
+- Includes: QR ordering up to 10 tables, kitchen Telegram notifications, cash/bank-transfer payments, PDF receipts, daily sales reports.
+
+### Delivery Bot
+- Setup: ₦60,000.
+- Monthly: ₦25,000.
+- First monthly subscription under current introductory offer: ₦12,500.
+- Positioning: home chefs, cloud kitchens and online food vendors.
+- Includes: own branded Telegram bot, customers find vendor by name without QR, delivery address by text/location, delivery-zone fee configuration, kitchen Telegram notifications, cash/bank-transfer/pay-on-delivery, PDF receipts, daily sales reports, pickup on request.
+
+### Growth
+- Setup: ₦100,000.
+- Monthly: ₦35,000.
+- First monthly subscription under current introductory offer: ₦17,500.
+- Positioning: busy restaurants with dine-in and delivery.
+- Includes everything in Starter plus unlimited tables, delivery/pickup, delivery zones and fees, weekly reports, kitchen menu management, customer reorder, inventory tracking/low-stock alerts and priority support.
+
+### Enterprise
+- Setup: from ₦200,000.
+- Monthly: from ₦80,000.
+- First monthly subscription under current introductory offer: from ₦40,000.
+- Positioning: multi-venue, multi-section and high-volume operations.
+- Includes everything in Growth plus multiple branches under one account, custom menus per section/event type, club/event-night menu switching, dedicated support, monthly business review and custom feature development.
+
+## Current introductory offer
+
+Public pricing currently advertises 50% off the first monthly subscription on any plan.
+- Setup fee is paid in full at onboarding.
+- First month subscription is half price.
+- Full rate starts from month two.
+
+This is a commercial rule. Do not invent billing implementation from the marketing copy; inspect subscription/billing code before changing billing behavior.
+
+## Annual pricing advertised
+
+- Starter: ₦200,000/year.
+- Delivery Bot: ₦250,000/year.
+- Growth: ₦350,000/year.
+- Enterprise: custom quote.
+
+Marketing says annual upfront payment saves two months free. Verify whether annual billing/entitlements are technically implemented before coding against this claim.
+
+## WhatsApp Ordering add-on
+
+Available commercially on Delivery Bot, Growth and Enterprise.
+
+- Setup add-on: ₦30,000.
+- Monthly add-on: ₦12,000/month.
+- Requires Delivery Bot tier or above.
+- Customers order through the vendor's WhatsApp catalog without a separate app or QR.
+- Delivery address can be typed or supplied as a location pin.
+- Delivery zones/fees share the same delivery configuration concept as Telegram.
+- Payment options include cash, bank transfer, pay on delivery and Paystack checkout where enabled.
+- Customers can receive order status updates, cancel/order-history/reorder functionality where implemented, and receipts.
+- Kitchen continues receiving orders on Telegram.
+- Add-on is transactional only; it is not intended for automated marketing blasts.
+
+Important: the repository already contains WhatsApp ordering, including catalog cart handling, WhatsApp state persistence, bank-transfer proof, Paystack, receipts, status notifications and catalog availability synchronization. Verify `whatsapp.py`, `whatsapp_state.py` and `main.py` before treating any specific behavior as complete.
+
+# Verified bot.py capability map
+
+The current `bot.py` is a large coupled aiogram module. Its major handlers/helpers include:
+
+## Delivery and location
+- `start_delivery_session()` initializes a restaurant-specific delivery bot session, checks subscription, loads the EXTERNAL table context and optionally offers pickup.
+- `load_delivery_bots()` creates one aiogram `Bot` instance per restaurant with `delivery_bot_token`.
+- `reverse_geocode()` uses Nominatim for Telegram location handling and returns a human-readable address or falls back safely.
+- `format_maps_link()` creates a Google Maps link from coordinates.
+- `get_delivery_fee()` handles none/flat/zone fee types.
+- `show_delivery_zones()` presents active restaurant delivery zones.
+- `proceed_after_address()` routes to zone selection, flat fee application or the menu.
+
+## Composite menu items
+- `start_composite_item()` loads active modifier groups/options.
+- `build_group_prompt()` respects available options, selection mode, minimum selections and optional groups.
+- Modifier options can have price deltas and quantities.
+- `finalize_composite_selection()` calculates base price plus modifier price deltas and stores a unique composite cart line.
+
+## Inventory
+- `get_tracked_inventory_items()` retrieves inventory-tracked menu items.
+- `validate_cart_inventory()` checks requested quantities against current stock.
+- `send_restock_alert()` notifies kitchen and manager about low stock.
+- `deduct_inventory_for_order()` delegates deduction to the PostgreSQL `deduct_order_inventory` RPC/function.
+
+## Paystack
+- `resolve_bank_code()` resolves a bank name through Paystack.
+- `create_paystack_subaccount()` creates and saves a restaurant Paystack subaccount.
+- `create_paystack_payment_link()` initializes NGN checkout using the order id as reference and the restaurant subaccount.
+- Paystack payment confirmation is handled through the FastAPI webhook in `main.py`; browser callback must not be treated as payment proof.
+
+## Kitchen operations
+- `send_order_to_kitchen_from_db()` sends a submitted order to the restaurant kitchen Telegram group.
+- `build_kitchen_order_board()` groups current-day orders into pending, preparing and recent-ready sections.
+- `refresh_kitchen_order_board()` edits/recreates the pinned board and can trigger the daily rush alert.
+- `send_rush_hour_alert_if_needed()` alerts the manager when pending orders exceed the configured threshold.
+
+## Customer ordering
+- `/start` handles table QR, external order and delivery-bot entry points.
+- Delivery/pickup selection is implemented.
+- Address collection accepts text and location.
+- Category/item browsing and quantity selection are implemented.
+- Cart review/clear/confirmation are implemented.
+- Composite items are implemented on Telegram.
+- Payment handlers exist for pay-on-delivery, cash, Paystack and bank transfer.
+- `/cancel`, `/history`, `/status` and reorder handlers exist.
+
+## Reports and administration
+- `/daily_report`, `/weekly_report`, `/monthly_report` are available.
+- `/register_manager` and `/set_manager` manage manager configuration.
+- `/restock` provides kitchen stock management.
+- `/menu` provides kitchen menu management and availability controls.
+- `/pending` and `/board` expose/refresh kitchen order information.
+- `/set_delivery_fee` and `/add_zone` configure delivery pricing.
+- `/activate` is admin-restricted through `ADMIN_TELEGRAM_ID`.
+
+# Product-to-code guardrails
+
+1. Do not implement a plan entitlement merely because it appears on the pricing page. First locate the subscription/entitlement code and database fields.
+2. Do not implement annual billing merely from the annual pricing copy. Verify subscription billing support.
+3. Do not assume Enterprise multi-branch behavior is already present. The pricing page is a commercial requirement, not proof of current schema support.
+4. WhatsApp Ordering is a paid add-on commercially, but existing WhatsApp code may not yet enforce the add-on entitlement. Check subscription/add-on fields before adding enforcement.
+5. Starter is intentionally limited to 10 tables commercially; verify whether current code enforces a table limit before changing onboarding or table creation.
+6. Delivery Bot is a distinct product tier centered on dedicated branded Telegram delivery bots. Do not confuse it with ordinary QR-based external ordering.
+7. Growth includes inventory, kitchen menu management, delivery/pickup and reorder as commercial positioning. Verify actual plan gates before changing those features.
+8. Enterprise custom development is a service offering. Do not hard-code custom requirements into the core product without a specific customer requirement.
+9. WhatsApp ordering should remain transactional. Do not add marketing automation or unsolicited broadcast behavior as part of ordinary ordering features.
+
+# Pricing/UI copy reference
+
+When editing the public pricing page, preserve these current customer-facing facts unless the user supplies a newer price:
+- Starter ₦50k setup / ₦20k monthly.
+- Delivery Bot ₦60k setup / ₦25k monthly.
+- Growth ₦100k setup / ₦35k monthly.
+- Enterprise from ₦200k setup / from ₦80k monthly.
+- First monthly subscription is currently 50% off on all plans.
+- Annual: Starter ₦200k, Delivery Bot ₦250k, Growth ₦350k, Enterprise custom.
+- WhatsApp add-on: ₦30k setup + ₦12k/month, Delivery Bot and above.
+
+# Engineering source-of-truth rule
+
+This file is context, not a replacement for source code or database schema.
+
+For engineering behavior, current repository code and applied database schema win.
+For public commercial pricing, the pricing section above is the current supplied pricing unless the user provides newer instructions.
+For ambiguous requirements, inspect the owning code and explain any mismatch rather than silently assuming one side is correct.

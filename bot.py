@@ -209,13 +209,14 @@ async def get_tracked_inventory_items(restaurant_id: str):
     return response.data or []
 
 
-async def validate_cart_inventory(cart: dict):
+async def validate_cart_inventory(cart: dict, restaurant_id: str):
     shortages = []
     for cart_key, cart_item in cart.items():
         real_menu_item_id = cart_item.get("menu_item_id", cart_key)
         item = supabase.table("menu_items")\
             .select("name, inventory_count, track_inventory")\
             .eq("id", real_menu_item_id)\
+            .eq("restaurant_id", restaurant_id)\
             .execute()
         if not item.data:
             continue
@@ -334,6 +335,36 @@ def build_group_prompt(group: dict) -> tuple[str, InlineKeyboardMarkup]:
         kb.inline_keyboard.append([InlineKeyboardButton(text="✅ Done with this", callback_data="mod_group_done")])
     text = f"*{group['name']}*\n(choose {'one' if group['selection_mode'] == 'single' else 'one or more'})"
     return text, kb
+
+
+def compute_composite_totals(base_price, selections: dict) -> tuple[float, list[str]]:
+    line_total = Decimal(str(base_price or 0))
+    summary_parts = []
+    for picks in selections.values():
+        names = []
+        for pick in picks:
+            quantity = int(pick.get("quantity") or 0)
+            line_total += Decimal(str(pick.get("price_delta") or 0)) * quantity
+            name = pick.get("name", "")
+            names.append(f"{name} x{quantity}" if quantity > 1 else name)
+        if names:
+            summary_parts.append(", ".join(names))
+    return float(line_total), summary_parts
+
+
+def build_composite_cart_line(menu_item: dict, selections: dict) -> tuple[str, dict, str]:
+    line_total, summary_parts = compute_composite_totals(menu_item.get("price"), selections)
+    name = menu_item["name"]
+    cart_key = f"{menu_item['id']}_{uuid.uuid4().hex[:8]}"
+    line = {
+        "name": name,
+        "price": line_total,
+        "qty": 1,
+        "modifiers": selections,
+        "menu_item_id": menu_item["id"],
+    }
+    summary_text = f"{name} — {' + '.join(summary_parts)} — ₦{line_total:,.0f}"
+    return cart_key, line, summary_text
 
 
 async def show_current_group(callback: CallbackQuery, state: FSMContext):
@@ -479,36 +510,17 @@ async def advance_to_next_group(callback: CallbackQuery, state: FSMContext):
 
 
 async def finalize_composite_selection(callback: CallbackQuery, state: FSMContext):
-    """Build the cart line: base item price + sum of all modifier price_delta * qty."""
     data = await state.get_data()
     menu_item = (
         supabase.table("menu_items").select("*").eq("id", data["menu_item_id"]).single().execute().data
     )
 
-    modifier_total = 0
-    summary_lines = []
-    for group_id, picks in data["selections"].items():
-        names = []
-        for p in picks:
-            modifier_total += p["price_delta"] * p["quantity"]
-            names.append(f"{p['name']} x{p['quantity']}" if p["quantity"] > 1 else p["name"])
-        summary_lines.append(", ".join(names))
-
-    line_total = menu_item["price"] + modifier_total
-    summary_text = f"{menu_item['name']} — " + " + ".join(summary_lines) + f" — ₦{line_total:,.0f}"
+    cart_key, cart_line, summary_text = build_composite_cart_line(menu_item, data["selections"])
 
     # Add to cart in FSM data (same place your existing simple-item flow stores cart items)
     data = await state.get_data()
     cart = data.get("cart", {})
-    cart_key = f"{data['menu_item_id']}_{uuid.uuid4().hex[:8]}"  # unique key for this composite selection
-    cart[cart_key] = {
-        
-        "name": menu_item["name"],
-        "price": line_total,  # use "price" (not "base_price") so existing cart code reads it correctly
-        "qty": 1,             # composite orders are always qty 1 per configured combo
-        "modifiers": data["selections"],
-        "menu_item_id": data["menu_item_id"],
-    }
+    cart[cart_key] = cart_line
     await state.update_data(cart=cart)
 
     await callback.message.edit_text(f"Added to cart:\n{summary_text}")
@@ -520,27 +532,10 @@ async def finalize_composite_selection_via_message(message: types.Message, state
     data = await state.get_data()
     menu_item = supabase.table("menu_items").select("*").eq("id", data["menu_item_id"]).single().execute().data
 
-    modifier_total = 0
-    summary_lines = []
-    for group_id, picks in data["selections"].items():
-        names = []
-        for p in picks:
-            modifier_total += p["price_delta"] * p["quantity"]
-            names.append(f"{p['name']} x{p['quantity']}" if p["quantity"] > 1 else p["name"])
-        summary_lines.append(", ".join(names))
-
-    line_total = menu_item["price"] + modifier_total
-    summary_text = f"{menu_item['name']} — " + " + ".join(summary_lines) + f" — ₦{line_total:,.0f}"
+    cart_key, cart_line, summary_text = build_composite_cart_line(menu_item, data["selections"])
 
     cart = data.get("cart", {})
-    cart_key = f"{data['menu_item_id']}_{uuid.uuid4().hex[:8]}"
-    cart[cart_key] = {
-        "name": menu_item["name"],
-        "price": line_total,
-        "qty": 1,
-        "modifiers": data["selections"],
-        "menu_item_id": data["menu_item_id"],
-    }
+    cart[cart_key] = cart_line
     await state.update_data(cart=cart)
     await message.answer(f"Added to cart:\n{summary_text}")
     await state.set_state(None)
@@ -2004,7 +1999,7 @@ async def create_order_in_db(
         delivery_address = format_delivery_coordinates(delivery_lat, delivery_lon)
         await state.update_data(delivery_address=delivery_address)
 
-    shortages = await validate_cart_inventory(cart)
+    shortages = await validate_cart_inventory(cart, restaurant_id)
     if shortages:
         details = "; ".join(
             f"{item['name']} has {item['available']} left, requested {item['requested']}"
@@ -2662,7 +2657,7 @@ async def reject_payment_handler(callback_query: types.CallbackQuery, bot: Bot):
     
     # Get order details
     order = supabase.table("orders")\
-        .select("telegram_user_id, customer_contact, order_channel, restaurant_id, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
+        .select("telegram_user_id, customer_contact, order_channel, order_type, restaurant_id, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
         .eq("id", order_id)\
         .execute()
 
@@ -3696,7 +3691,7 @@ async def pending_orders(message: types.Message):
 
 
 @dp.message(Command("board"))
-async def manual_order_board_refresh(message: types.Message):
+async def manual_order_board_refresh(message: types.Message, bot: Bot):
     chat_id = message.chat.id
 
     restaurant = supabase.table("restaurants")\
@@ -3708,7 +3703,7 @@ async def manual_order_board_refresh(message: types.Message):
         await message.answer("⚠️ This command only works in a registered kitchen group.")
         return
 
-    await refresh_kitchen_order_board(restaurant.data[0]["id"])
+    await refresh_kitchen_order_board(bot, restaurant.data[0]["id"])
     await message.answer("📋 Live order board refreshed.")
 
 
