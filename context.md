@@ -140,10 +140,14 @@ Use this as the implementation order. It reflects the feature delta observed in 
 3. ~~**Add WhatsApp Paystack.**~~ ✅ Done. `start_paystack_payment()` in `whatsapp.py` creates a pending order, generates a Paystack link using a deterministic `<digits>@chowlin.ng` email, and sends the checkout URL. The Paystack webhook in `main.py` handles confirmation for both channels.
 4. ~~**Support pickup and delivery configuration.**~~ ✅ Done. WhatsApp presents delivery/pickup choice when `pickup_enabled` is true. Flat fee and zone-based delivery fees are applied before payment. `handle_unusable_zone_config()` falls back to flat fee or pickup.
 5. ~~**Support delivery zones and totals.**~~ ✅ Done. Zone selection uses a WhatsApp interactive list (capped at `MAX_WHATSAPP_LIST_ROWS`). Zone fee is saved to state and added to `total_price` before order creation.
-6. **Add catalog validation before order creation.** The WhatsApp cart mapping currently does not reject inactive/unavailable items and does not support composite modifiers. Query current `is_available`, aggregate duplicate retailer ids safely, validate inventory, and give a clear resubmit-cart response.
+6. ~~**Add catalog validation before order creation.**~~ ✅ Done. `build_authoritative_cart()` validates mapped items and inventory in batched queries, aggregates duplicate catalog lines, and reports invalid lines. Valid lines can proceed after a partial-cart confirmation in state `confirming_partial_cart`. Before bank-transfer order creation, stock conflicts are sent to the kitchen with the payment proof; the customer is told to keep the receipt while the restaurant resolves the issue.
 7. **Add customer commands/menu actions that fit WhatsApp.** At minimum: start/help, current-order status, recent orders/reorder, cancel before preparation, and a way to recover an abandoned session. Use WhatsApp list/button constraints and conversational text rather than Telegram callbacks.
-8. **Handle composite items.** Meta catalog orders cannot represent modifier choices in the current mapping. A practical approach is detecting `item_type = composite` after catalog submission, then running a WhatsApp interactive-list/text state machine for `modifier_groups`, persisting the same `cart[item].modifiers` shape that Telegram uses.
+8. ~~**Handle composite items.**~~ ✅ Done when `WHATSAPP_COMPOSITES_ENABLED=true`. Composite catalog items run through a modifier state machine using `configuring_modifiers` and `entering_modifier_qty`, and save the same `cart[item].modifiers` shape used by Telegram. The flow re-fetches current groups/options and applies `MAX_COMPOSITE_UNITS = 5` across a cart. With the flag unset or false, composite catalog items are rejected with an explanation.
 9. **Add a WhatsApp operations layer only if required.** Telegram kitchen controls, reports, inventory, subscription alerts, and kitchen board are deliberately Telegram-oriented. If staff must use WhatsApp, build explicit staff authorization and commands rather than exposing those controls to every customer number.
+
+### WhatsApp message limits
+
+`send_list()` and `send_buttons()` bound their payloads before sending; `send_text()` caps text bodies. Keep within Meta's limits: list rows 10 total, row title 24 characters, row description 72 characters, list button label 20 characters, reply button title 20 characters, interactive body 1024 characters, and text body 4096 characters. Interactive reply IDs are validated rather than truncated.
 
 ## Safe implementation guidance
 
@@ -158,10 +162,29 @@ Use this as the implementation order. It reflects the feature delta observed in 
 
 ## Environment configuration
 
-Names observed in runtime code include:
+Set application variables in the repository-root `.env` file for Docker Compose (`docker-compose.yml` loads it into the container). For a non-Compose deployment, set the same variables in the application service's environment configuration. Keep secret values out of this file and out of source control. `CHOWLIN_HOST_PORT` is read by Compose for the host-side port mapping only.
 
-`TOKEN`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `FASTAPI_WEBHOOK_URL`, `N8N_WEBHOOK_URL`, `N8N_UPDATE_WEBHOOK_URL`, `N8N_HEARTBEAT_URL`, `ADMIN_TELEGRAM_ID`, `ADMIN_API_KEY`, `RUSH_HOUR_PENDING_THRESHOLD`, `PAYSTACK_SECRET_KEY`, `PAYSTACK_COMMISSION_PERCENTAGE`,
-`WHATSAPP_COMPOSITES_ENABLED`, and `WHATSAPP_VERIFY_TOKEN`.
+Runtime environment variables:
+
+| Variable | Needed / default | Purpose |
+|---|---|---|
+| `TOKEN` | Required | Shared Telegram bot token. |
+| `SUPABASE_URL` | Required | Supabase project URL. |
+| `SUPABASE_SERVICE_KEY` | Required, secret | Supabase service-role key. |
+| `WHATSAPP_VERIFY_TOKEN` | Required to verify Meta's webhook | Must match the verification token configured in Meta. |
+| `FASTAPI_WEBHOOK_URL` | Optional; defaults to `https://telegram-n8n-restaurant-bot.onrender.com` | Public application base URL, used for webhook/payment callback URLs. |
+| `N8N_WEBHOOK_URL` | Optional; defaults to the configured Chowlin n8n new-order URL | Sends new-order events to n8n. |
+| `N8N_UPDATE_WEBHOOK_URL` | Optional; defaults to the configured Chowlin n8n update URL | Sends order updates to n8n. |
+| `N8N_HEARTBEAT_URL` | Optional; defaults to the configured Chowlin n8n heartbeat URL | Sends service heartbeat events. |
+| `ADMIN_TELEGRAM_ID` | Optional for restricted admin commands | Telegram ID authorized for admin-only actions. |
+| `ADMIN_API_KEY` | Required to use the protected admin HTTP endpoints | Secret sent in the `X-Admin-Key` header. |
+| `RUSH_HOUR_PENDING_THRESHOLD` | Optional; defaults to `5` | Pending-order threshold for kitchen rush alerts. |
+| `PAYSTACK_SECRET_KEY` | Required to use Paystack | Paystack API/webhook secret. |
+| `PAYSTACK_COMMISSION_PERCENTAGE` | Optional; defaults to `5` | Paystack commission percentage used by payment calculations. |
+| `WHATSAPP_COMPOSITES_ENABLED` | Optional; defaults to `false` | Set to `true` to enable WhatsApp composite modifier selection; false/unset rejects composite catalog items. |
+| `CHOWLIN_HOST_PORT` | Optional; defaults to `8001` | Host port published by Docker Compose; container port remains `8001`. |
+
+The old standalone `boted.py` and helper scripts mention `BOT_TOKEN` and `KITCHEN_CHAT_ID`; they are not part of the current Docker Compose runtime. Do not add them unless deploying those scripts separately.
 
 WhatsApp restaurant credentials are stored per tenant in `restaurants`: `whatsapp_phone_number_id`, `whatsapp_business_account_id`, and `whatsapp_access_token`.
 
