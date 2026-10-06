@@ -648,6 +648,11 @@ async def deduct_inventory_for_order(order_id: str):
     return response.data or []
 
 
+async def restore_inventory_for_order(order_id: str):
+    response = supabase.rpc("restore_order_inventory", {"p_order_id": order_id}).execute()
+    return response.data or []
+
+
 def format_money(amount) -> str:
     return f"₦{float(amount):,.0f}"
 

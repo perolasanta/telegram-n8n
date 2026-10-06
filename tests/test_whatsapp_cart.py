@@ -22,6 +22,7 @@ from whatsapp import (
     build_modifier_rows,
     build_reorder_catalog_rows,
     build_stock_conflict_caption,
+    can_self_cancel,
     classify_cart_lines,
     format_order_status_line,
     format_partial_cart_body,
@@ -99,6 +100,26 @@ class TestOrderStatusFormatting(unittest.TestCase):
             "id": "order-123", "order_status": "pending", "payment_method": "Bank Transfer",
             "payment_status": "pending", "total_amount": 2500,
         }))
+
+
+class TestSelfCancellationPolicy(unittest.TestCase):
+
+    def test_only_pending_cash_and_pay_on_delivery_orders_are_cancellable(self):
+        for payment_method in ("Cash Payment", "Pay on Delivery"):
+            with self.subTest(payment_method=payment_method):
+                self.assertTrue(can_self_cancel({
+                    "order_status": "pending", "payment_method": payment_method,
+                }))
+        for payment_method in ("Bank Transfer", "Paystack", "Other"):
+            with self.subTest(payment_method=payment_method):
+                self.assertFalse(can_self_cancel({
+                    "order_status": "pending", "payment_method": payment_method,
+                }))
+        for status in ("preparing", "ready", "delivered", "cancelled"):
+            with self.subTest(status=status):
+                self.assertFalse(can_self_cancel({
+                    "order_status": status, "payment_method": "Cash Payment",
+                }))
 
 
 class TestReorderCatalogAdapter(unittest.TestCase):

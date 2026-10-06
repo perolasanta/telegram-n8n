@@ -23,6 +23,8 @@ from bot import (
     create_paystack_payment_link,
     deduct_inventory_for_order,
     is_subscription_active,
+    refresh_kitchen_order_board,
+    restore_inventory_for_order,
     send_order_to_kitchen,
     send_order_receipt,
     send_restock_alert,
@@ -702,6 +704,13 @@ def format_order_status_line(order: dict) -> str:
         }.get(order_status, "Received")
     total = f"{money(order.get('total_amount')):,.0f}"
     return f"#{order_id} — {status_label} — ₦{total}"
+
+
+def can_self_cancel(order: dict) -> bool:
+    return (
+        order.get("order_status") == "pending"
+        and order.get("payment_method") in {"Cash Payment", "Pay on Delivery"}
+    )
 
 
 async def validate_cart_inventory_and_drop_shortages(cart: dict, problems: list[str], restaurant_id: str):
@@ -1559,6 +1568,120 @@ async def send_customer_order_history(state, restaurant, from_number, supabase):
     )
 
 
+async def send_cancellable_orders(state, restaurant, from_number, supabase):
+    result = supabase.table("orders").select(
+        "id, created_at, order_status, payment_method, payment_status, total_amount"
+    ).eq("restaurant_id", restaurant["id"]).eq(
+        "order_channel", "whatsapp"
+    ).eq("customer_contact", from_number).eq(
+        "order_status", "pending"
+    ).in_("payment_method", ["Cash Payment", "Pay on Delivery"]).order(
+        "created_at", desc=True
+    ).limit(5).execute()
+    orders = result.data or []
+    if not orders:
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "You have no orders that can be cancelled. If your order is already being prepared, please contact the restaurant.",
+        )
+        return
+    rows = []
+    for order in orders:
+        order_id = str(order.get("id") or "")
+        created_at = str(order.get("created_at") or "Date unknown").split("T", 1)[0]
+        rows.append({
+            "id": f"cancel:{order_id}",
+            "title": format_order_status_line(order),
+            "description": f"{created_at}, {order.get('payment_method') or 'Payment'}",
+        })
+    await state.set_state("browsing_orders")
+    await send_list(
+        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+        "Choose a pending order to cancel.", "Orders", rows,
+    )
+
+
+async def begin_order_cancellation(order_id, state, restaurant, from_number, supabase):
+    order = await fetch_customer_order(
+        supabase, order_id, restaurant["id"], from_number,
+        "id, order_status, payment_method, payment_status",
+    )
+    if not order or not can_self_cancel(order):
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "Please contact the restaurant to cancel this order.",
+        )
+        return
+    await state.update_data(cancel_order_id=str(order.get("id") or ""))
+    await state.set_state("confirming_cancel")
+    await send_buttons(
+        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+        "Are you sure you want to cancel this order?",
+        [
+            {"id": f"cancel_yes:{order_id}", "title": "Yes, cancel"},
+            {"id": "cancel_no", "title": "No, keep it"},
+        ],
+    )
+
+
+async def confirm_order_cancellation(order_id, state, restaurant, from_number, supabase, bot):
+    data = await state.get_data()
+    if str(data.get("cancel_order_id") or "") != order_id:
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "Please use the buttons for the current order.",
+        )
+        return
+    result = supabase.table("orders").update({
+        "order_status": "cancelled",
+    }).eq("id", order_id).eq(
+        "order_status", "pending"
+    ).eq("restaurant_id", restaurant["id"]).eq(
+        "order_channel", "whatsapp"
+    ).eq("customer_contact", from_number).in_(
+        "payment_method", ["Cash Payment", "Pay on Delivery"]
+    ).select("id").execute()
+    if not result.data:
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "Sorry, the kitchen has already started this order. Please contact the restaurant.",
+        )
+        await state.clear()
+        return
+
+    try:
+        restored_items = await restore_inventory_for_order(order_id)
+        for item in restored_items:
+            if (item.get("inventory_count") or 0) > 0:
+                try:
+                    await sync_catalog_item_availability(item.get("id"), True, supabase)
+                except Exception:
+                    logging.exception("Failed to sync restored menu item availability")
+    except Exception:
+        logging.exception("Failed to restore inventory for cancelled order %s", order_id)
+
+    kitchen_chat_id = restaurant.get("kitchen_chat_id")
+    if kitchen_chat_id:
+        kitchen_bot = delivery_bots.get(restaurant["id"], bot)
+        try:
+            await kitchen_bot.send_message(
+                kitchen_chat_id,
+                html.escape(f"ORDER #{order_id[:8]} CANCELLED by customer"),
+            )
+        except Exception:
+            logging.exception("Failed to notify kitchen of cancelled order %s", order_id)
+    try:
+        await refresh_kitchen_order_board(bot, restaurant["id"])
+    except Exception:
+        logging.exception("Failed to refresh kitchen board after cancelling order %s", order_id)
+
+    await send_text(
+        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+        f"Your order #{order_id[:8]} has been cancelled.",
+    )
+    await state.clear()
+
+
 async def show_customer_order(order_id, restaurant, from_number, supabase):
     order = await fetch_customer_order(
         supabase, order_id, restaurant["id"], from_number,
@@ -1637,11 +1760,7 @@ async def handle_command_reply(reply_id, state, restaurant, from_number, supabas
     elif reply_id == "cmd_help":
         await send_whatsapp_main_menu(restaurant, from_number)
     elif reply_id == "cmd_cancel":
-        # TODO: implement pre-preparation cancellation.
-        await send_text(
-            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            "Coming soon",
-        )
+        await send_cancellable_orders(state, restaurant, from_number, supabase)
 
 
 async def handle_interactive(msg, state, restaurant, from_number, supabase, bot, current_state):
@@ -1653,6 +1772,26 @@ async def handle_interactive(msg, state, restaurant, from_number, supabase, bot,
     if isinstance(reply_id, str) and reply_id.startswith("cmd_"):
         if current_state in (None, "browsing_orders"):
             await handle_command_reply(reply_id, state, restaurant, from_number, supabase, bot, current_state)
+        return
+    if isinstance(reply_id, str) and reply_id.startswith("cancel_yes:"):
+        if current_state == "confirming_cancel":
+            await confirm_order_cancellation(
+                reply_id.partition(":")[2], state, restaurant, from_number, supabase, bot
+            )
+        return
+    if reply_id == "cancel_no":
+        if current_state == "confirming_cancel":
+            await state.clear()
+            await send_text(
+                restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                "No problem, your order is unchanged.",
+            )
+        return
+    if isinstance(reply_id, str) and reply_id.startswith("cancel:"):
+        if current_state in (None, "browsing_orders"):
+            await begin_order_cancellation(
+                reply_id.partition(":")[2], state, restaurant, from_number, supabase
+            )
         return
     if isinstance(reply_id, str) and reply_id.startswith("hist:"):
         if current_state in (None, "browsing_orders"):
