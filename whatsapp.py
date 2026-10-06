@@ -43,13 +43,13 @@ def money(value) -> Decimal:
         return Decimal("0")
 
 
-def truncate(text: str, max_length: int) -> str:
-    text = str(text or "")
-    if len(text) <= max_length:
+def truncate(text, limit: int) -> str:
+    text = str(text or "").strip()
+    if len(text) <= limit:
         return text
-    if max_length <= 1:
-        return text[:max_length]
-    return text[:max_length - 1] + "…"
+    if limit <= 0:
+        return ""
+    return text[:limit - 1].rstrip() + "…"
 
 
 def build_modifier_rows(group_id: str, group: dict, options: list[dict], page: int = 0) -> tuple[list[dict], int, int]:
@@ -179,35 +179,71 @@ async def send_whatsapp_message(phone_number_id: str, token: str, to: str, paylo
 
 
 async def send_text(phone_number_id, token, to, text):
-    await send_whatsapp_message(phone_number_id, token, to, {"type": "text", "text": {"body": text}})
+    await send_whatsapp_message(
+        phone_number_id, token, to,
+        {"type": "text", "text": {"body": truncate(text, 4096)}},
+    )
 
 
-async def send_list(phone_number_id: str, token: str, to: str, body: str, button_label: str, rows: list[dict]):
-    """Send a Meta interactive list; callers must explicitly handle over-limit data."""
+def build_list_payload(body: str, button_label: str, rows: list[dict]) -> dict:
     if not rows or len(rows) > MAX_WHATSAPP_LIST_ROWS:
         raise ValueError("WhatsApp interactive lists must contain 1–10 rows")
-    await send_whatsapp_message(phone_number_id, token, to, {
+    safe_rows = []
+    for row in rows:
+        row_id = row.get("id")
+        if len(str(row_id or "")) > 200:
+            raise ValueError("WhatsApp list row ids must be at most 200 characters")
+        title = truncate(row.get("title"), 24)
+        if not title:
+            raise ValueError("WhatsApp list row titles cannot be empty")
+        safe_row = {**row, "title": title}
+        description = truncate(row.get("description"), 72)
+        if description:
+            safe_row["description"] = description
+        else:
+            safe_row.pop("description", None)
+        safe_rows.append(safe_row)
+    return {
         "type": "interactive",
         "interactive": {
             "type": "list",
-            "body": {"text": body},
-            "action": {"button": button_label, "sections": [{"title": "Options", "rows": rows}]},
+            "body": {"text": truncate(body, 1024)},
+            "action": {
+                "button": truncate(button_label, 20),
+                "sections": [{"title": "Options", "rows": safe_rows}],
+            },
         },
-    })
+    }
 
 
-async def send_buttons(phone_number_id: str, token: str, to: str, body: str, buttons: list[dict]):
-    """Send a Meta interactive quick-reply message. Meta allows at most 3 buttons."""
+def build_buttons_payload(body: str, buttons: list[dict]) -> dict:
     if not buttons or len(buttons) > 3:
         raise ValueError("WhatsApp interactive buttons must contain 1-3 options")
-    await send_whatsapp_message(phone_number_id, token, to, {
+    safe_buttons = []
+    for button in buttons:
+        button_id = button.get("id")
+        if len(str(button_id or "")) > 256:
+            raise ValueError("WhatsApp button ids must be at most 256 characters")
+        title = truncate(button.get("title"), 20)
+        if not title:
+            raise ValueError("WhatsApp button titles cannot be empty")
+        safe_buttons.append({**button, "title": title})
+    return {
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {"text": body},
-            "action": {"buttons": [{"type": "reply", "reply": b} for b in buttons]},
+            "body": {"text": truncate(body, 1024)},
+            "action": {"buttons": [{"type": "reply", "reply": button} for button in safe_buttons]},
         },
-    })
+    }
+
+
+async def send_list(phone_number_id: str, token: str, to: str, body: str, button_label: str, rows: list[dict]):
+    await send_whatsapp_message(phone_number_id, token, to, build_list_payload(body, button_label, rows))
+
+
+async def send_buttons(phone_number_id: str, token: str, to: str, body: str, buttons: list[dict]):
+    await send_whatsapp_message(phone_number_id, token, to, build_buttons_payload(body, buttons))
 
 
 async def send_payment_options(phone_number_id, token, to, order_type: str, paystack_enabled: bool):
@@ -797,7 +833,7 @@ async def next_composite_unit(state, restaurant, from_number):
         else:
             await send_text(
                 restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-                f"{active_unit.get('name', 'This item')} is temporarily unavailable.",
+                f"{truncate(active_unit.get('name', 'This item'), 100)} is temporarily unavailable.",
             )
         await next_composite_unit(state, restaurant, from_number)
         return
@@ -810,7 +846,7 @@ async def next_composite_unit(state, restaurant, from_number):
     if unavailable_required:
         await send_text(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            f"{active_unit.get('name', 'This item')} is temporarily unavailable.",
+            f"{truncate(active_unit.get('name', 'This item'), 100)} is temporarily unavailable.",
         )
         await next_composite_unit(state, restaurant, from_number)
         return
@@ -833,7 +869,7 @@ async def render_modifier_group(state, restaurant, from_number):
     if int(group.get("min_select") or 0) > 0 and not options:
         await send_text(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            f"{active_unit.get('name', 'This item')} is temporarily unavailable.",
+            f"{truncate(active_unit.get('name', 'This item'), 100)} is temporarily unavailable.",
         )
         await next_composite_unit(state, restaurant, from_number)
         return
@@ -842,20 +878,20 @@ async def render_modifier_group(state, restaurant, from_number):
     await state.update_data(active_unit=active_unit)
     prompt = "Choose one" if group.get("selection_mode") == "single" else "Choose one or more"
     body_lines = [
-        f"{active_unit.get('name', 'Item')} (unit {active_unit.get('unit_no', 1)} of {active_unit.get('units_total', 1)})",
-        group.get("name", "Choose an option"),
+        f"{truncate(active_unit.get('name', 'Item'), 100)} (unit {active_unit.get('unit_no', 1)} of {active_unit.get('units_total', 1)})",
+        truncate(group.get("name", "Choose an option"), 100),
         prompt,
     ]
     selected = (active_unit.get("selections") or {}).get(group["id"], [])
     if group.get("selection_mode") == "multi" and selected:
         selected_names = [
-            f"{pick.get('name', 'Option')} x{pick.get('quantity', 1)}" if int(pick.get("quantity") or 1) > 1 else pick.get("name", "Option")
+            f"{truncate(pick.get('name', 'Option'), 80)} x{pick.get('quantity', 1)}" if int(pick.get("quantity") or 1) > 1 else truncate(pick.get("name", "Option"), 100)
             for pick in selected
         ]
         body_lines.append("Selected: " + ", ".join(selected_names))
     note = data.get("modifier_note")
     if note:
-        body_lines.insert(0, note)
+        body_lines.insert(0, truncate(note, 200))
         await state.update_data(modifier_note=None)
     body = truncate("\n".join(body_lines), 1000)
     await send_list(
@@ -873,7 +909,7 @@ async def finish_composite_unit(state, restaurant, from_number):
     if not menu_item_result.data or not menu_item_result.data[0].get("is_available"):
         await send_text(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            f"{active_unit.get('name', 'This item')} is temporarily unavailable.",
+            f"{truncate(active_unit.get('name', 'This item'), 100)} is temporarily unavailable.",
         )
         await next_composite_unit(state, restaurant, from_number)
         return
@@ -898,7 +934,7 @@ async def finish_composite_unit(state, restaurant, from_number):
             if not option or not option.get("is_available"):
                 await send_text(
                     restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-                    f"{(option or {}).get('name') or pick.get('name') or 'An option'} is no longer available. "
+                    f"{truncate((option or {}).get('name') or pick.get('name') or 'An option', 100)} is no longer available. "
                     "Please choose another option.",
                 )
                 selections[group_id] = [
@@ -986,7 +1022,7 @@ async def handle_cart_submission(msg, state, restaurant, from_number, contact_na
     if composites and not WHATSAPP_COMPOSITES_ENABLED:
         for composite in composites:
             problems.append(
-                f"{composite['name']} needs choices we can't take through the catalog yet. "
+                f"{truncate(composite.get('name'), 100)} needs choices we can't take through the catalog yet. "
                 "Please order it on Telegram or call the restaurant."
             )
         composites = []
@@ -994,7 +1030,7 @@ async def handle_cart_submission(msg, state, restaurant, from_number, contact_na
     if not cart and not composites:
         await state.clear()
         detail = "\n• ".join(problems) if problems else "no available items were found"
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ We couldn't accept this cart:\n• {detail}\n\nPlease update it and send it again.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ We couldn't accept this cart:\n• {truncate(detail, 900)}\n\nPlease update it and send it again.")
         return
     await state.update_data(
         cart=cart, restaurant_id=restaurant["id"], restaurant_name=restaurant["name"],
@@ -1052,7 +1088,7 @@ async def continue_after_delivery_address(state, restaurant, from_number):
     await state.set_state("waiting_for_delivery_zone")
     await send_list(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
                     "Choose the area closest to your delivery address.", "Choose zone", [
-                        {"id": f"zone:{zone['id']}", "title": zone["zone_name"], "description": f"₦{float(money(zone['fee'])):,.0f}"}
+                        {"id": f"zone:{zone['id']}", "title": truncate(zone.get("zone_name"), 24), "description": f"₦{float(money(zone.get('fee'))):,.0f}"}
                         for zone in zones
                     ])
 
@@ -1062,13 +1098,13 @@ async def handle_unusable_zone_config(state, restaurant, from_number, reason: st
     flat_fee = money(restaurant.get("delivery_fee_flat"))
     if flat_fee > 0:
         await state.update_data(delivery_fee=float(flat_fee), delivery_zone_id=None, delivery_zone_name=None)
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {reason}; using the restaurant's flat delivery fee of ₦{float(flat_fee):,.0f}.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(reason, 250)}; using the restaurant's flat delivery fee of ₦{float(flat_fee):,.0f}.")
         await request_payment_method(state, restaurant, from_number)
     elif restaurant.get("pickup_enabled"):
         await state.set_state("waiting_for_order_type")
-        await send_list(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {reason}. Delivery is unavailable; please choose pickup.", "Choose order type", [{"id": "order_type_pickup", "title": "Pickup"}])
+        await send_list(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(reason, 250)}. Delivery is unavailable; please choose pickup.", "Choose order type", [{"id": "order_type_pickup", "title": "Pickup"}])
     else:
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {reason}. Delivery is temporarily unavailable; please contact the restaurant.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(reason, 250)}. Delivery is temporarily unavailable; please contact the restaurant.")
         await state.clear()
 
 
@@ -1160,7 +1196,7 @@ async def handle_modifier_reply(reply_id, state, restaurant, from_number):
         await state.set_state("entering_modifier_qty")
         await send_text(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            f"How many {option.get('name', 'items')} ({option.get('unit_label') or 'units'})? Reply with a number from 1 to 20.",
+            f"How many {truncate(option.get('name', 'items'), 100)} ({truncate(option.get('unit_label') or 'units', 40)})? Reply with a number from 1 to 20.",
         )
         return
 
@@ -1254,7 +1290,7 @@ async def handle_location(msg, state, restaurant, from_number, current_state):
     # proceeding — mirrors the Telegram flow's confirm/retype step.
     await state.set_state("confirming_address")
     await send_buttons(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-                        f"📍 We found this address:\n\n{address}\n\nIs this correct?", [
+                        f"📍 We found this address:\n\n{truncate(address, 600)}\n\nIs this correct?", [
                             {"id": "address_confirmed", "title": "Yes, correct"},
                             {"id": "address_retype", "title": "No, retype"},
                         ])
@@ -1268,6 +1304,10 @@ async def handle_text(msg, state, restaurant, from_number, current_state):
         await handle_freeform_message(msg, state, restaurant, from_number, current_state)
         return
     address = ((msg.get("text") or {}).get("body") or "").strip()
+    if len(address) > 300:
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                        "Please send a shorter address (under 300 characters) or share a location pin.")
+        return
     if len(address) < 10:
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please send a complete delivery address or a location pin.")
         return
@@ -1286,7 +1326,7 @@ async def handle_freeform_message(msg, state, restaurant, from_number, current_s
     Kept as a simple, safe fallback until that agent is wired in.
     """
     await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-                    f"Hi! To order from {restaurant['name']}, please browse our WhatsApp catalog and send your cart. "
+                    f"Hi! To order from {truncate(restaurant.get('name'), 100)}, please browse our WhatsApp catalog and send your cart. "
                     "Need help? Just ask and we'll get back to you.")
 
 
@@ -1351,7 +1391,7 @@ async def handle_payment_selection(button_id, state, restaurant, from_number, su
     try:
         total = await recalculate_total(state, restaurant)
     except ValueError as exc:
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {exc}. Please send a new catalog cart.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}. Please send a new catalog cart.")
         return
     customer_name = data.get("customer_name", "Customer")
     if button_id == "pay_bank":
@@ -1362,7 +1402,7 @@ async def handle_payment_selection(button_id, state, restaurant, from_number, su
             return
         await state.update_data(payment_method="Bank Transfer")
         await state.set_state("waiting_for_payment_proof")
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"Bank Transfer Details\n\nAmount: ₦{float(total):,.0f}\nBank: {info['bank_name']}\nAccount Number: {info['account_number']}\nAccount Name: {info['account_name']}\n\nSend a screenshot of your payment receipt.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"Bank Transfer Details\n\nAmount: ₦{float(total):,.0f}\nBank: {truncate(info.get('bank_name'), 100)}\nAccount Number: {truncate(info.get('account_number'), 64)}\nAccount Name: {truncate(info.get('account_name'), 100)}\n\nSend a screenshot of your payment receipt.")
         return
     if button_id == "pay_paystack":
         await start_paystack_payment(state, restaurant, from_number, customer_name, total)
@@ -1378,7 +1418,7 @@ async def create_and_send_order(state, restaurant, from_number, customer_name, p
         await send_order_to_kitchen(bot, order_id, state, customer_name, from_number)
         low_stock_items = await deduct_inventory_for_order(order_id)
         await send_restock_alert(bot, restaurant["id"], restaurant.get("kitchen_chat_id"), low_stock_items)
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\nPayment: {payment_method}\n\nWe'll notify you when it is ready.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\nPayment: {truncate(payment_method, 100)}\n\nWe'll notify you when it is ready.")
         await send_order_receipt(bot, {
             "order_channel": "whatsapp",
             "customer_contact": from_number,
@@ -1386,7 +1426,7 @@ async def create_and_send_order(state, restaurant, from_number, customer_name, p
         }, order_id)
         await state.clear()
     except ValueError as exc:
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {exc}")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}")
     except Exception:
         logging.exception("WhatsApp order error")
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "❌ Something went wrong placing your order. Please try again or contact the restaurant.")
@@ -1403,7 +1443,7 @@ async def start_paystack_payment(state, restaurant, from_number, customer_name, 
         email = f"{''.join(character for character in from_number if character.isdigit())}@chowlin.ng"
         payment_url = await create_paystack_payment_link(order_id, float(total), email, restaurant["paystack_subaccount_code"])
         state.supabase.table("payments").insert({"order_id": order_id, "restaurant_id": restaurant["id"], "amount": str(total), "provider": "Paystack", "status": "pending", "provider_reference": order_id, "paystack_reference": order_id, "paystack_subaccount_code": restaurant["paystack_subaccount_code"]}).execute()
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order #{order_id[:8]} is pending payment.\nTotal: ₦{float(total):,.0f}\n\nComplete payment here:\n{payment_url}\n\nWe'll confirm payment and send your order to the kitchen.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order #{order_id[:8]} is pending payment.\nTotal: ₦{float(total):,.0f}\n\nComplete payment here:\n{truncate(payment_url, 2500)}\n\nWe'll confirm payment and send your order to the kitchen.")
         await state.clear()
     except Exception:
         logging.exception("WhatsApp Paystack setup failed")
@@ -1445,7 +1485,7 @@ async def handle_payment_proof(msg, state, restaurant, from_number, supabase, bo
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\n\nYour payment proof is being verified.")
         await state.clear()
     except ValueError as exc:
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {exc}")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}")
     except Exception:
         logging.exception("WhatsApp bank-transfer order error")
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "❌ Something went wrong. Please try again or contact the restaurant.")
