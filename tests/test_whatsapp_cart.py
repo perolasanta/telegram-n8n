@@ -28,6 +28,7 @@ from whatsapp import (
     filter_same_composite_units,
     parse_requested_items,
     parse_modifier_quantity,
+    parse_customer_intent,
     price_composite_line,
     recalculate_total,
     can_skip_group,
@@ -38,6 +39,35 @@ from whatsapp import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+class TestParseCustomerIntent(unittest.TestCase):
+
+    def test_supported_keywords(self):
+        expected = {
+            "status": "status", "track": "status", "my order": "status",
+            "orders": "history", "history": "history", "my orders": "history",
+            "cancel": "cancel", "restart": "restart", "reset": "restart",
+            "start over": "restart", "help": "help", "menu": "help",
+            "hi": "help", "hello": "help", "hey": "help", "start": "help",
+        }
+        for text, intent in expected.items():
+            with self.subTest(text=text):
+                self.assertEqual(parse_customer_intent(text), intent)
+
+    def test_case_punctuation_and_whitespace_are_normalized(self):
+        self.assertEqual(parse_customer_intent("  MY   ORDERS!!!  "), "history")
+        self.assertEqual(parse_customer_intent("\tStart over...\n"), "restart")
+
+    def test_near_misses_and_addresses_do_not_match(self):
+        for text in (
+            "cancel my order please",
+            "status update please",
+            "12 High Street, Lagos",
+            "14 My Order Road",
+            "hello there",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(parse_customer_intent(text))
 
 class TestWhatsAppAddonActive(unittest.TestCase):
 

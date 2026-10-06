@@ -5,10 +5,11 @@ used only to identify a menu item and requested quantity.
 """
 
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import html
 import logging
 import os
+import unicodedata
 
 import httpx
 from aiogram.types import BufferedInputFile
@@ -34,6 +35,7 @@ GRAPH_API = "https://graph.facebook.com/v25.0"
 MAX_WHATSAPP_LIST_ROWS = 10
 MAX_LINE_QTY = 50
 MAX_COMPOSITE_UNITS = 5
+SESSION_TTL_MINUTES = 120
 WHATSAPP_COMPOSITES_ENABLED = os.getenv("WHATSAPP_COMPOSITES_ENABLED", "false").lower() == "true"
 
 
@@ -57,6 +59,30 @@ def is_whatsapp_addon_active(restaurant: dict, now=None) -> bool:
     if current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=timezone.utc)
     return expiry > current_time.astimezone(timezone.utc)
+
+
+def parse_customer_intent(text: str) -> str | None:
+    normalized = " ".join(str(text or "").lower().split())
+    while normalized and unicodedata.category(normalized[-1]).startswith("P"):
+        normalized = normalized[:-1].rstrip()
+    return {
+        "status": "status",
+        "track": "status",
+        "my order": "status",
+        "orders": "history",
+        "history": "history",
+        "my orders": "history",
+        "cancel": "cancel",
+        "restart": "restart",
+        "reset": "restart",
+        "start over": "restart",
+        "help": "help",
+        "menu": "help",
+        "hi": "help",
+        "hello": "help",
+        "hey": "help",
+        "start": "help",
+    }.get(normalized)
 
 
 def truncate(text, limit: int) -> str:
@@ -471,8 +497,37 @@ async def handle_whatsapp_webhook(payload: dict, supabase, bot):
 
     try:
         state = WhatsAppState(supabase, from_number, restaurant["id"])
-        session = supabase.table("whatsapp_sessions").select("state").eq("phone_number", from_number).eq("restaurant_id", restaurant["id"]).execute()
-        current_state = session.data[0].get("state") if session.data else None
+        session = supabase.table("whatsapp_sessions").select("state, updated_at").eq(
+            "phone_number", from_number
+        ).eq("restaurant_id", restaurant["id"]).execute()
+        session_row = session.data[0] if session.data else {}
+        current_state = session_row.get("state")
+
+        if current_state is not None and msg.get("type") != "order":
+            updated_at = session_row.get("updated_at")
+            if updated_at:
+                try:
+                    session_updated_at = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+                    if session_updated_at.tzinfo is None:
+                        session_updated_at = session_updated_at.replace(tzinfo=timezone.utc)
+                    session_is_stale = session_updated_at < (
+                        datetime.now(timezone.utc) - timedelta(minutes=SESSION_TTL_MINUTES)
+                    )
+                except (TypeError, ValueError):
+                    logging.warning(
+                        "Invalid WhatsApp session timestamp: restaurant_id=%s from_number=%s",
+                        restaurant.get("id"), from_number,
+                    )
+                    session_is_stale = False
+                if session_is_stale:
+                    await state.clear()
+                    current_state = None
+                    if msg.get("type") == "interactive":
+                        await send_text(
+                            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                            "That order session expired. Send your cart again to start over.",
+                        )
+                        return
 
         if msg.get("type") == "order":
             await handle_cart_submission(msg, state, restaurant, from_number, contact_name, supabase)
@@ -481,7 +536,7 @@ async def handle_whatsapp_webhook(payload: dict, supabase, bot):
         elif msg.get("type") == "location":
             await handle_location(msg, state, restaurant, from_number, current_state)
         elif msg.get("type") == "text":
-            await handle_text(msg, state, restaurant, from_number, current_state)
+            await handle_text(msg, state, restaurant, from_number, current_state, supabase, bot)
         elif msg.get("type") == "image":
             await handle_payment_proof(msg, state, restaurant, from_number, supabase, bot, current_state)
     except Exception:
@@ -1051,7 +1106,12 @@ async def handle_cart_submission(msg, state, restaurant, from_number, contact_na
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "We're not accepting orders right now. Please try again later.")
         return
     cart, composites, problems = await build_authoritative_cart(msg.get("order") or {}, restaurant["id"], supabase)
+    await submit_authoritative_cart(
+        cart, composites, problems, state, restaurant, from_number, contact_name, supabase
+    )
 
+
+async def submit_authoritative_cart(cart, composites, problems, state, restaurant, from_number, contact_name, supabase):
     # Composite items cannot be completed through the catalog flow yet
     if composites and not WHATSAPP_COMPOSITES_ENABLED:
         for composite in composites:
@@ -1330,7 +1390,37 @@ async def handle_location(msg, state, restaurant, from_number, current_state):
                         ])
 
 
-async def handle_text(msg, state, restaurant, from_number, current_state):
+async def handle_text(msg, state, restaurant, from_number, current_state, supabase, bot):
+    text_data = msg.get("text") or {}
+    body = text_data.get("body") or "" if isinstance(text_data, dict) else ""
+    intent = parse_customer_intent(body)
+    if intent == "restart":
+        await state.clear()
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "Your session has been reset. Browse our catalog and send your cart to start a new order.",
+        )
+        return
+    if intent == "cancel" and current_state is not None and current_state not in (
+        "browsing_orders", "confirming_cancel"
+    ):
+        await state.clear()
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "Your current order was cancelled. Send a new cart anytime.",
+        )
+        return
+    if intent and current_state in (None, "browsing_orders"):
+        reply_id = {
+            "status": "cmd_status",
+            "history": "cmd_history",
+            "cancel": "cmd_cancel",
+            "help": "cmd_help",
+        }.get(intent)
+        if reply_id:
+            await handle_command_reply(reply_id, state, restaurant, from_number, supabase, bot, current_state)
+            return
+
     if current_state == "entering_modifier_qty":
         await handle_modifier_quantity(msg, state, restaurant, from_number)
         return
@@ -1351,17 +1441,32 @@ async def handle_text(msg, state, restaurant, from_number, current_state):
 
 
 async def handle_freeform_message(msg, state, restaurant, from_number, current_state):
-    """Handle idle-session text: no active checkout in progress.
+    await send_whatsapp_main_menu(restaurant, from_number)
 
-    This is the seam for a future AI/RAG assistant (menu questions, hours, FAQs).
-    It must stay read-only: never create orders, touch payment state, or write to
-    whatsapp_sessions here. If a future agent wants to nudge someone toward
-    ordering, have it reply with a prompt rather than attempting to build a cart.
-    Kept as a simple, safe fallback until that agent is wired in.
-    """
-    await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-                    f"Hi! To order from {truncate(restaurant.get('name'), 100)}, please browse our WhatsApp catalog and send your cart. "
-                    "Need help? Just ask and we'll get back to you.")
+
+async def send_whatsapp_main_menu(restaurant, from_number):
+    await send_list(
+        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+        f"Hi! To order from {restaurant.get('name', 'the restaurant')}, browse our WhatsApp catalog and send your cart. What would you like to do?",
+        "Menu",
+        [
+            {"id": "cmd_status", "title": "Order status"},
+            {"id": "cmd_history", "title": "Recent orders"},
+            {"id": "cmd_cancel", "title": "Cancel an order"},
+            {"id": "cmd_help", "title": "How to order"},
+        ],
+    )
+
+
+async def handle_command_reply(reply_id, state, restaurant, from_number, supabase, bot, current_state):
+    if reply_id == "cmd_help":
+        await send_whatsapp_main_menu(restaurant, from_number)
+    elif reply_id in {"cmd_status", "cmd_history", "cmd_cancel"}:
+        # TODO: implement order status, order history, and pre-preparation cancellation.
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "Coming soon",
+        )
 
 
 async def handle_interactive(msg, state, restaurant, from_number, supabase, bot, current_state):
@@ -1369,6 +1474,10 @@ async def handle_interactive(msg, state, restaurant, from_number, supabase, bot,
     if isinstance(reply_id, str) and (reply_id.startswith("mod:") or reply_id in {"mod_done", "mod_skip", "mod_more"}):
         if current_state == "configuring_modifiers":
             await handle_modifier_reply(reply_id, state, restaurant, from_number)
+        return
+    if isinstance(reply_id, str) and reply_id.startswith("cmd_"):
+        if current_state in (None, "browsing_orders"):
+            await handle_command_reply(reply_id, state, restaurant, from_number, supabase, bot, current_state)
         return
     if current_state == "confirming_same_for_all":
         if reply_id == "same_all":
