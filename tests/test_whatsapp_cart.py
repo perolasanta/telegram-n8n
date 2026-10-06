@@ -20,8 +20,10 @@ from whatsapp import (
     MAX_COMPOSITE_UNITS,
     WHATSAPP_COMPOSITES_ENABLED,
     build_modifier_rows,
+    build_reorder_catalog_rows,
     build_stock_conflict_caption,
     classify_cart_lines,
+    format_order_status_line,
     format_partial_cart_body,
     is_whatsapp_addon_active,
     expand_composite_queue,
@@ -68,6 +70,64 @@ class TestParseCustomerIntent(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(parse_customer_intent(text))
+
+
+class TestOrderStatusFormatting(unittest.TestCase):
+
+    def test_order_status_wording_and_totals(self):
+        for status, wording in {
+            "pending": "Received",
+            "preparing": "Being prepared",
+            "ready": "Ready",
+            "delivered": "Delivered",
+            "cancelled": "Cancelled",
+        }.items():
+            with self.subTest(status=status):
+                self.assertEqual(
+                    format_order_status_line({
+                        "id": "12345678-1234", "order_status": status, "total_amount": "1250.25",
+                    }),
+                    f"#12345678 — {wording} — ₦1,250",
+                )
+
+    def test_pending_payment_overrides(self):
+        self.assertIn("Awaiting payment", format_order_status_line({
+            "id": "order-123", "order_status": "pending", "payment_method": "Paystack",
+            "payment_status": "pending", "total_amount": 2500,
+        }))
+        self.assertIn("Payment being verified", format_order_status_line({
+            "id": "order-123", "order_status": "pending", "payment_method": "Bank Transfer",
+            "payment_status": "pending", "total_amount": 2500,
+        }))
+
+
+class TestReorderCatalogAdapter(unittest.TestCase):
+
+    def test_pseudo_rows_classify_like_catalog_rows(self):
+        menu_item = {
+            "id": "menu-item-1", "name": "Jollof Rice", "price": "2500.00",
+            "is_available": True, "item_type": "simple", "category_id": "cat-1",
+            "menu_categories": {"is_active": True},
+        }
+        requested, pseudo_rows = build_reorder_catalog_rows(
+            [{"menu_item_id": "menu-item-1", "quantity": 2}],
+            {"menu-item-1": menu_item},
+        )
+        catalog_rows = {
+            "retailer-1": {
+                "menu_item_id": "menu-item-1",
+                "menu_items": menu_item,
+            },
+        }
+        catalog_cart, catalog_composites, catalog_problems = classify_cart_lines(
+            {"retailer-1": 2}, catalog_rows,
+        )
+        reorder_cart, reorder_composites, reorder_problems = classify_cart_lines(
+            requested, pseudo_rows,
+        )
+        self.assertEqual(reorder_cart, catalog_cart)
+        self.assertEqual(reorder_composites, catalog_composites)
+        self.assertEqual(reorder_problems, catalog_problems)
 
 class TestWhatsAppAddonActive(unittest.TestCase):
 

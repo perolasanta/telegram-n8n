@@ -667,6 +667,63 @@ def classify_cart_lines(
     return cart, composites, problems
 
 
+def build_reorder_catalog_rows(order_items: list[dict], menu_items_by_id: dict) -> tuple[dict, dict]:
+    requested = {}
+    for item in order_items:
+        menu_item_id = item.get("menu_item_id")
+        try:
+            quantity = int(item.get("quantity") or 0)
+        except (TypeError, ValueError):
+            continue
+        if menu_item_id and quantity > 0:
+            requested[menu_item_id] = requested.get(menu_item_id, 0) + quantity
+    rows_by_id = {
+        menu_item_id: {"menu_item_id": menu_item_id, "menu_items": menu_items_by_id[menu_item_id]}
+        for menu_item_id in requested
+        if menu_item_id in menu_items_by_id
+    }
+    return requested, rows_by_id
+
+
+def format_order_status_line(order: dict) -> str:
+    order_id = str(order.get("id") or "")[:8]
+    order_status = str(order.get("order_status") or "pending").lower()
+    if order.get("payment_method") == "Paystack" and order.get("payment_status") == "pending":
+        status_label = "Awaiting payment"
+    elif order.get("payment_method") == "Bank Transfer" and order.get("payment_status") == "pending":
+        status_label = "Payment being verified"
+    else:
+        status_label = {
+            "pending": "Received",
+            "preparing": "Being prepared",
+            "ready": "Ready",
+            "delivered": "Delivered",
+            "cancelled": "Cancelled",
+        }.get(order_status, "Received")
+    total = f"{money(order.get('total_amount')):,.0f}"
+    return f"#{order_id} — {status_label} — ₦{total}"
+
+
+async def validate_cart_inventory_and_drop_shortages(cart: dict, problems: list[str], restaurant_id: str):
+    shortages = await validate_cart_inventory(cart, restaurant_id)
+    for shortage in shortages:
+        mid = shortage.get("menu_item_id") or next(
+            (key for key, line in cart.items() if line.get("name") == shortage["name"]), None
+        )
+        available = int(shortage.get("available") or 0)
+        name = shortage["name"]
+        requested_qty = int(shortage.get("requested") or 0)
+        if available <= 0:
+            problems.append(f"{name} is sold out")
+        else:
+            problems.append(f"Only {available} {name} left (you asked for {requested_qty})")
+        if mid and mid in cart:
+            del cart[mid]
+        else:
+            cart = {key: line for key, line in cart.items() if line.get("name") != name}
+    return cart, problems
+
+
 async def build_authoritative_cart(
     order_payload: dict, restaurant_id: str, supabase
 ) -> tuple[dict, list[dict], list[str]]:
@@ -693,25 +750,9 @@ async def build_authoritative_cart(
     cart, composites, classify_problems = classify_cart_lines(requested, rows_by_rid)
     problems.extend(classify_problems)
 
-    # Inventory validation — remove short lines and report shortages
-    shortages = await validate_cart_inventory(cart, restaurant_id)
-    for shortage in shortages:
-        mid = shortage.get("menu_item_id") or next(
-            (k for k, v in cart.items() if v.get("name") == shortage["name"]), None
-        )
-        available = int(shortage.get("available") or 0)
-        name = shortage["name"]
-        requested_qty = int(shortage.get("requested") or 0)
-        if available <= 0:
-            problems.append(f"{name} is sold out")
-        else:
-            problems.append(f"Only {available} {name} left (you asked for {requested_qty})")
-        # Remove the short line from the cart regardless of key form
-        if mid and mid in cart:
-            del cart[mid]
-        else:
-            cart = {k: v for k, v in cart.items() if v.get("name") != name}
-
+    cart, problems = await validate_cart_inventory_and_drop_shortages(
+        cart, problems, restaurant_id
+    )
     return cart, composites, problems
 
 
@@ -1458,11 +1499,145 @@ async def send_whatsapp_main_menu(restaurant, from_number):
     )
 
 
+async def fetch_customer_order(supabase, order_id, restaurant_id, from_number, select):
+    result = supabase.table("orders").select(select).eq(
+        "id", order_id
+    ).eq("restaurant_id", restaurant_id).eq(
+        "order_channel", "whatsapp"
+    ).eq("customer_contact", from_number).execute()
+    return result.data[0] if result.data else None
+
+
+async def send_customer_order_status(restaurant, from_number, supabase):
+    result = supabase.table("orders").select(
+        "id, order_status, payment_method, payment_status, total_amount"
+    ).eq("restaurant_id", restaurant["id"]).eq(
+        "order_channel", "whatsapp"
+    ).eq("customer_contact", from_number).in_(
+        "order_status", ["pending", "preparing", "ready"]
+    ).order("created_at", desc=True).limit(3).execute()
+    orders = result.data or []
+    if not orders:
+        body = "No active orders. Reply ORDERS to see your recent orders."
+    else:
+        body = "\n".join(format_order_status_line(order) for order in orders)
+    await send_text(
+        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+        body,
+    )
+
+
+async def send_customer_order_history(state, restaurant, from_number, supabase):
+    result = supabase.table("orders").select(
+        "id, created_at, order_status, payment_method, payment_status, total_amount"
+    ).eq("restaurant_id", restaurant["id"]).eq(
+        "order_channel", "whatsapp"
+    ).eq("customer_contact", from_number).order(
+        "created_at", desc=True
+    ).limit(5).execute()
+    orders = result.data or []
+    await state.set_state("browsing_orders")
+    if not orders:
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "You have no previous orders yet.",
+        )
+        return
+    rows = []
+    for order in orders:
+        order_id = str(order.get("id") or "")
+        status = format_order_status_line(order).split(" — ", 2)[1]
+        created_at = str(order.get("created_at") or "Date unknown").split("T", 1)[0]
+        rows.append({
+            "id": f"hist:{order_id}",
+            "title": f"#{order_id[:8]} ₦{money(order.get('total_amount')):,.0f}",
+            "description": f"{created_at}, {status}",
+        })
+    await send_list(
+        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+        "Choose a recent order to view or reorder.", "Orders", rows,
+    )
+
+
+async def show_customer_order(order_id, restaurant, from_number, supabase):
+    order = await fetch_customer_order(
+        supabase, order_id, restaurant["id"], from_number,
+        "id, total_amount, order_status, payment_method, payment_status, order_items(quantity, menu_items(name))",
+    )
+    if not order:
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "That order could not be found.",
+        )
+        return
+    item_lines = []
+    for item in order.get("order_items") or []:
+        menu_item = item.get("menu_items") or {}
+        item_lines.append(f"{item.get('quantity') or 0} x {truncate(menu_item.get('name') or 'Item', 100)}")
+    item_text = truncate("\n".join(item_lines) or "No item details available.", 3500)
+    await send_text(
+        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+        f"{item_text}\n\n{format_order_status_line(order)}",
+    )
+    await send_buttons(
+        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+        "Choose an action for this order.",
+        [
+            {"id": f"reorder:{order_id}", "title": "Reorder"},
+            {"id": "cmd_history", "title": "Back"},
+        ],
+    )
+
+
+async def reorder_customer_order(order_id, state, restaurant, from_number, supabase):
+    order = await fetch_customer_order(
+        supabase, order_id, restaurant["id"], from_number,
+        "id, customer_name",
+    )
+    if not order:
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "That order could not be found.",
+        )
+        return
+    old_items = supabase.table("order_items").select(
+        "menu_item_id, quantity"
+    ).eq("order_id", order["id"]).execute().data or []
+    menu_item_ids = list(dict.fromkeys(
+        item.get("menu_item_id") for item in old_items if item.get("menu_item_id")
+    ))
+    current_items = []
+    if menu_item_ids:
+        current_items = supabase.table("menu_items").select(
+            "id, name, price, is_available, item_type, category_id, menu_categories(is_active)"
+        ).in_("id", menu_item_ids).eq("restaurant_id", restaurant["id"]).execute().data or []
+    menu_items_by_id = {item.get("id"): item for item in current_items if item.get("id")}
+    requested, pseudo_rows = build_reorder_catalog_rows(old_items, menu_items_by_id)
+    cart, composites, problems = classify_cart_lines(requested, pseudo_rows)
+    cart, problems = await validate_cart_inventory_and_drop_shortages(
+        cart, problems, restaurant["id"]
+    )
+    if not await is_subscription_active(restaurant["id"]):
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "We're not accepting orders right now. Please try again later.",
+        )
+        return
+    await submit_authoritative_cart(
+        cart, composites, problems, state, restaurant, from_number,
+        order.get("customer_name") or "Customer", supabase,
+    )
+
+
 async def handle_command_reply(reply_id, state, restaurant, from_number, supabase, bot, current_state):
-    if reply_id == "cmd_help":
+    if reply_id == "cmd_status":
+        await send_customer_order_status(restaurant, from_number, supabase)
+    elif reply_id == "cmd_history":
+        await send_customer_order_history(state, restaurant, from_number, supabase)
+    elif reply_id == "cmd_help":
         await send_whatsapp_main_menu(restaurant, from_number)
-    elif reply_id in {"cmd_status", "cmd_history", "cmd_cancel"}:
-        # TODO: implement order status, order history, and pre-preparation cancellation.
+    elif reply_id == "cmd_cancel":
+        # TODO: implement pre-preparation cancellation.
         await send_text(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
             "Coming soon",
@@ -1478,6 +1653,16 @@ async def handle_interactive(msg, state, restaurant, from_number, supabase, bot,
     if isinstance(reply_id, str) and reply_id.startswith("cmd_"):
         if current_state in (None, "browsing_orders"):
             await handle_command_reply(reply_id, state, restaurant, from_number, supabase, bot, current_state)
+        return
+    if isinstance(reply_id, str) and reply_id.startswith("hist:"):
+        if current_state in (None, "browsing_orders"):
+            await show_customer_order(reply_id.partition(":")[2], restaurant, from_number, supabase)
+        return
+    if isinstance(reply_id, str) and reply_id.startswith("reorder:"):
+        if current_state in (None, "browsing_orders"):
+            await reorder_customer_order(
+                reply_id.partition(":")[2], state, restaurant, from_number, supabase
+            )
         return
     if current_state == "confirming_same_for_all":
         if reply_id == "same_all":
