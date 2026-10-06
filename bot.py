@@ -3541,6 +3541,57 @@ async def activate_restaurant(message: types.Message):
     await upgrade_restaurant(restaurant_id, days=days)
     await message.answer(f"✅ Restaurant activated for {days} days.")
 
+
+@dp.message(Command("set_whatsapp_addon"))
+async def set_whatsapp_addon(message: types.Message):
+    admin_telegram_id = int(ADMIN_TELEGRAM_ID)
+    if message.from_user.id != admin_telegram_id:
+        return  # silently ignore
+
+    args = message.text.split()
+    if len(args) not in (3, 4) or args[2].lower() not in {"on", "off"}:
+        await message.answer("Usage: /set_whatsapp_addon <restaurant_id> on|off [days]")
+        return
+
+    restaurant_id = args[1]
+    enabled = args[2].lower() == "on"
+    if enabled:
+        if len(args) == 4 and not args[3].isdigit():
+            await message.answer("Days must be a positive whole number.")
+            return
+        days = int(args[3]) if len(args) == 4 else 30
+        if days <= 0:
+            await message.answer("Days must be a positive whole number.")
+            return
+        expires_at = (datetime.now(pytz.utc) + timedelta(days=days)).isoformat()
+    else:
+        if len(args) == 4:
+            await message.answer("Usage: /set_whatsapp_addon <restaurant_id> on|off [days]")
+            return
+        days = None
+        expires_at = None
+
+    restaurant = supabase.table("restaurants").select("id, name").eq(
+        "id", restaurant_id
+    ).execute()
+    if not restaurant.data:
+        await message.answer("Restaurant not found.")
+        return
+
+    supabase.table("restaurants").update({
+        "whatsapp_addon_enabled": enabled,
+        "whatsapp_addon_expires_at": expires_at,
+    }).eq("id", restaurant_id).execute()
+
+    if enabled:
+        await message.answer(
+            f"✅ WhatsApp add-on enabled for {escape(str(restaurant.data[0].get('name') or restaurant_id))} for {days} days."
+        )
+    else:
+        await message.answer(
+            f"✅ WhatsApp add-on disabled for {escape(str(restaurant.data[0].get('name') or restaurant_id))}."
+        )
+
 # ========== TEST COMMANDS =============
 #Remove before deploying to production
 #@dp.message(Command("test_sub"))

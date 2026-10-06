@@ -7,6 +7,7 @@ dummy environment variables before any import from that module occurs.
 
 import os
 import unittest
+from datetime import datetime, timezone
 
 # Neutralise bot.py's module-level Bot / Supabase construction
 os.environ.setdefault("TOKEN", "123456:TEST_TOKEN")
@@ -22,6 +23,7 @@ from whatsapp import (
     build_stock_conflict_caption,
     classify_cart_lines,
     format_partial_cart_body,
+    is_whatsapp_addon_active,
     expand_composite_queue,
     filter_same_composite_units,
     parse_requested_items,
@@ -36,6 +38,41 @@ from whatsapp import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+class TestWhatsAppAddonActive(unittest.TestCase):
+
+    def setUp(self):
+        self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+    def test_disabled_addon_is_inactive(self):
+        self.assertFalse(is_whatsapp_addon_active({"whatsapp_addon_enabled": False}, self.now))
+
+    def test_enabled_addon_without_expiry_is_active(self):
+        self.assertTrue(is_whatsapp_addon_active({"whatsapp_addon_enabled": True}, self.now))
+
+    def test_future_expiry_is_active(self):
+        self.assertTrue(is_whatsapp_addon_active({
+            "whatsapp_addon_enabled": True,
+            "whatsapp_addon_expires_at": "2030-01-02T00:00:00+00:00",
+        }, self.now))
+
+    def test_past_expiry_is_inactive(self):
+        self.assertFalse(is_whatsapp_addon_active({
+            "whatsapp_addon_enabled": True,
+            "whatsapp_addon_expires_at": "2029-12-31T23:59:59+00:00",
+        }, self.now))
+
+    def test_z_suffixed_expiry_is_supported(self):
+        self.assertTrue(is_whatsapp_addon_active({
+            "whatsapp_addon_enabled": True,
+            "whatsapp_addon_expires_at": "2030-01-02T00:00:00Z",
+        }, self.now))
+
+    def test_naive_expiry_is_assumed_utc(self):
+        self.assertTrue(is_whatsapp_addon_active({
+            "whatsapp_addon_enabled": True,
+            "whatsapp_addon_expires_at": "2030-01-02T00:00:00",
+        }, self.now))
 
 class TestFormatPartialCartBody(unittest.TestCase):
 

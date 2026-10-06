@@ -5,6 +5,7 @@ used only to identify a menu item and requested quantity.
 """
 
 from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone
 import html
 import logging
 import os
@@ -41,6 +42,21 @@ def money(value) -> Decimal:
         return Decimal(str(value or 0))
     except (InvalidOperation, ValueError):
         return Decimal("0")
+
+
+def is_whatsapp_addon_active(restaurant: dict, now=None) -> bool:
+    if restaurant.get("whatsapp_addon_enabled") is not True:
+        return False
+    expires_at = restaurant.get("whatsapp_addon_expires_at")
+    if not expires_at:
+        return True
+    expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    return expiry > current_time.astimezone(timezone.utc)
 
 
 def truncate(text, limit: int) -> str:
@@ -428,12 +444,30 @@ async def handle_whatsapp_webhook(payload: dict, supabase, bot):
     contact_name = ((entry.get("contacts") or [{}])[0].get("profile") or {}).get("name", "Customer")
     response = supabase.table("restaurants").select(
         "id, name, kitchen_chat_id, whatsapp_phone_number_id, whatsapp_access_token, "
+        "whatsapp_addon_enabled, whatsapp_addon_expires_at, "
         "pickup_enabled, delivery_fee_type, delivery_fee_flat, paystack_enabled, paystack_subaccount_code"
     ).eq("whatsapp_phone_number_id", phone_number_id).execute()
     if not response.data:
         logging.error("No restaurant configured for whatsapp_phone_number_id=%s (message_id=%s)", phone_number_id, message_id)
         return
     restaurant = response.data[0]
+
+    if not is_whatsapp_addon_active(restaurant):
+        logging.warning(
+            "WhatsApp add-on is inactive: restaurant_id=%s message_id=%s",
+            restaurant.get("id"), message_id,
+        )
+        try:
+            await send_text(
+                restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                "Ordering on WhatsApp isn't available right now. Please contact the restaurant directly.",
+            )
+        except Exception:
+            logging.exception(
+                "Failed to notify customer that WhatsApp ordering is unavailable: restaurant_id=%s message_id=%s",
+                restaurant.get("id"), message_id,
+            )
+        return
 
     try:
         state = WhatsAppState(supabase, from_number, restaurant["id"])
