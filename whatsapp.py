@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import html
 import logging
 import os
+import re
 import unicodedata
 
 import httpx
@@ -38,6 +39,7 @@ MAX_WHATSAPP_LIST_ROWS = 10
 MAX_LINE_QTY = 50
 MAX_COMPOSITE_UNITS = 5
 SESSION_TTL_MINUTES = 120
+TABLE_BINDING_TTL_MINUTES = 180
 WHATSAPP_COMPOSITES_ENABLED = os.getenv("WHATSAPP_COMPOSITES_ENABLED", "false").lower() == "true"
 
 
@@ -46,6 +48,52 @@ def money(value) -> Decimal:
         return Decimal(str(value or 0))
     except (InvalidOperation, ValueError):
         return Decimal("0")
+
+
+def extract_table_ref(text: str) -> str | None:
+    match = re.search(r"ref:\s*([A-Za-z0-9_-]{1,64})(?![A-Za-z0-9_-])", str(text or ""), re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def is_binding_fresh(table_bound_at, now=None, ttl_minutes=TABLE_BINDING_TTL_MINUTES) -> bool:
+    if not table_bound_at:
+        return False
+    try:
+        bound_at = table_bound_at
+        if not isinstance(bound_at, datetime):
+            bound_at = datetime.fromisoformat(str(bound_at).replace("Z", "+00:00"))
+        if bound_at.tzinfo is None:
+            bound_at = bound_at.replace(tzinfo=timezone.utc)
+        current_time = now or datetime.now(timezone.utc)
+        if not isinstance(current_time, datetime):
+            current_time = datetime.fromisoformat(str(current_time).replace("Z", "+00:00"))
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        return current_time.astimezone(timezone.utc) - bound_at.astimezone(timezone.utc) <= timedelta(minutes=ttl_minutes)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+async def clear_table_binding(state):
+    data = await state.get_data()
+    for key in ("table_id", "table_number", "menu_filter", "table_bound_at"):
+        data.pop(key, None)
+    state.supabase.table("whatsapp_sessions").update({"data": data}).eq(
+        "phone_number", state.phone_number
+    ).eq("restaurant_id", state.restaurant_id).execute()
+
+
+async def clear_keeping_table_binding(state):
+    data = await state.get_data()
+    binding = {
+        key: data.get(key)
+        for key in ("table_id", "table_number", "menu_filter", "table_bound_at")
+    }
+    if not binding.get("table_id") or not is_binding_fresh(binding.get("table_bound_at")):
+        binding = {}
+    await state.clear()
+    if binding:
+        await state.update_data(**binding)
 
 
 def is_whatsapp_addon_active(restaurant: dict, now=None) -> bool:
@@ -607,6 +655,7 @@ def parse_requested_items(order_payload: dict) -> tuple[dict[str, int], list[str
 def classify_cart_lines(
     requested: dict[str, int],
     rows_by_rid: dict,
+    menu_filter: str | None = None,
 ) -> tuple[dict, list[dict], list[str]]:
     """Pure: classify catalog rows into simple cart lines, composites, and problems.
 
@@ -642,6 +691,12 @@ def classify_cart_lines(
         if category is not None and not category.get("is_active", True):
             problems.append(f"{name} is unavailable")
             continue
+        if menu_filter:
+            category_name = str((category or {}).get("name") or "")
+            required_prefix = f"{menu_filter} —".casefold()
+            if not category_name.casefold().startswith(required_prefix):
+                problems.append(f"{name} isn't on this table's menu")
+                continue
 
         menu_item_id = row.get("menu_item_id")
         item_type = menu_item.get("item_type") or "simple"
@@ -734,7 +789,7 @@ async def validate_cart_inventory_and_drop_shortages(cart: dict, problems: list[
 
 
 async def build_authoritative_cart(
-    order_payload: dict, restaurant_id: str, supabase
+    order_payload: dict, restaurant_id: str, supabase, menu_filter: str | None = None
 ) -> tuple[dict, list[dict], list[str]]:
     """Build a validated cart from a Meta order payload.
 
@@ -751,12 +806,12 @@ async def build_authoritative_cart(
     # ONE batched query for all retailer ids in this order
     result = supabase.table("menu_item_catalog_map").select(
         "catalog_retailer_id, menu_item_id, "
-        "menu_items(name, price, is_available, item_type, category_id, menu_categories(is_active))"
+        "menu_items(name, price, is_available, item_type, category_id, menu_categories(name, is_active))"
     ).in_("catalog_retailer_id", list(requested)).eq("restaurant_id", restaurant_id).execute()
 
     rows_by_rid: dict = {row["catalog_retailer_id"]: row for row in result.data or []}
 
-    cart, composites, classify_problems = classify_cart_lines(requested, rows_by_rid)
+    cart, composites, classify_problems = classify_cart_lines(requested, rows_by_rid, menu_filter)
     problems.extend(classify_problems)
 
     cart, problems = await validate_cart_inventory_and_drop_shortages(
@@ -869,6 +924,17 @@ def format_partial_cart_body(problems: list[str], max_length: int = 1000) -> str
 
 
 async def begin_delivery_or_pickup(state, restaurant, from_number):
+    data = await state.get_data()
+    if data.get("table_id") and is_binding_fresh(data.get("table_bound_at")):
+        await state.update_data(
+            order_type="dine_in", delivery_fee=0, delivery_zone_id=None,
+            delivery_zone_name=None, delivery_address=None,
+            delivery_lat=None, delivery_lon=None,
+        )
+        await request_payment_method(state, restaurant, from_number)
+        return
+    if data.get("table_id"):
+        await clear_table_binding(state)
     if restaurant.get("pickup_enabled"):
         await state.set_state("waiting_for_order_type")
         await send_list(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
@@ -1152,10 +1218,21 @@ async def apply_same_composite_to_queue(state, restaurant, from_number):
 
 
 async def handle_cart_submission(msg, state, restaurant, from_number, contact_name, supabase):
+    session_data = await state.get_data()
+    if session_data.get("table_id") and not is_binding_fresh(session_data.get("table_bound_at")):
+        await clear_table_binding(state)
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "Your table link has expired. Please scan the QR code on your table again to order for dine-in.",
+        )
+        return
     if not await is_subscription_active(restaurant["id"]):
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "We're not accepting orders right now. Please try again later.")
         return
-    cart, composites, problems = await build_authoritative_cart(msg.get("order") or {}, restaurant["id"], supabase)
+    menu_filter = session_data.get("menu_filter") if session_data.get("table_id") else None
+    cart, composites, problems = await build_authoritative_cart(
+        msg.get("order") or {}, restaurant["id"], supabase, menu_filter
+    )
     await submit_authoritative_cart(
         cart, composites, problems, state, restaurant, from_number, contact_name, supabase
     )
@@ -1443,6 +1520,50 @@ async def handle_location(msg, state, restaurant, from_number, current_state):
 async def handle_text(msg, state, restaurant, from_number, current_state, supabase, bot):
     text_data = msg.get("text") or {}
     body = text_data.get("body") or "" if isinstance(text_data, dict) else ""
+    table_ref = extract_table_ref(body)
+    if table_ref:
+        if current_state is not None:
+            await send_text(
+                restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                "Please finish or cancel your current order first (reply CANCEL), then scan the table QR code again.",
+            )
+            return
+        result = supabase.table("restaurant_tables").select(
+            "id, table_number, restaurant_id, menu_filter"
+        ).eq("public_code", table_ref).eq("is_active", True).eq(
+            "restaurant_id", restaurant["id"]
+        ).limit(1).execute()
+        if not result.data:
+            await send_text(
+                restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                "That table code isn't valid for this restaurant.",
+            )
+            return
+        if not await is_subscription_active(restaurant["id"]):
+            await send_text(
+                restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                "This restaurant isn't taking orders right now.",
+            )
+            return
+        row = result.data[0]
+        table_number = row.get("table_number")
+        if table_number is None or table_number == "EXTERNAL":
+            await clear_table_binding(state)
+            await send_text(
+                restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                f"Hi! To order from {truncate(restaurant.get('name') or 'the restaurant', 250)}, browse our WhatsApp catalog and send your cart.",
+            )
+            return
+        await state.update_data(
+            table_id=row.get("id"), table_number=table_number,
+            menu_filter=row.get("menu_filter"),
+            table_bound_at=datetime.now(timezone.utc).isoformat(),
+        )
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            f"Welcome to {truncate(restaurant.get('name') or 'the restaurant', 250)} (Table {truncate(table_number, 50)}). Open our catalog, add your items, and send your cart.",
+        )
+        return
     intent = parse_customer_intent(body)
     if intent == "restart":
         await state.clear()
@@ -1732,11 +1853,15 @@ async def reorder_customer_order(order_id, state, restaurant, from_number, supab
     current_items = []
     if menu_item_ids:
         current_items = supabase.table("menu_items").select(
-            "id, name, price, is_available, item_type, category_id, menu_categories(is_active)"
+            "id, name, price, is_available, item_type, category_id, menu_categories(name, is_active)"
         ).in_("id", menu_item_ids).eq("restaurant_id", restaurant["id"]).execute().data or []
     menu_items_by_id = {item.get("id"): item for item in current_items if item.get("id")}
     requested, pseudo_rows = build_reorder_catalog_rows(old_items, menu_items_by_id)
-    cart, composites, problems = classify_cart_lines(requested, pseudo_rows)
+    session_data = await state.get_data()
+    menu_filter = session_data.get("menu_filter") if (
+        session_data.get("table_id") and is_binding_fresh(session_data.get("table_bound_at"))
+    ) else None
+    cart, composites, problems = classify_cart_lines(requested, pseudo_rows, menu_filter)
     cart, problems = await validate_cart_inventory_and_drop_shortages(
         cart, problems, restaurant["id"]
     )
@@ -1891,7 +2016,7 @@ async def create_and_send_order(state, restaurant, from_number, customer_name, p
             "customer_contact": from_number,
             "restaurants": restaurant,
         }, order_id)
-        await state.clear()
+        await clear_keeping_table_binding(state)
     except ValueError as exc:
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}")
     except Exception:
@@ -1911,7 +2036,7 @@ async def start_paystack_payment(state, restaurant, from_number, customer_name, 
         payment_url = await create_paystack_payment_link(order_id, float(total), email, restaurant["paystack_subaccount_code"])
         state.supabase.table("payments").insert({"order_id": order_id, "restaurant_id": restaurant["id"], "amount": str(total), "provider": "Paystack", "status": "pending", "provider_reference": order_id, "paystack_reference": order_id, "paystack_subaccount_code": restaurant["paystack_subaccount_code"]}).execute()
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order #{order_id[:8]} is pending payment.\nTotal: ₦{float(total):,.0f}\n\nComplete payment here:\n{truncate(payment_url, 2500)}\n\nWe'll confirm payment and send your order to the kitchen.")
-        await state.clear()
+        await clear_keeping_table_binding(state)
     except Exception:
         logging.exception("WhatsApp Paystack setup failed")
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "❌ Could not create a Paystack payment link. Please choose another payment method.")
@@ -1950,7 +2075,7 @@ async def handle_payment_proof(msg, state, restaurant, from_number, supabase, bo
         order_id, _ = await create_order_in_db(None, state, "Bank Transfer", data.get("customer_name", "Customer"), "whatsapp", f"wa_media:{media_id}", from_number)
         await send_order_to_kitchen(bot, order_id, state, data.get("customer_name", "Customer"), from_number, BufferedInputFile(image_bytes, filename="payment_proof.jpg"))
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\n\nYour payment proof is being verified.")
-        await state.clear()
+        await clear_keeping_table_binding(state)
     except ValueError as exc:
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}")
     except Exception:

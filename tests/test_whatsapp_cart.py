@@ -7,7 +7,7 @@ dummy environment variables before any import from that module occurs.
 
 import os
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # Neutralise bot.py's module-level Bot / Supabase construction
 os.environ.setdefault("TOKEN", "123456:TEST_TOKEN")
@@ -24,9 +24,11 @@ from whatsapp import (
     build_stock_conflict_caption,
     can_self_cancel,
     classify_cart_lines,
+    extract_table_ref,
     format_order_status_line,
     format_partial_cart_body,
     is_whatsapp_addon_active,
+    is_binding_fresh,
     expand_composite_queue,
     filter_same_composite_units,
     parse_requested_items,
@@ -71,6 +73,54 @@ class TestParseCustomerIntent(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(parse_customer_intent(text))
+
+
+class TestTableBindingHelpers(unittest.TestCase):
+
+    def test_extract_table_ref_case_spacing_and_junk(self):
+        self.assertEqual(extract_table_ref("Hello REF:   Table_7-QR"), "Table_7-QR")
+        self.assertIsNone(extract_table_ref("reference: table-1"))
+        self.assertIsNone(extract_table_ref("ref: !!!"))
+
+    def test_extract_table_ref_rejects_over_length_code(self):
+        self.assertIsNone(extract_table_ref("ref:" + "a" * 65))
+
+    def test_binding_freshness_boundary_and_invalid_value(self):
+        bound = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        boundary = bound + timedelta(minutes=180)
+        self.assertTrue(is_binding_fresh(bound.isoformat(), boundary))
+        self.assertFalse(is_binding_fresh(bound.isoformat(), boundary + timedelta(microseconds=1)))
+        self.assertTrue(is_binding_fresh("2026-01-01T00:00:00", bound))
+        self.assertFalse(is_binding_fresh("not-a-timestamp", bound))
+
+
+class TestCartMenuFilter(unittest.TestCase):
+
+    def setUp(self):
+        self.requested = {"retailer-1": 1}
+        self.rows = {"retailer-1": {
+            "menu_item_id": "item-1",
+            "menu_items": {
+                "name": "Jollof Rice", "price": "1200", "is_available": True,
+                "item_type": "simple",
+                "menu_categories": {"name": "Lunch — Rice", "is_active": True},
+            },
+        }}
+
+    def test_matching_category_prefix_is_kept_case_insensitively(self):
+        cart, _, problems = classify_cart_lines(self.requested, self.rows, "lunch")
+        self.assertIn("item-1", cart)
+        self.assertEqual(problems, [])
+
+    def test_mismatching_category_prefix_is_rejected(self):
+        cart, _, problems = classify_cart_lines(self.requested, self.rows, "Dinner")
+        self.assertEqual(cart, {})
+        self.assertEqual(problems, ["Jollof Rice isn't on this table's menu"])
+
+    def test_no_filter_keeps_category(self):
+        cart, _, problems = classify_cart_lines(self.requested, self.rows)
+        self.assertIn("item-1", cart)
+        self.assertEqual(problems, [])
 
 
 class TestOrderStatusFormatting(unittest.TestCase):
