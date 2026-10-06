@@ -70,7 +70,7 @@ The base tables predate the migration folder. The following is the application-l
 
 | Table | Important fields / role |
 |---|---|
-| `restaurants` | Tenant, manager and kitchen Telegram ids, subscription fields, bank details, kitchen-board state, optional delivery bot token, delivery fee/pickup configuration, Paystack configuration, WhatsApp credentials, `dispatch_group_id` (rider dispatch Telegram group), and `whatsapp_catalog_id` (Meta catalog for availability sync). |
+| `restaurants` | Tenant, manager and kitchen Telegram ids, subscription fields, bank details, kitchen-board state, optional delivery bot token, delivery fee/pickup configuration, Paystack configuration, WhatsApp credentials and entitlement (`whatsapp_addon_enabled`, `whatsapp_addon_expires_at`, `whatsapp_display_number`), `dispatch_group_id` (rider dispatch Telegram group), and `whatsapp_catalog_id` (Meta catalog for availability sync). |
 | `restaurant_tables` | Tenant table/Qr mapping: `public_code`, `table_number`, active status, optional `menu_filter`. `NULL` or `EXTERNAL` represents external delivery/pickup ordering. |
 | `menu_categories` | Tenant categories with active flag and display order. |
 | `menu_items` | Tenant category items: price, availability, inventory fields, image URL, and `item_type` (`simple` or `composite`). |
@@ -131,6 +131,20 @@ WhatsApp is not a Telegram UI clone. It begins when Meta sends an `order` messag
 11. State lives in Supabase, so it survives service restarts. `WhatsAppState` offers `get_data`, `update_data`, `set_state`, and `clear` so it can be passed to shared persistence/kitchen functions.
 12. `sync_catalog_item_availability()` in `whatsapp.py` pushes item availability changes to the Meta Catalog Batch API using `restaurants.whatsapp_catalog_id`.
 
+### WhatsApp dine-in
+
+- `GET /t/{public_code}` in `main.py` is the table landing route. It offers Telegram and, when the WhatsApp number and add-on entitlement are valid, WhatsApp. QR codes can encode this route with `generate_qr_codes.py --landing`.
+- A WhatsApp landing link includes a `ref:` token. When a customer sends it while idle, the bot looks up an active table belonging to the receiving restaurant and stores `table_id`, `table_number`, `menu_filter`, and the original UTC `table_bound_at` in `whatsapp_sessions` data.
+- The binding expires after 3 hours. A fresh binding makes checkout dine-in and is preserved across successful order rounds without refreshing its timestamp.
+- When `menu_filter` is set, cart and reorder lines are accepted only when their category name starts with `{menu_filter} —` (case-insensitive). A mismatched line is rejected while other valid lines can continue.
+
+### WhatsApp add-on entitlement
+
+- `restaurants.whatsapp_addon_enabled` controls entitlement; `whatsapp_addon_expires_at` is an optional UTC expiry, with `NULL` meaning no separate expiry. Migration 012 defaults new tenants to disabled and grandfathers tenants already configured with both `whatsapp_phone_number_id` and `whatsapp_access_token`. `whatsapp_display_number` stores the dialable international number (digits only) used for `wa.me` links; `whatsapp_phone_number_id` is Meta's internal id.
+- An admin can grant or revoke the add-on with `/set_whatsapp_addon <restaurant_id> on|off [days]`. `on` defaults to 30 days; `off` clears the expiry.
+- Inbound WhatsApp webhook handling checks the add-on before creating or loading session state. The `/t/{public_code}` page only displays its WhatsApp choice when the display number is valid, the Meta phone-number id exists, and the add-on is active; otherwise it redirects to Telegram.
+- Outbound order-status notifications, receipts, the Paystack webhook, and catalog-availability synchronization are not gated by the add-on, so existing orders continue to receive updates after expiry.
+
 ## Telegram-to-WhatsApp parity backlog
 
 Use this as the implementation order. It reflects the feature delta observed in the code, not a promise that every Telegram interaction can be copied literally to WhatsApp.
@@ -141,7 +155,7 @@ Use this as the implementation order. It reflects the feature delta observed in 
 4. ~~**Support pickup and delivery configuration.**~~ ✅ Done. WhatsApp presents delivery/pickup choice when `pickup_enabled` is true. Flat fee and zone-based delivery fees are applied before payment. `handle_unusable_zone_config()` falls back to flat fee or pickup.
 5. ~~**Support delivery zones and totals.**~~ ✅ Done. Zone selection uses a WhatsApp interactive list (capped at `MAX_WHATSAPP_LIST_ROWS`). Zone fee is saved to state and added to `total_price` before order creation.
 6. ~~**Add catalog validation before order creation.**~~ ✅ Done. `build_authoritative_cart()` validates mapped items and inventory in batched queries, aggregates duplicate catalog lines, and reports invalid lines. Valid lines can proceed after a partial-cart confirmation in state `confirming_partial_cart`. Before bank-transfer order creation, stock conflicts are sent to the kitchen with the payment proof; the customer is told to keep the receipt while the restaurant resolves the issue.
-7. **Add customer commands/menu actions that fit WhatsApp.** At minimum: start/help, current-order status, recent orders/reorder, cancel before preparation, and a way to recover an abandoned session. Use WhatsApp list/button constraints and conversational text rather than Telegram callbacks.
+7. ~~**Add customer commands/menu actions that fit WhatsApp.**~~ ✅ Done. Whole-message keywords are `status`, `track`, `my order`; `orders`, `history`, `my orders`; `cancel`; `restart`, `reset`, `start over`; and `help`, `menu`, `hi`, `hello`, `hey`, `start`. The interactive menu offers Order status, Recent orders, Cancel an order, and How to order. For non-order incoming messages, a session state older than 120 minutes (`SESSION_TTL_MINUTES`) is cleared; expired interactive replies are told to send the cart again. History and reorder are customer-owned WhatsApp orders; reorder fetches current menu items, validates stock, and goes through the shared cart submission pipeline, including partial-cart and composite flows. Customers may self-cancel only pending Cash Payment or Pay on Delivery orders; other orders require contacting the restaurant.
 8. ~~**Handle composite items.**~~ ✅ Done when `WHATSAPP_COMPOSITES_ENABLED=true`. Composite catalog items run through a modifier state machine using `configuring_modifiers` and `entering_modifier_qty`, and save the same `cart[item].modifiers` shape used by Telegram. The flow re-fetches current groups/options and applies `MAX_COMPOSITE_UNITS = 5` across a cart. With the flag unset or false, composite catalog items are rejected with an explanation.
 9. **Add a WhatsApp operations layer only if required.** Telegram kitchen controls, reports, inventory, subscription alerts, and kitchen board are deliberately Telegram-oriented. If staff must use WhatsApp, build explicit staff authorization and commands rather than exposing those controls to every customer number.
 
@@ -173,6 +187,8 @@ Runtime environment variables:
 | `SUPABASE_SERVICE_KEY` | Required, secret | Supabase service-role key. |
 | `WHATSAPP_VERIFY_TOKEN` | Required to verify Meta's webhook | Must match the verification token configured in Meta. |
 | `FASTAPI_WEBHOOK_URL` | Optional; defaults to `https://telegram-n8n-restaurant-bot.onrender.com` | Public application base URL, used for webhook/payment callback URLs. |
+| `TELEGRAM_BOT_USERNAME` | Required for the `/t/{public_code}` landing route; no `@` | Username used to build the table's Telegram deep link. |
+| `PUBLIC_BASE_URL` | Optional | Base URL used by `generate_qr_codes.py --landing`; falls back to `FASTAPI_WEBHOOK_URL`. |
 | `N8N_WEBHOOK_URL` | Optional; defaults to the configured Chowlin n8n new-order URL | Sends new-order events to n8n. |
 | `N8N_UPDATE_WEBHOOK_URL` | Optional; defaults to the configured Chowlin n8n update URL | Sends order updates to n8n. |
 | `N8N_HEARTBEAT_URL` | Optional; defaults to the configured Chowlin n8n heartbeat URL | Sends service heartbeat events. |
