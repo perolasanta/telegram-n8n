@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from aiogram.types import Update
 from bot import (
     bot,
@@ -13,6 +13,7 @@ from bot import (
     send_restock_alert,
     notify_order_customer,
     send_order_receipt,
+    is_subscription_active,
 )
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -23,17 +24,21 @@ import asyncio
 import aiohttp
 import hmac
 import hashlib
+import html
+import re
+from urllib.parse import quote
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 from datetime import datetime, timedelta
 from reports import generate_daily_report, generate_weekly_report
-from whatsapp import handle_whatsapp_webhook
+from whatsapp import handle_whatsapp_webhook, is_whatsapp_addon_active
 
 
 FASTAPI_WEBHOOK_URL = os.getenv("FASTAPI_WEBHOOK_URL","https://telegram-n8n-restaurant-bot.onrender.com")  # Replace with your actual webhook URL
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
+TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME")
 
 # URL of  n8n Heartbeat Webhook
 N8N_HEARTBEAT_URL=os.getenv("N8N_HEARTBEAT_URL", "https://n8n-atad.onrender.com/webhook/heartbeat")
@@ -46,6 +51,82 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone = pytz.timezone("Africa/Lagos"))
+
+
+def build_landing_links(table_number, public_code, display_number):
+    digits = re.sub(r"[^0-9]", "", str(display_number or ""))
+    if not 8 <= len(digits) <= 15:
+        return None
+    is_table = table_number is not None and str(table_number) != "EXTERNAL"
+    message = f"Table {table_number} ref:{public_code}" if is_table else f"Hi ref:{public_code}"
+    return f"https://wa.me/{quote(digits, safe='')}?text={quote(message, safe='')}"
+
+
+@app.get("/t/{public_code}", response_class=HTMLResponse)
+async def table_landing(public_code: str):
+    no_store = {"Cache-Control": "no-store"}
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", public_code or ""):
+        return HTMLResponse("<!doctype html><title>Not found</title><h1>Not found</h1>", status_code=404, headers=no_store)
+
+    result = supabase.table("restaurant_tables").select(
+        "id, table_number, restaurant_id, restaurants(name, whatsapp_display_number, whatsapp_phone_number_id, whatsapp_addon_enabled, whatsapp_addon_expires_at, subscription_status, subscription_expires_at)"
+    ).eq("public_code", public_code).eq("is_active", True).limit(1).execute()
+    if not result.data:
+        return HTMLResponse(
+            "<!doctype html><title>QR code not found</title><h1>This QR code isn't valid. Please ask the staff.</h1>",
+            status_code=404,
+            headers=no_store,
+        )
+
+    table = result.data[0]
+    restaurant_value = table.get("restaurants") or {}
+    restaurant = restaurant_value[0] if isinstance(restaurant_value, list) and restaurant_value else restaurant_value
+    if not isinstance(restaurant, dict):
+        restaurant = {}
+    if not await is_subscription_active(table.get("restaurant_id")):
+        return HTMLResponse(
+            "<!doctype html><title>Ordering unavailable</title><h1>This restaurant isn't taking orders right now.</h1>",
+            headers=no_store,
+        )
+
+    if not TELEGRAM_BOT_USERNAME:
+        logger.error("TELEGRAM_BOT_USERNAME is missing; cannot build table landing link")
+        return HTMLResponse(
+            "<!doctype html><title>Temporarily unavailable</title><h1>Ordering is temporarily unavailable.</h1>",
+            status_code=503,
+            headers=no_store,
+        )
+
+    telegram_url = f"https://t.me/{quote(TELEGRAM_BOT_USERNAME, safe='')}?start={quote(public_code, safe='')}"
+    whatsapp_url = build_landing_links(
+        table.get("table_number"), public_code, restaurant.get("whatsapp_display_number")
+    )
+    whatsapp_available = (
+        whatsapp_url is not None
+        and restaurant.get("whatsapp_phone_number_id")
+        and is_whatsapp_addon_active(restaurant)
+    )
+    if not whatsapp_available:
+        return RedirectResponse(telegram_url, status_code=302, headers=no_store)
+
+    table_number = table.get("table_number")
+    is_table = table_number is not None and str(table_number) != "EXTERNAL"
+    title = html.escape(str(restaurant.get("name") or "Restaurant"))
+    table_copy = f"<p>{html.escape(f'Table {table_number}')}</p>" if is_table else ""
+    page = (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<title>{title}</title><style>body{{font:16px sans-serif;margin:0;padding:24px;"
+        "min-height:100vh;box-sizing:border-box;display:flex;flex-direction:column;"
+        "justify-content:center;gap:16px}}h1{font-size:1.5rem}a{display:block;padding:18px;"
+        "border-radius:12px;text-align:center;text-decoration:none;font-weight:bold;"
+        "background:#087f5b;color:white}a+ a{background:#128c7e}</style></head><body>"
+        f"<h1>{title}</h1>{table_copy}"
+        f"<a href=\"{html.escape(telegram_url, quote=True)}\">Continue on Telegram</a>"
+        f"<a href=\"{html.escape(whatsapp_url, quote=True)}\">Continue on WhatsApp</a>"
+        "</body></html>"
+    )
+    return HTMLResponse(page, headers=no_store)
 
 # ADD THESE FUNCTIONS
 
