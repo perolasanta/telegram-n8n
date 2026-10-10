@@ -31,7 +31,6 @@ from bot import (
     deduct_inventory_for_order,
     is_subscription_active,
     send_order_to_kitchen,
-    send_order_receipt,
     send_restock_alert,
     reverse_geocode,
     format_delivery_coordinates,
@@ -1889,7 +1888,7 @@ async def confirm_order_cancellation(order_id, state, restaurant, from_number, s
         return
     await send_text(
         restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-        f"Your order #{order_id[:8]} has been cancelled. If we sent you a receipt for it, please disregard it, as it is void.",
+        f"Your order #{order_id[:8]} has been cancelled.",
     )
     await state.clear()
 
@@ -2110,12 +2109,7 @@ async def create_and_send_order(state, restaurant, from_number, customer_name, p
         await send_order_to_kitchen(bot, order_id, state, customer_name, from_number)
         low_stock_items = await deduct_inventory_for_order(order_id)
         await send_restock_alert(bot, restaurant["id"], restaurant.get("kitchen_chat_id"), low_stock_items)
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\nPayment: {truncate(payment_method, 100)}\n\nWe'll notify you when it is ready.")
-        await send_order_receipt(bot, {
-            "order_channel": "whatsapp",
-            "customer_contact": from_number,
-            "restaurants": restaurant,
-        }, order_id)
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\nPayment: {truncate(payment_method, 100)}\n\nWe'll notify you when it is ready. Your receipt will be sent when your order is ready.")
         await clear_keeping_table_binding(state)
     except ValueError as exc:
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}")

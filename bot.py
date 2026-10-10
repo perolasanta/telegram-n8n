@@ -2557,12 +2557,9 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💵 Payment Method: Pay on Delivery\n\n"
             f"Please have cash ready when your order arrives.\n"
-            f"📄 Receipt will be sent shortly.\n\n"
+            f"📄 Your receipt will be sent when your order is ready.\n\n"
             f"<i>Powered by Chowlin 🍽️</i>"
         )
-
-        # SEND RECEIPT TO CUSTOMER
-        await try_send_receipt_after_order(bot, callback_query.message, user_id, order_id)
         
         # Clear cart
         await state.update_data(cart={})
@@ -2608,12 +2605,9 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext, b
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💵 Payment Method: Cash Payment\n\n"
             f"Please pay cash when collecting your order.\n"
-            f"📄 Receipt will be sent shortly.\n\n"
+            f"📄 Your receipt will be sent when your order is ready.\n\n"
             f"<i>Powered by Chowlin 🍽️</i>"
         )
-
-        # SEND RECEIPT TO CUSTOMER
-        await try_send_receipt_after_order(bot, callback_query.message, user_id, order_id)
         
         # Clear cart
         await state.update_data(cart={})
@@ -3000,7 +2994,7 @@ async def handle_ready(callback_query: CallbackQuery, bot: Bot):
     
     # Get order details
     order = supabase.table("orders")\
-        .select("telegram_user_id, customer_name, customer_contact, order_channel, restaurant_id, order_type, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
+        .select("telegram_user_id, customer_name, customer_contact, order_channel, restaurant_id, order_type, payment_method, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
         .eq("id", order_id)\
         .eq("restaurant_id", restaurant_id)\
         .execute()
@@ -3026,6 +3020,8 @@ async def handle_ready(callback_query: CallbackQuery, bot: Bot):
             ready_message = f"✅ Hi {customer_name}, your order #{order_short_id(order_id)} is ready for collection! Please come pick it up at the counter."
         
         await notify_order_customer(bot, order_data, ready_message)
+        if order_data.get("payment_method") in {"Cash Payment", "Pay on Delivery"}:
+            await send_order_receipt(bot, order_data, order_id)
     
     # Update kitchen message
     if callback_query.message.photo:
@@ -3183,7 +3179,7 @@ async def confirm_telegram_order_cancellation(callback_query: types.CallbackQuer
     user_id = callback_query.from_user.id
     outcome = await cancel_pending_order(bot, order_id, telegram_user_id=user_id)
     messages = {
-        "cancelled": f"Your order #{order_id[:8]} has been cancelled. If we sent you a receipt for it, please disregard it, as it is void.",
+        "cancelled": f"Your order #{order_id[:8]} has been cancelled.",
         "not_found": "We couldn't find that order. Please contact the restaurant.",
         "not_allowed": "This order can't be cancelled. Please contact the restaurant.",
         "already_started": "The kitchen has already started this order. Please contact the restaurant.",
