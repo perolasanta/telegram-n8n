@@ -2264,8 +2264,6 @@ async def send_order_to_kitchen(
             [InlineKeyboardButton(text="🍳 Mark as Preparing", callback_data=f"preparing_{order_id}")],
             [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]
         ]
-        if data.get("order_type") == "delivery":
-            kitchen_buttons.append([InlineKeyboardButton(text="🛵 Send to Rider", callback_data=f"dispatch_{order_id}")])
         keyboard = InlineKeyboardMarkup(inline_keyboard=kitchen_buttons)
         print(f"DEBUG kitchen_chat_id={kitchen_chat_id!r} type={type(kitchen_chat_id)}")
         sent_message = await bot.send_message(
@@ -2303,6 +2301,9 @@ async def dispatch_to_rider_handler(callback_query: types.CallbackQuery, bot: Bo
     order_data = order.data[0]
     if order_data.get("order_status") == "cancelled":
         await callback_query.answer("This order was cancelled.", show_alert=True)
+        return
+    if order_data.get("order_status") != "ready":
+        await callback_query.answer("Mark the order as Ready first.", show_alert=True)
         return
     restaurant = order_data.get("restaurants") or {}
     dispatch_group_id = restaurant.get("dispatch_group_id")
@@ -2829,10 +2830,9 @@ async def handle_preparing(callback_query: types.CallbackQuery, bot: Bot):
         if restaurant_id:
             await refresh_kitchen_order_board(bot, restaurant_id)
 
-    ready_keyboard_buttons = [[InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]]
-    if order.data and order.data[0].get("order_type") == "delivery":
-        ready_keyboard_buttons.append([InlineKeyboardButton(text="🛵 Send to Rider", callback_data=f"dispatch_{order_id}")])
-    ready_keyboard = InlineKeyboardMarkup(inline_keyboard=ready_keyboard_buttons)
+    ready_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}")]
+    ])
     if callback_query.message.photo:
         await callback_query.message.edit_caption(
             caption=f"{callback_query.message.caption}\n\n🍳 Order marked as preparing.",
