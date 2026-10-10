@@ -6,6 +6,9 @@ used only to identify a menu item and requested quantity.
 
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
+import base64
+import hashlib
+import hmac
 import html
 import logging
 import os
@@ -51,8 +54,73 @@ def money(value) -> Decimal:
         return Decimal("0")
 
 
+def _unix_timestamp(now=None) -> int:
+    if now is None:
+        return int(datetime.now(timezone.utc).timestamp())
+    if isinstance(now, datetime):
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return int(now.timestamp())
+    return int(now)
+
+
+def _base36(value: int) -> str:
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if value == 0:
+        return "0"
+    if value < 0:
+        return "-" + _base36(-value)
+    digits = []
+    while value:
+        value, remainder = divmod(value, 36)
+        digits.append(alphabet[remainder])
+    return "".join(reversed(digits))
+
+
+def make_table_token(public_code, secret, now, ttl_minutes) -> str:
+    expiry_base36 = _base36(_unix_timestamp(now) + int(ttl_minutes * 60))
+    signing_value = f"{public_code}.{expiry_base36}".encode("utf-8")
+    signature = base64.urlsafe_b64encode(
+        hmac.new(str(secret).encode("utf-8"), signing_value, hashlib.sha256).digest()
+    ).decode("ascii")[:16]
+    return f"{public_code}.{expiry_base36}.{signature}"
+
+
+def verify_table_token(token, secret, now) -> tuple[str, str | None]:
+    try:
+        if not isinstance(token, str) or not isinstance(secret, str) or not secret:
+            return "invalid", None
+        public_code, expiry_base36, signature = token.rsplit(".", 2)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", public_code):
+            return "invalid", None
+        if not re.fullmatch(r"[0-9a-zA-Z]+", expiry_base36) or len(signature) != 16:
+            return "invalid", None
+        signing_value = f"{public_code}.{expiry_base36}".encode("utf-8")
+        expected_signature = base64.urlsafe_b64encode(
+            hmac.new(secret.encode("utf-8"), signing_value, hashlib.sha256).digest()
+        ).decode("ascii")[:16]
+        if not hmac.compare_digest(signature, expected_signature):
+            return "invalid", None
+        expiry = int(expiry_base36, 36)
+        if expiry <= _unix_timestamp(now):
+            return "expired", None
+        return "ok", public_code
+    except Exception:
+        return "invalid", None
+
+
+def resolve_table_reference(reference, secret, now, allow_raw) -> tuple[str, str | None]:
+    if not isinstance(reference, str):
+        return "invalid", None
+    if "." in reference:
+        return verify_table_token(reference, secret, now)
+    if allow_raw and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", reference):
+        return "ok", reference
+    return "invalid", None
+
+
 def extract_table_ref(text: str) -> str | None:
-    match = re.search(r"ref:\s*([A-Za-z0-9_-]{1,64})(?![A-Za-z0-9_-])", str(text or ""), re.IGNORECASE)
+    match = re.search(r"ref:\s*([A-Za-z0-9_.-]{1,160})(?![A-Za-z0-9_.-])", str(text or ""), re.IGNORECASE)
     return match.group(1) if match else None
 
 
@@ -1555,6 +1623,24 @@ async def handle_text(msg, state, restaurant, from_number, current_state, supaba
     body = text_data.get("body") or "" if isinstance(text_data, dict) else ""
     table_ref = extract_table_ref(body)
     if table_ref:
+        secret = os.getenv("TABLE_LINK_SECRET")
+        allow_raw = os.getenv("ALLOW_RAW_TABLE_REF", "false").lower() == "true"
+        status, verified_public_code = resolve_table_reference(
+            table_ref, secret, datetime.now(timezone.utc), allow_raw
+        )
+        if status == "expired":
+            await send_text(
+                restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                "That link has expired. Please scan the QR code on your table again.",
+            )
+            return
+        if status != "ok" or not verified_public_code:
+            await send_text(
+                restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                "That table link isn't valid. Please scan the QR code on your table.",
+            )
+            return
+        table_ref = verified_public_code
         if current_state is not None:
             await send_text(
                 restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,

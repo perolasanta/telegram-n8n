@@ -33,7 +33,7 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 from datetime import datetime, timedelta
 from reports import generate_daily_report, generate_weekly_report
-from whatsapp import handle_whatsapp_webhook, is_whatsapp_addon_active
+from whatsapp import handle_whatsapp_webhook, is_whatsapp_addon_active, make_table_token
 
 
 FASTAPI_WEBHOOK_URL = os.getenv("FASTAPI_WEBHOOK_URL","https://telegram-n8n-restaurant-bot.onrender.com")  # Replace with your actual webhook URL
@@ -135,19 +135,38 @@ async def table_landing(public_code: str):
 
     telegram_url = f"https://t.me/{quote(TELEGRAM_BOT_USERNAME, safe='')}?start={quote(public_code, safe='')}"
     display_number = restaurant.get("whatsapp_display_number")
-    whatsapp_url = build_landing_links(
+    table_link_secret = os.getenv("TABLE_LINK_SECRET")
+    if not table_link_secret:
+        logger.error("TABLE_LINK_SECRET is unset; hiding WhatsApp table link for restaurant_id=%s", table.get("restaurant_id"))
+    token_ttl_minutes = os.getenv("LANDING_TOKEN_TTL_MINUTES", "15")
+    try:
+        token_ttl_minutes = int(token_ttl_minutes)
+        if token_ttl_minutes <= 0:
+            token_ttl_minutes = 15
+    except (TypeError, ValueError):
+        token_ttl_minutes = 15
+    table_token = make_table_token(
+        public_code, table_link_secret, datetime.now(pytz.utc), token_ttl_minutes
+    ) if table_link_secret else None
+    display_number_valid = build_landing_links(
         table.get("table_number"), public_code, display_number
-    )
+    ) is not None
+    whatsapp_url = build_landing_links(
+        table.get("table_number"), table_token, display_number
+    ) if table_token and display_number_valid else None
     addon_active = is_whatsapp_addon_active(restaurant)
     whatsapp_available = (
         whatsapp_url is not None
+        and table_link_secret
         and restaurant.get("whatsapp_phone_number_id")
         and addon_active
     )
     if not whatsapp_available:
         failed_conditions = []
-        if whatsapp_url is None:
+        if not display_number_valid:
             failed_conditions.append("display number invalid")
+        if not table_link_secret:
+            failed_conditions.append("table link secret missing")
         if not restaurant.get("whatsapp_phone_number_id"):
             failed_conditions.append("phone id missing")
         if not addon_active:

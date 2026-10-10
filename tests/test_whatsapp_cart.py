@@ -30,6 +30,9 @@ from whatsapp import (
     format_partial_cart_body,
     is_whatsapp_addon_active,
     is_binding_fresh,
+    make_table_token,
+    resolve_table_reference,
+    verify_table_token,
     expand_composite_queue,
     filter_same_composite_units,
     parse_requested_items,
@@ -84,8 +87,40 @@ class TestTableBindingHelpers(unittest.TestCase):
         self.assertIsNone(extract_table_ref("reference: table-1"))
         self.assertIsNone(extract_table_ref("ref: !!!"))
 
-    def test_extract_table_ref_rejects_over_length_code(self):
-        self.assertIsNone(extract_table_ref("ref:" + "a" * 65))
+    def test_extract_table_ref_accepts_signed_refs_and_rejects_over_limit(self):
+        self.assertEqual(extract_table_ref("ref:" + "a" * 100 + ".expiry.signature"), "a" * 100 + ".expiry.signature")
+        self.assertIsNone(extract_table_ref("ref:" + "a" * 161))
+
+
+class TestTableLinkTokens(unittest.TestCase):
+
+    def setUp(self):
+        self.now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        self.secret = "test-table-link-secret"
+        self.token = make_table_token("table_42", self.secret, self.now, 15)
+
+    def test_token_round_trip(self):
+        self.assertEqual(verify_table_token(self.token, self.secret, self.now), ("ok", "table_42"))
+
+    def test_tampered_code_expiry_and_signature_are_invalid(self):
+        code, expiry, signature = self.token.rsplit(".", 2)
+        variants = (
+            f"other_{code[6:]}.{expiry}.{signature}",
+            f"{code}.{expiry}0.{signature}",
+            f"{code}.{expiry}.{('A' if signature[0] != 'A' else 'B')}{signature[1:]}",
+        )
+        for token in variants:
+            with self.subTest(token=token):
+                self.assertEqual(verify_table_token(token, self.secret, self.now), ("invalid", None))
+
+    def test_expired_token_and_wrong_secret(self):
+        later = self.now + timedelta(minutes=16)
+        self.assertEqual(verify_table_token(self.token, self.secret, later), ("expired", None))
+        self.assertEqual(verify_table_token(self.token, "wrong-secret", self.now), ("invalid", None))
+
+    def test_raw_table_reference_requires_explicit_allow_flag(self):
+        self.assertEqual(resolve_table_reference("table_42", self.secret, self.now, False), ("invalid", None))
+        self.assertEqual(resolve_table_reference("table_42", self.secret, self.now, True), ("ok", "table_42"))
 
     def test_binding_freshness_boundary_and_invalid_value(self):
         bound = datetime(2026, 1, 1, tzinfo=timezone.utc)
