@@ -43,7 +43,11 @@ from whatsapp import (
     can_skip_group,
     validate_group_selection,
 )
-from bot import format_kitchen_item_line, format_order_headline
+from bot import (
+    build_kitchen_order_board_sections,
+    format_kitchen_item_line,
+    format_order_headline,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -282,22 +286,38 @@ class TestAvailablePaymentMethods(unittest.TestCase):
 
 class TestSelfCancellationPolicy(unittest.TestCase):
 
-    def test_only_pending_cash_and_pay_on_delivery_orders_are_cancellable(self):
-        for payment_method in ("Cash Payment", "Pay on Delivery"):
-            with self.subTest(payment_method=payment_method):
-                self.assertTrue(can_self_cancel({
-                    "order_status": "pending", "payment_method": payment_method,
-                }))
-        for payment_method in ("Bank Transfer", "Paystack", "Other"):
-            with self.subTest(payment_method=payment_method):
-                self.assertFalse(can_self_cancel({
-                    "order_status": "pending", "payment_method": payment_method,
-                }))
-        for status in ("preparing", "ready", "delivered", "cancelled"):
-            with self.subTest(status=status):
-                self.assertFalse(can_self_cancel({
-                    "order_status": status, "payment_method": "Cash Payment",
-                }))
+    def test_all_payment_methods_and_statuses(self):
+        payment_methods = (
+            "Cash Payment", "Pay on Delivery", "Bank Transfer", "Paystack", "Other",
+        )
+        statuses = ("pending", "preparing", "ready", "delivered", "cancelled")
+        for payment_method in payment_methods:
+            for status in statuses:
+                with self.subTest(payment_method=payment_method, status=status):
+                    expected = (
+                        status == "pending"
+                        and payment_method in {"Cash Payment", "Pay on Delivery"}
+                    )
+                    self.assertEqual(can_self_cancel({
+                        "order_status": status, "payment_method": payment_method,
+                    }), expected)
+
+
+class TestKitchenOrderBoardSections(unittest.TestCase):
+
+    def test_cancelled_orders_are_separate_from_active_sections(self):
+        orders = [
+            {"id": "pending-1", "order_status": "pending", "created_at": "2026-10-10T10:00:00+00:00"},
+            {"id": "cancel-older", "order_status": "cancelled", "created_at": "2026-10-10T09:00:00+00:00"},
+            {"id": "cancel-newer", "order_status": "cancelled", "created_at": "2026-10-10T11:00:00+00:00"},
+        ]
+        pending, preparing, ready, cancelled = build_kitchen_order_board_sections(orders)
+        self.assertEqual([order["id"] for order in pending], ["pending-1"])
+        self.assertEqual(preparing, [])
+        self.assertEqual(ready, [])
+        self.assertEqual(
+            [order["id"] for order in cancelled], ["cancel-newer", "cancel-older"]
+        )
 
 
 class TestReorderCatalogAdapter(unittest.TestCase):

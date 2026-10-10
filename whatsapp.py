@@ -23,13 +23,13 @@ from receipt_generator import generate_receipt_pdf
 from bot import (
     available_payment_methods,
     build_composite_cart_line,
+    can_self_cancel,
+    cancel_pending_order,
     delivery_bots,
     create_order_in_db,
     create_paystack_payment_link,
     deduct_inventory_for_order,
     is_subscription_active,
-    refresh_kitchen_order_board,
-    restore_inventory_for_order,
     send_order_to_kitchen,
     send_order_receipt,
     send_restock_alert,
@@ -454,7 +454,9 @@ async def send_whatsapp_document(phone_number_id: str, token: str, to: str, cont
     })
 
 
-async def sync_catalog_item_availability(menu_item_id: str, is_available: bool, supabase) -> None:
+async def sync_catalog_item_availability(
+    menu_item_id: str, is_available: bool, supabase, restaurant_id=None
+) -> None:
     """Best-effort push of an item's availability to the Meta catalog.
 
     Called whenever a kitchen toggles a menu item's availability (from either
@@ -468,7 +470,10 @@ async def sync_catalog_item_availability(menu_item_id: str, is_available: bool, 
     """
     mapping = supabase.table("menu_item_catalog_map").select(
         "catalog_retailer_id, restaurant_id, restaurants(whatsapp_access_token, whatsapp_catalog_id)"
-    ).eq("menu_item_id", menu_item_id).execute()
+    ).eq("menu_item_id", menu_item_id)
+    if restaurant_id is not None:
+        mapping = mapping.eq("restaurant_id", restaurant_id)
+    mapping = mapping.execute()
     if not mapping.data:
         return  # item isn't mapped to a WhatsApp catalog product; nothing to sync
 
@@ -847,13 +852,6 @@ def format_order_status_line(order: dict) -> str:
         }.get(order_status, "Received")
     total = f"{money(order.get('total_amount')):,.0f}"
     return f"#{order_id} — {status_label} — ₦{total}"
-
-
-def can_self_cancel(order: dict) -> bool:
-    return (
-        order.get("order_status") == "pending"
-        and order.get("payment_method") in {"Cash Payment", "Pay on Delivery"}
-    )
 
 
 async def validate_cart_inventory_and_drop_shortages(cart: dict, problems: list[str], restaurant_id: str):
@@ -1874,75 +1872,24 @@ async def confirm_order_cancellation(order_id, state, restaurant, from_number, s
             "Please use the buttons for the current order.",
         )
         return
-    result = supabase.table("orders").update({
-        "order_status": "cancelled",
-    }).eq("id", order_id).eq(
-        "order_status", "pending"
-    ).eq("restaurant_id", restaurant["id"]).eq(
-        "order_channel", "whatsapp"
-    ).eq("customer_contact", from_number).in_(
-        "payment_method", ["Cash Payment", "Pay on Delivery"]
-    ).select("id").execute()
-    if not result.data:
+    outcome = await cancel_pending_order(
+        bot, order_id, customer_contact=from_number, restaurant_id=restaurant["id"]
+    )
+    if outcome["result"] != "cancelled":
+        message = {
+            "not_found": "We couldn't find that order. Please contact the restaurant.",
+            "not_allowed": "This order can't be cancelled. Please contact the restaurant.",
+            "already_started": "Sorry, the kitchen has already started this order. Please contact the restaurant.",
+        }.get(outcome["result"], "We couldn't cancel that order. Please contact the restaurant.")
         await send_text(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            "Sorry, the kitchen has already started this order. Please contact the restaurant.",
+            message,
         )
         await state.clear()
         return
-
-    try:
-        restored_items = await restore_inventory_for_order(order_id)
-        for item in restored_items:
-            if (item.get("inventory_count") or 0) > 0:
-                try:
-                    await sync_catalog_item_availability(item.get("id"), True, supabase)
-                except Exception:
-                    logging.exception("Failed to sync restored menu item availability")
-    except Exception:
-        logging.exception("Failed to restore inventory for cancelled order %s", order_id)
-
-    kitchen_chat_id = restaurant.get("kitchen_chat_id")
-    if kitchen_chat_id:
-        kitchen_bot = delivery_bots.get(restaurant["id"], bot)
-        saved = {}
-        try:
-            kitchen_order = supabase.table("orders").select(
-                "kitchen_message_id, kitchen_message_text"
-            ).eq("id", order_id).eq("restaurant_id", restaurant["id"]).execute()
-            saved = (kitchen_order.data or [{}])[0]
-        except Exception:
-            logging.exception("Failed to read kitchen message details for cancelled order %s", order_id)
-        try:
-            message_id = saved.get("kitchen_message_id")
-            stored_text = saved.get("kitchen_message_text")
-            if message_id and stored_text:
-                await kitchen_bot.edit_message_text(
-                    chat_id=kitchen_chat_id,
-                    message_id=message_id,
-                    text=stored_text + "\n\n❌ <b>CANCELLED BY CUSTOMER</b>",
-                    reply_markup=None,
-                )
-            else:
-                raise ValueError("Kitchen message details are unavailable")
-        except Exception:
-            logging.exception("Failed to edit kitchen ticket for cancelled order %s", order_id)
-            try:
-                await kitchen_bot.send_message(
-                    kitchen_chat_id, f"❌ ORDER #{order_id[:8]} CANCELLED by customer"
-                )
-            except Exception:
-                logging.exception("Failed to notify kitchen of cancelled order %s", order_id)
-    try:
-        await refresh_kitchen_order_board(
-            delivery_bots.get(restaurant["id"], bot), restaurant["id"]
-        )
-    except Exception:
-        logging.exception("Failed to refresh kitchen board after cancelling order %s", order_id)
-
     await send_text(
         restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-        f"Your order #{order_id[:8]} has been cancelled.",
+        f"Your order #{order_id[:8]} has been cancelled. If we sent you a receipt for it, please disregard it, as it is void.",
     )
     await state.clear()
 

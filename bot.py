@@ -654,12 +654,122 @@ async def restore_inventory_for_order(order_id: str):
     return response.data or []
 
 
+async def cancel_pending_order(
+    bot: Bot,
+    order_id: str,
+    *,
+    telegram_user_id=None,
+    customer_contact=None,
+    restaurant_id=None,
+) -> dict:
+    query = supabase.table("orders").select(
+        "id, restaurant_id, telegram_user_id, customer_contact, order_status, payment_method, "
+        "total_amount, order_type, kitchen_message_id, kitchen_message_text, "
+        "restaurants(kitchen_chat_id)"
+    ).eq("id", order_id)
+    if telegram_user_id is not None:
+        query = query.eq("telegram_user_id", telegram_user_id).eq("order_channel", "telegram")
+    elif customer_contact is not None and restaurant_id is not None:
+        query = query.eq("customer_contact", customer_contact).eq(
+            "restaurant_id", restaurant_id
+        ).eq("order_channel", "whatsapp")
+    else:
+        return {"result": "not_found", "order": None}
+
+    response = query.execute()
+    order = response.data[0] if response.data else None
+    summary = {
+        key: order.get(key)
+        for key in ("id", "restaurant_id", "order_status", "payment_method", "total_amount", "order_type")
+    } if order else None
+
+    def result(code):
+        return {"result": code, "order": summary}
+
+    if not order:
+        return result("not_found")
+    if not can_self_cancel(order):
+        if (
+            order.get("payment_method") in {"Cash Payment", "Pay on Delivery"}
+            and order.get("order_status") != "pending"
+        ):
+            return result("already_started")
+        return result("not_allowed")
+
+    updated = supabase.table("orders").update({
+        "order_status": "cancelled",
+    }).eq("id", order_id).eq("restaurant_id", order.get("restaurant_id")).eq(
+        "order_status", "pending"
+    ).select("id").execute()
+    if not updated.data:
+        return result("already_started")
+
+    try:
+        restored_items = await restore_inventory_for_order(order_id)
+    except Exception:
+        restored_items = []
+        logging.exception("Failed to restore inventory for cancelled order %s", order_id)
+    if restored_items:
+        try:
+            from whatsapp import sync_catalog_item_availability
+            for item in restored_items:
+                if (item.get("inventory_count") or 0) > 0:
+                    try:
+                        await sync_catalog_item_availability(
+                            item.get("id"), True, supabase, restaurant_id=order.get("restaurant_id")
+                        )
+                    except Exception:
+                        logging.exception(
+                            "Failed to sync restored menu item availability for order %s", order_id
+                        )
+        except Exception:
+            logging.exception("Failed to load catalog availability sync for order %s", order_id)
+
+    restaurant_id = order.get("restaurant_id")
+    kitchen_chat_id = (order.get("restaurants") or {}).get("kitchen_chat_id")
+    kitchen_bot = delivery_bots.get(restaurant_id, bot)
+    if kitchen_chat_id:
+        try:
+            message_id = order.get("kitchen_message_id")
+            stored_text = order.get("kitchen_message_text")
+            if not message_id or stored_text is None:
+                raise ValueError("Kitchen message details are unavailable")
+            await kitchen_bot.edit_message_text(
+                chat_id=kitchen_chat_id,
+                message_id=message_id,
+                text=stored_text + "\n\n❌ <b>CANCELLED BY CUSTOMER</b>",
+                reply_markup=None,
+            )
+        except Exception:
+            logging.exception("Failed to edit kitchen ticket for cancelled order %s", order_id)
+            try:
+                await kitchen_bot.send_message(
+                    kitchen_chat_id, f"❌ ORDER #{str(order_id)[:8]} CANCELLED by customer"
+                )
+            except Exception:
+                logging.exception("Failed to notify kitchen of cancelled order %s", order_id)
+    try:
+        await refresh_kitchen_order_board(kitchen_bot, restaurant_id)
+    except Exception:
+        logging.exception("Failed to refresh kitchen board after cancelling order %s", order_id)
+
+    summary["order_status"] = "cancelled"
+    return result("cancelled")
+
+
 def format_money(amount) -> str:
     return f"₦{float(amount):,.0f}"
 
 
 def order_short_id(order_id: str) -> str:
     return order_id.replace("-", "")[:4].upper()
+
+
+def can_self_cancel(order: dict) -> bool:
+    return (
+        order.get("order_status") == "pending"
+        and order.get("payment_method") in {"Cash Payment", "Pay on Delivery"}
+    )
 
 
 def available_payment_methods(order_type, pod_enabled, paystack_enabled, has_bank) -> list[str]:
@@ -748,6 +858,22 @@ def format_order_location(order: dict, include_type: bool = False) -> str:
     if include_type and order_type == "dine_in":
         return f"{label} — Dine-in"
     return label
+
+
+def build_kitchen_order_board_sections(orders: list[dict]):
+    pending = [order for order in orders if order.get("order_status") == "pending"]
+    preparing = [order for order in orders if order.get("order_status") == "preparing"]
+    ready = sorted(
+        [order for order in orders if order.get("order_status") == "ready"],
+        key=lambda item: parse_created_at(item["created_at"]),
+        reverse=True,
+    )[:3]
+    cancelled = sorted(
+        [order for order in orders if order.get("order_status") == "cancelled"],
+        key=lambda item: parse_created_at(item["created_at"]),
+        reverse=True,
+    )[:3]
+    return pending, preparing, ready, cancelled
 
 
 async def get_paystack_email_for_user(user_id: int) -> str:
@@ -949,21 +1075,14 @@ async def build_kitchen_order_board(restaurant_id: str) -> tuple[str, int]:
     orders = supabase.table("orders")\
         .select("id, order_type, delivery_address, order_status, payment_status, payment_method, created_at, order_items(quantity, menu_items(name)), restaurant_tables(table_number)")\
         .eq("restaurant_id", restaurant_id)\
-        .in_("order_status", ["pending", "preparing", "ready"])\
+        .in_("order_status", ["pending", "preparing", "ready", "cancelled"])\
         .neq("payment_status", "rejected")\
         .gte("created_at", start.astimezone(pytz.utc).isoformat())\
         .lt("created_at", end.astimezone(pytz.utc).isoformat())\
         .order("created_at")\
         .execute()
 
-    rows = orders.data or []
-    pending = [order for order in rows if order.get("order_status") == "pending"]
-    preparing = [order for order in rows if order.get("order_status") == "preparing"]
-    ready = sorted(
-        [order for order in rows if order.get("order_status") == "ready"],
-        key=lambda item: parse_created_at(item["created_at"]),
-        reverse=True
-    )[:3]
+    pending, preparing, ready, cancelled = build_kitchen_order_board_sections(orders.data or [])
 
     rush_label = "  🔥 RUSH HOUR" if len(pending) > RUSH_HOUR_PENDING_THRESHOLD else ""
     board = [
@@ -1008,6 +1127,7 @@ async def build_kitchen_order_board(restaurant_id: str) -> tuple[str, int]:
     add_section("🔴 <b>PENDING</b>", pending)
     add_section("🟡 <b>PREPARING</b>", preparing)
     add_section("✅ <b>READY (last 3)</b>", ready, show_items=False)
+    add_section("❌ <b>CANCELLED (last 3)</b>", cancelled, show_items=False)
 
     board.append("Use the buttons on each order message to update status.")
     return "\n".join(board), len(pending)
@@ -2995,38 +3115,55 @@ async def order_history(message: types.Message, state: FSMContext):
         )]]
         if (
             order.get("order_channel") == "telegram"
-            and raw_status.lower() == "pending"
-            and order.get("payment_method") in {"Cash Payment", "Pay on Delivery"}
+            and can_self_cancel(order)
         ):
             keyboard_rows.append([InlineKeyboardButton(
                 text="❌ Cancel order",
-                callback_data=f"cancel_tg:{order_id}",
+                callback_data=f"tcx_{order_id}",
             )])
         keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
         await message.answer(text, reply_markup=keyboard)
 
 
-@dp.callback_query(F.data.startswith("cancel_tg:"))
+@dp.message(Command("cancel_order"))
+async def cancel_order_command(message: types.Message):
+    orders = supabase.table("orders").select(
+        "id, restaurant_id, order_status, payment_method, total_amount, created_at"
+    ).eq("telegram_user_id", message.from_user.id).eq(
+        "order_channel", "telegram"
+    ).eq("order_status", "pending").in_(
+        "payment_method", ["Cash Payment", "Pay on Delivery"]
+    ).order("created_at", desc=True).limit(5).execute()
+    if not orders.data:
+        await message.answer("You have no pending orders that can be cancelled.")
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"❌ Cancel order #{str(order.get('id') or '')[:8]}",
+            callback_data=f"tcx_{order.get('id')}",
+        )]
+        for order in orders.data
+    ])
+    await message.answer("Choose a pending order to cancel:", reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("tcx_"))
 async def begin_telegram_order_cancellation(callback_query: types.CallbackQuery):
-    order_id = callback_query.data.partition(":")[2]
+    order_id = callback_query.data[len("tcx_"):]
     result = supabase.table("orders").select(
         "id, restaurant_id, order_status, payment_method, order_channel"
     ).eq("id", order_id).eq(
         "telegram_user_id", callback_query.from_user.id
     ).eq("order_channel", "telegram").execute()
     order = result.data[0] if result.data else {}
-    if (
-        not order
-        or order.get("order_status") != "pending"
-        or order.get("payment_method") not in {"Cash Payment", "Pay on Delivery"}
-    ):
+    if not order or not can_self_cancel(order):
         await callback_query.answer("This order can no longer be cancelled.", show_alert=True)
         return
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Yes, cancel", callback_data=f"cancel_tg_yes:{order_id}")],
-        [InlineKeyboardButton(text="Keep order", callback_data=f"cancel_tg_no:{order_id}")],
+        [InlineKeyboardButton(text="Yes, cancel", callback_data=f"tcy_{order_id}")],
+        [InlineKeyboardButton(text="Keep order", callback_data="tcn")],
     ])
     await callback_query.message.answer(
         f"Cancel pending order #{order_id[:8]}?", reply_markup=keyboard
@@ -3034,77 +3171,29 @@ async def begin_telegram_order_cancellation(callback_query: types.CallbackQuery)
     await callback_query.answer()
 
 
-@dp.callback_query(F.data.startswith("cancel_tg_no:"))
+@dp.callback_query(F.data == "tcn")
 async def abort_telegram_order_cancellation(callback_query: types.CallbackQuery):
-    await callback_query.message.edit_text("Your order has not been cancelled.", reply_markup=None)
+    await callback_query.message.edit_text("No problem, your order is unchanged.", reply_markup=None)
     await callback_query.answer()
 
 
-@dp.callback_query(F.data.startswith("cancel_tg_yes:"))
+@dp.callback_query(F.data.startswith("tcy_"))
 async def confirm_telegram_order_cancellation(callback_query: types.CallbackQuery, bot: Bot):
-    order_id = callback_query.data.partition(":")[2]
+    order_id = callback_query.data[len("tcy_"):]
     user_id = callback_query.from_user.id
-    order_result = supabase.table("orders").select(
-        "id, restaurant_id, order_status, payment_method, kitchen_message_id, kitchen_message_text, restaurants(kitchen_chat_id)"
-    ).eq("id", order_id).eq("telegram_user_id", user_id).eq(
-        "order_channel", "telegram"
-    ).execute()
-    order = order_result.data[0] if order_result.data else {}
-    restaurant_id = order.get("restaurant_id")
-    if (
-        not restaurant_id
-        or order.get("order_status") != "pending"
-        or order.get("payment_method") not in {"Cash Payment", "Pay on Delivery"}
-    ):
-        await callback_query.answer("This order can no longer be cancelled.", show_alert=True)
-        return
-
-    updated = supabase.table("orders").update({
-        "order_status": "cancelled",
-    }).eq("id", order_id).eq("restaurant_id", restaurant_id).eq(
-        "telegram_user_id", user_id
-    ).eq("order_channel", "telegram").eq("order_status", "pending").in_(
-        "payment_method", ["Cash Payment", "Pay on Delivery"]
-    ).select("id").execute()
-    if not updated.data:
-        await callback_query.answer("This order was already updated.", show_alert=True)
-        return
-
-    try:
-        await restore_inventory_for_order(order_id)
-    except Exception:
-        logging.exception("Failed to restore inventory for cancelled Telegram order %s", order_id)
-
-    kitchen_chat_id = (order.get("restaurants") or {}).get("kitchen_chat_id")
-    kitchen_bot = delivery_bots.get(restaurant_id, bot)
-    if kitchen_chat_id:
-        try:
-            if order.get("kitchen_message_id") and order.get("kitchen_message_text"):
-                await kitchen_bot.edit_message_text(
-                    chat_id=kitchen_chat_id,
-                    message_id=order["kitchen_message_id"],
-                    text=order["kitchen_message_text"] + "\n\n❌ <b>CANCELLED BY CUSTOMER</b>",
-                    reply_markup=None,
-                )
-            else:
-                raise ValueError("Kitchen message details are unavailable")
-        except Exception:
-            logging.exception("Failed to edit kitchen ticket for cancelled Telegram order %s", order_id)
-            try:
-                await kitchen_bot.send_message(
-                    kitchen_chat_id, f"❌ ORDER #{order_id[:8]} CANCELLED by customer"
-                )
-            except Exception:
-                logging.exception("Failed to notify kitchen of cancelled Telegram order %s", order_id)
-    try:
-        await refresh_kitchen_order_board(kitchen_bot, restaurant_id)
-    except Exception:
-        logging.exception("Failed to refresh kitchen board after Telegram cancellation %s", order_id)
-
+    outcome = await cancel_pending_order(bot, order_id, telegram_user_id=user_id)
+    messages = {
+        "cancelled": f"Your order #{order_id[:8]} has been cancelled. If we sent you a receipt for it, please disregard it, as it is void.",
+        "not_found": "We couldn't find that order. Please contact the restaurant.",
+        "not_allowed": "This order can't be cancelled. Please contact the restaurant.",
+        "already_started": "The kitchen has already started this order. Please contact the restaurant.",
+    }
     await callback_query.message.edit_text(
-        f"Order #{order_id[:8]} has been cancelled.", reply_markup=None
+        messages[outcome["result"]], reply_markup=None
     )
-    await callback_query.answer("Order cancelled.")
+    await callback_query.answer(
+        "Order cancelled." if outcome["result"] == "cancelled" else "Cancellation checked."
+    )
 
 
 @dp.callback_query(F.data.startswith("reorder_"))
@@ -3995,8 +4084,9 @@ async def order_status(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
     order = supabase.table("orders")\
-        .select("id, order_status, payment_status, total_amount, created_at")\
+        .select("id, order_status, payment_status, payment_method, total_amount, created_at")\
         .eq("telegram_user_id", user_id)\
+        .eq("order_channel", "telegram")\
         .in_("order_status", ["pending", "preparing"])\
         .order("created_at", desc=True)\
         .limit(1)\
@@ -4008,12 +4098,18 @@ async def order_status(message: types.Message, state: FSMContext):
     
     o = order.data[0]
     emoji = {"pending": "⏳", "preparing": "🍳"}.get(o["order_status"], "📦")
+    keyboard = None
+    if can_self_cancel(o):
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Cancel order", callback_data=f"tcx_{o['id']}")
+        ]])
     await message.answer(
         f"{emoji} <b>Active Order</b>\n\n"
         f"Order: #{o['id'][:8]}\n"
         f"Status: {o['order_status'].capitalize()}\n"
         f"Payment: {o['payment_status'].capitalize()}\n"
-        f"Total: ₦{float(o['total_amount']):,.0f}"
+        f"Total: ₦{float(o['total_amount']):,.0f}",
+        reply_markup=keyboard,
     )
 
 

@@ -49,6 +49,7 @@ async def generate_daily_report(supabase: Client, restaurant_id: str, date: date
     orders = supabase.table("orders")\
         .select("*, order_items(*, menu_items(name))")\
         .eq("restaurant_id", restaurant_id)\
+        .neq("order_status", "cancelled")\
         .gte("created_at", start_of_day.isoformat())\
         .lte("created_at", end_of_day.isoformat())\
         .execute()
@@ -136,6 +137,7 @@ async def generate_weekly_report(supabase: Client, restaurant_id: str, end_date:
     orders = supabase.table("orders")\
         .select("*, order_items(*, menu_items(name))")\
         .eq("restaurant_id", restaurant_id)\
+        .neq("order_status", "cancelled")\
         .gte("created_at", start_date.isoformat())\
         .lte("created_at", end_date.isoformat())\
         .execute()
