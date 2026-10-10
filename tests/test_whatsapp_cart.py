@@ -43,7 +43,7 @@ from whatsapp import (
     can_skip_group,
     validate_group_selection,
 )
-from bot import format_order_headline
+from bot import format_kitchen_item_line, format_order_headline
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +221,32 @@ class TestKitchenOrderHeadline(unittest.TestCase):
     def test_table_number_is_html_escaped(self):
         location_line, _ = format_order_headline("dine_in", "A&B", "Cash Payment", 0)
         self.assertEqual(location_line, "<b>🪑 TABLE A&amp;B · DINE-IN</b>")
+
+
+class TestKitchenItemLine(unittest.TestCase):
+
+    def test_without_picks(self):
+        self.assertEqual(format_kitchen_item_line("Swallow Combo", 1, []), "• Swallow Combo × 1")
+
+    def test_one_pick(self):
+        self.assertEqual(
+            format_kitchen_item_line("Swallow Combo", 1, [("Amala", 1)]),
+            "• Swallow Combo (Amala) × 1",
+        )
+
+    def test_picks_with_quantities(self):
+        self.assertEqual(
+            format_kitchen_item_line(
+                "Swallow Combo", 1, [("Amala", 1), ("Beef", 3), ("Fish", 2)]
+            ),
+            "• Swallow Combo (Amala, Beef x3, Fish x2) × 1",
+        )
+
+    def test_html_characters_are_escaped(self):
+        self.assertEqual(
+            format_kitchen_item_line("A&B <Combo>", 1, [("Fish & Chips", 1)]),
+            "• A&amp;B &lt;Combo&gt; (Fish &amp; Chips) × 1",
+        )
 
 
 class TestAvailablePaymentMethods(unittest.TestCase):

@@ -696,6 +696,20 @@ def format_order_headline(order_type, table_number, payment_method, total, deliv
     return f"<b>{location_line}</b>", f"<b>{payment_line}</b>"
 
 
+def format_kitchen_item_line(name, qty, picks):
+    """Format one escaped kitchen ticket item with its selected modifiers."""
+    modifier_labels = []
+    for modifier_name, modifier_qty in picks or []:
+        safe_modifier_name = escape(str(modifier_name))
+        modifier_qty = int(modifier_qty or 1)
+        modifier_labels.append(
+            f"{safe_modifier_name} x{modifier_qty}" if modifier_qty > 1
+            else safe_modifier_name
+        )
+    modifiers = f" ({', '.join(modifier_labels)})" if modifier_labels else ""
+    return f"• {escape(str(name))}{modifiers} × {qty}"
+
+
 def parse_created_at(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
@@ -883,17 +897,12 @@ async def send_order_to_kitchen_from_db(bot: Bot, order_id: str):
         menu_item = item.get("menu_items") or {}
         qty = int(item.get("quantity") or 0)
         name = menu_item.get("name", "Item")
-        modifier_labels = []
+        picks = []
         for modifier in item.get("order_item_modifiers") or []:
             option_name = (modifier.get("modifier_options") or {}).get("name")
             if option_name:
-                modifier_qty = int(modifier.get("quantity") or 1)
-                modifier_labels.append(
-                    f"{escape(str(option_name))} x{modifier_qty}" if modifier_qty > 1
-                    else escape(str(option_name))
-                )
-        modifier_text = f" ({', '.join(modifier_labels)})" if modifier_labels else ""
-        order_text += f"• {escape(str(name))}{modifier_text} × {qty}\n"
+                picks.append((option_name, modifier.get("quantity") or 1))
+        order_text += format_kitchen_item_line(name, qty, picks) + "\n"
 
     order_text += "─────────────────"
     order_text += f"\n💰 <b>{format_money(total_price)}</b>"
@@ -2184,14 +2193,14 @@ def build_kitchen_order_text(
             order_text += f"🗺 {format_maps_link(float(delivery_lat), float(delivery_lon))}\n"
     order_text += "─────────────────\n"
     for item in cart.values():
-        if item.get("modifiers"):
-            modifiers = ", ".join(
-                f"{pick['name']} x{pick['quantity']}" if pick["quantity"] > 1 else pick["name"]
-                for picks in item["modifiers"].values() for pick in picks
-            )
-            order_text += f"• {escape(item['name'])} ({escape(modifiers)}) × {item['qty']}\n"
-        else:
-            order_text += f"• {escape(item['name'])} × {item['qty']}\n"
+        picks = [
+            (pick.get("name", "Option"), pick.get("quantity", 1))
+            for group_picks in (item.get("modifiers") or {}).values()
+            for pick in group_picks
+        ]
+        order_text += format_kitchen_item_line(
+            item.get("name", "Item"), item.get("qty", 0), picks
+        ) + "\n"
 
     payment_method = data.get("payment_method", "Unknown")
     delivery_fee = Decimal(str(data.get("delivery_fee") or 0))
