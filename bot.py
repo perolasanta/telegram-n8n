@@ -665,7 +665,7 @@ def order_short_id(order_id: str) -> str:
 def available_payment_methods(order_type, pod_enabled, paystack_enabled, has_bank) -> list[str]:
     """Return enabled payment method ids for an order's fulfillment type."""
     methods = []
-    if order_type in {"dine_in", "pickup"}:
+    if order_type in {"dine_in", "pickup"} and pod_enabled:
         methods.append("cash")
     if has_bank:
         methods.append("bank")
@@ -846,7 +846,7 @@ async def create_paystack_payment_link(order_id: str, amount: float, email: str,
 
 async def send_order_to_kitchen_from_db(bot: Bot, order_id: str):
     order_resp = supabase.table("orders")\
-        .select("*, order_items(quantity, menu_items(name)), restaurant_tables(table_number), restaurants(name, kitchen_chat_id)")\
+        .select("*, order_items(quantity, menu_items(name), order_item_modifiers(quantity, modifier_options(name))), restaurant_tables(table_number), restaurants(name, kitchen_chat_id)")\
         .eq("id", order_id).execute()
 
     if not order_resp.data:
@@ -883,7 +883,17 @@ async def send_order_to_kitchen_from_db(bot: Bot, order_id: str):
         menu_item = item.get("menu_items") or {}
         qty = int(item.get("quantity") or 0)
         name = menu_item.get("name", "Item")
-        order_text += f"• {escape(name)} × {qty}\n"
+        modifier_labels = []
+        for modifier in item.get("order_item_modifiers") or []:
+            option_name = (modifier.get("modifier_options") or {}).get("name")
+            if option_name:
+                modifier_qty = int(modifier.get("quantity") or 1)
+                modifier_labels.append(
+                    f"{escape(str(option_name))} x{modifier_qty}" if modifier_qty > 1
+                    else escape(str(option_name))
+                )
+        modifier_text = f" ({', '.join(modifier_labels)})" if modifier_labels else ""
+        order_text += f"• {escape(str(name))}{modifier_text} × {qty}\n"
 
     order_text += "─────────────────"
     order_text += f"\n💰 <b>{format_money(total_price)}</b>"
@@ -2909,7 +2919,7 @@ async def order_history(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
 
     orders = supabase.table("orders")\
-        .select("id, created_at, total_amount, order_status, payment_status, order_type, order_items(quantity, menu_items(name, price)), restaurants(name), restaurant_tables(table_number)")\
+        .select("id, restaurant_id, order_channel, payment_method, created_at, total_amount, order_status, payment_status, order_type, order_items(quantity, menu_items(name, price)), restaurants(name), restaurant_tables(table_number)")\
         .eq("telegram_user_id", user_id)\
         .order("created_at", desc=True)\
         .limit(5)\
@@ -2961,14 +2971,122 @@ async def order_history(message: types.Message, state: FSMContext):
         )
 
         # Reorder button sits directly under each order card
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text=f"🔄 Reorder these items",
-                callback_data=f"reorder_{order_id}"
-            )]
-        ])
+        keyboard_rows = [[InlineKeyboardButton(
+            text="🔄 Reorder these items",
+            callback_data=f"reorder_{order_id}"
+        )]]
+        if (
+            order.get("order_channel") == "telegram"
+            and raw_status.lower() == "pending"
+            and order.get("payment_method") in {"Cash Payment", "Pay on Delivery"}
+        ):
+            keyboard_rows.append([InlineKeyboardButton(
+                text="❌ Cancel order",
+                callback_data=f"cancel_tg:{order_id}",
+            )])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
         await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("cancel_tg:"))
+async def begin_telegram_order_cancellation(callback_query: types.CallbackQuery):
+    order_id = callback_query.data.partition(":")[2]
+    result = supabase.table("orders").select(
+        "id, restaurant_id, order_status, payment_method, order_channel"
+    ).eq("id", order_id).eq(
+        "telegram_user_id", callback_query.from_user.id
+    ).eq("order_channel", "telegram").execute()
+    order = result.data[0] if result.data else {}
+    if (
+        not order
+        or order.get("order_status") != "pending"
+        or order.get("payment_method") not in {"Cash Payment", "Pay on Delivery"}
+    ):
+        await callback_query.answer("This order can no longer be cancelled.", show_alert=True)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Yes, cancel", callback_data=f"cancel_tg_yes:{order_id}")],
+        [InlineKeyboardButton(text="Keep order", callback_data=f"cancel_tg_no:{order_id}")],
+    ])
+    await callback_query.message.answer(
+        f"Cancel pending order #{order_id[:8]}?", reply_markup=keyboard
+    )
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data.startswith("cancel_tg_no:"))
+async def abort_telegram_order_cancellation(callback_query: types.CallbackQuery):
+    await callback_query.message.edit_text("Your order has not been cancelled.", reply_markup=None)
+    await callback_query.answer()
+
+
+@dp.callback_query(F.data.startswith("cancel_tg_yes:"))
+async def confirm_telegram_order_cancellation(callback_query: types.CallbackQuery, bot: Bot):
+    order_id = callback_query.data.partition(":")[2]
+    user_id = callback_query.from_user.id
+    order_result = supabase.table("orders").select(
+        "id, restaurant_id, order_status, payment_method, kitchen_message_id, kitchen_message_text, restaurants(kitchen_chat_id)"
+    ).eq("id", order_id).eq("telegram_user_id", user_id).eq(
+        "order_channel", "telegram"
+    ).execute()
+    order = order_result.data[0] if order_result.data else {}
+    restaurant_id = order.get("restaurant_id")
+    if (
+        not restaurant_id
+        or order.get("order_status") != "pending"
+        or order.get("payment_method") not in {"Cash Payment", "Pay on Delivery"}
+    ):
+        await callback_query.answer("This order can no longer be cancelled.", show_alert=True)
+        return
+
+    updated = supabase.table("orders").update({
+        "order_status": "cancelled",
+    }).eq("id", order_id).eq("restaurant_id", restaurant_id).eq(
+        "telegram_user_id", user_id
+    ).eq("order_channel", "telegram").eq("order_status", "pending").in_(
+        "payment_method", ["Cash Payment", "Pay on Delivery"]
+    ).select("id").execute()
+    if not updated.data:
+        await callback_query.answer("This order was already updated.", show_alert=True)
+        return
+
+    try:
+        await restore_inventory_for_order(order_id)
+    except Exception:
+        logging.exception("Failed to restore inventory for cancelled Telegram order %s", order_id)
+
+    kitchen_chat_id = (order.get("restaurants") or {}).get("kitchen_chat_id")
+    kitchen_bot = delivery_bots.get(restaurant_id, bot)
+    if kitchen_chat_id:
+        try:
+            if order.get("kitchen_message_id") and order.get("kitchen_message_text"):
+                await kitchen_bot.edit_message_text(
+                    chat_id=kitchen_chat_id,
+                    message_id=order["kitchen_message_id"],
+                    text=order["kitchen_message_text"] + "\n\n❌ <b>CANCELLED BY CUSTOMER</b>",
+                    reply_markup=None,
+                )
+            else:
+                raise ValueError("Kitchen message details are unavailable")
+        except Exception:
+            logging.exception("Failed to edit kitchen ticket for cancelled Telegram order %s", order_id)
+            try:
+                await kitchen_bot.send_message(
+                    kitchen_chat_id, f"❌ ORDER #{order_id[:8]} CANCELLED by customer"
+                )
+            except Exception:
+                logging.exception("Failed to notify kitchen of cancelled Telegram order %s", order_id)
+    try:
+        await refresh_kitchen_order_board(kitchen_bot, restaurant_id)
+    except Exception:
+        logging.exception("Failed to refresh kitchen board after Telegram cancellation %s", order_id)
+
+    await callback_query.message.edit_text(
+        f"Order #{order_id[:8]} has been cancelled.", reply_markup=None
+    )
+    await callback_query.answer("Order cancelled.")
 
 
 @dp.callback_query(F.data.startswith("reorder_"))

@@ -1932,7 +1932,9 @@ async def confirm_order_cancellation(order_id, state, restaurant, from_number, s
             except Exception:
                 logging.exception("Failed to notify kitchen of cancelled order %s", order_id)
     try:
-        await refresh_kitchen_order_board(bot, restaurant["id"])
+        await refresh_kitchen_order_board(
+            delivery_bots.get(restaurant["id"], bot), restaurant["id"]
+        )
     except Exception:
         logging.exception("Failed to refresh kitchen board after cancelling order %s", order_id)
 

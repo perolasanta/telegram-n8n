@@ -235,7 +235,7 @@ class TestAvailablePaymentMethods(unittest.TestCase):
                             paystack_enabled=paystack_enabled, has_bank=has_bank,
                         ):
                             expected = []
-                            if order_type in {"dine_in", "pickup"}:
+                            if order_type in {"dine_in", "pickup"} and pod_enabled:
                                 expected.append("cash")
                             if has_bank:
                                 expected.append("bank")
