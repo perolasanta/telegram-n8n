@@ -11,6 +11,7 @@ import logging
 import asyncio
 import aiohttp
 import os
+import re
 from html import escape
 from supabase import Client, create_client
 from decimal import Decimal
@@ -3671,6 +3672,46 @@ async def set_pay_on_delivery(message: types.Message):
     await message.answer(
         f"✅ Pay on delivery {'enabled' if enabled else 'disabled'} for "
         f"{escape(str(result.data[0].get('name') or restaurant_id))}."
+    )
+
+
+@dp.message(Command("set_branding"))
+async def set_restaurant_branding(message: types.Message):
+    admin_telegram_id = int(ADMIN_TELEGRAM_ID)
+    if message.from_user.id != admin_telegram_id:
+        return
+    args = (message.text or "").split()
+    if len(args) not in (3, 4):
+        await message.answer("Usage: /set_branding <restaurant_id> <#hex> [https-logo-url|none]")
+        return
+
+    restaurant_id, brand_color = args[1], args[2]
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", brand_color):
+        await message.answer("Brand color must be a six-digit hex value, such as #1F2937.")
+        return
+    updates = {"brand_color": brand_color}
+    if len(args) == 4:
+        logo_value = args[3]
+        if logo_value.lower() == "none":
+            updates["logo_url"] = None
+        elif logo_value.startswith("https://") and len(logo_value) < 500:
+            updates["logo_url"] = logo_value
+        else:
+            await message.answer("Logo must be an HTTPS URL under 500 characters, or none.")
+            return
+
+    result = supabase.table("restaurants").update(updates).eq(
+        "id", restaurant_id
+    ).select("name, brand_color, logo_url").execute()
+    if not result.data:
+        await message.answer("Restaurant not found.")
+        return
+    saved = result.data[0]
+    saved_logo = saved.get("logo_url") or "none"
+    await message.answer(
+        f"✅ Branding saved for {escape(str(saved.get('name') or restaurant_id))}.\n"
+        f"Color: {escape(str(saved.get('brand_color') or ''))}\n"
+        f"Logo: {escape(str(saved_logo))}"
     )
 
 

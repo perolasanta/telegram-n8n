@@ -52,6 +52,42 @@ logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler(timezone = pytz.timezone("Africa/Lagos"))
 
+LANDING_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'none'; img-src https: data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+}
+
+
+def sanitize_brand_color(value):
+    value = str(value or "")
+    return value if re.fullmatch(r"#[0-9a-fA-F]{6}", value) else "#1F2937"
+
+
+def readable_text_color(hex_color):
+    color = sanitize_brand_color(hex_color).lstrip("#")
+    channels = [int(color[index:index + 2], 16) / 255 for index in (0, 2, 4)]
+    linear = [channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4 for channel in channels]
+    luminance = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+    white_contrast = 1.05 / (luminance + 0.05)
+    dark_luminance = 0.2126 * (17 / 255 / 12.92) + 0.7152 * (17 / 255 / 12.92) + 0.0722 * (17 / 255 / 12.92)
+    dark_contrast = (luminance + 0.05) / (dark_luminance + 0.05)
+    return "#FFFFFF" if white_contrast >= dark_contrast else "#111111"
+
+
+def sanitize_logo_url(value):
+    if isinstance(value, str) and value.startswith("https://") and len(value) < 500:
+        return value
+    return None
+
+
+def format_display_number(digits):
+    digits = re.sub(r"\D", "", str(digits or ""))
+    if digits.startswith("0") and len(digits) == 11:
+        digits = "234" + digits[1:]
+    if digits.startswith("234") and len(digits) == 13:
+        return f"+234 {digits[3:6]} {digits[6:9]} {digits[9:]}"
+    return f"+{digits}" if digits else ""
+
 
 def build_landing_links(table_number, public_code, display_number):
     digits = re.sub(r"[^0-9]", "", str(display_number or ""))
@@ -64,12 +100,12 @@ def build_landing_links(table_number, public_code, display_number):
 
 @app.get("/t/{public_code}", response_class=HTMLResponse)
 async def table_landing(public_code: str):
-    no_store = {"Cache-Control": "no-store"}
+    no_store = LANDING_HEADERS.copy()
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", public_code or ""):
         return HTMLResponse("<!doctype html><title>Not found</title><h1>Not found</h1>", status_code=404, headers=no_store)
 
     result = supabase.table("restaurant_tables").select(
-        "id, table_number, restaurant_id, restaurants(name, whatsapp_display_number, whatsapp_phone_number_id, whatsapp_addon_enabled, whatsapp_addon_expires_at, subscription_status, subscription_expires_at)"
+        "id, table_number, restaurant_id, restaurants(name, whatsapp_display_number, whatsapp_phone_number_id, whatsapp_addon_enabled, whatsapp_addon_expires_at, subscription_status, subscription_expires_at, brand_color, logo_url)"
     ).eq("public_code", public_code).eq("is_active", True).limit(1).execute()
     if not result.data:
         return HTMLResponse(
@@ -98,32 +134,87 @@ async def table_landing(public_code: str):
         )
 
     telegram_url = f"https://t.me/{quote(TELEGRAM_BOT_USERNAME, safe='')}?start={quote(public_code, safe='')}"
+    display_number = restaurant.get("whatsapp_display_number")
     whatsapp_url = build_landing_links(
-        table.get("table_number"), public_code, restaurant.get("whatsapp_display_number")
+        table.get("table_number"), public_code, display_number
     )
+    addon_active = is_whatsapp_addon_active(restaurant)
     whatsapp_available = (
         whatsapp_url is not None
         and restaurant.get("whatsapp_phone_number_id")
-        and is_whatsapp_addon_active(restaurant)
+        and addon_active
     )
     if not whatsapp_available:
+        failed_conditions = []
+        if whatsapp_url is None:
+            failed_conditions.append("display number invalid")
+        if not restaurant.get("whatsapp_phone_number_id"):
+            failed_conditions.append("phone id missing")
+        if not addon_active:
+            failed_conditions.append("add-on inactive")
+        logger.warning(
+            "WhatsApp button hidden for restaurant_id=%s: %s",
+            table.get("restaurant_id"), ", ".join(failed_conditions),
+        )
         return RedirectResponse(telegram_url, status_code=302, headers=no_store)
 
     table_number = table.get("table_number")
     is_table = table_number is not None and str(table_number) != "EXTERNAL"
-    title = html.escape(str(restaurant.get("name") or "Restaurant"))
-    table_copy = f"<p>{html.escape(f'Table {table_number}')}</p>" if is_table else ""
+    restaurant_name = str(restaurant.get("name") or "Restaurant")
+    title = html.escape(restaurant_name, quote=True)
+    brand_color = sanitize_brand_color(restaurant.get("brand_color"))
+    brand_text_color = readable_text_color(brand_color)
+    logo_url = sanitize_logo_url(restaurant.get("logo_url"))
+    logo_html = ""
+    if logo_url:
+        logo_url_attr = html.escape(quote(logo_url, safe=":/?#[]@!$&'()*+,;=%"), quote=True)
+        logo_html = f'<img class="logo" src="{logo_url_attr}" alt="">'
+    initials = "".join(part[0] for part in restaurant_name.split()[:2]).upper() or "C"
+    initials_html = html.escape(initials, quote=True)
+    location_label = f"Table {table_number} · Dine-in" if is_table else "Delivery & pickup"
+    phone_label = html.escape(format_display_number(display_number), quote=True)
+    table_pill = html.escape(location_label, quote=True)
     page = (
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        f"<title>{title}</title><style>body{{font:16px sans-serif;margin:0;padding:24px;"
-        "min-height:100vh;box-sizing:border-box;display:flex;flex-direction:column;"
-        "justify-content:center;gap:16px}}h1{font-size:1.5rem}a{display:block;padding:18px;"
-        "border-radius:12px;text-align:center;text-decoration:none;font-weight:bold;"
-        "background:#087f5b;color:white}a+ a{background:#128c7e}</style></head><body>"
-        f"<h1>{title}</h1>{table_copy}"
-        f"<a href=\"{html.escape(telegram_url, quote=True)}\">Continue on Telegram</a>"
-        f"<a href=\"{html.escape(whatsapp_url, quote=True)}\">Continue on WhatsApp</a>"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
+        f"<title>{title}</title><meta property=\"og:title\" content=\"{title}\">"
+        "<style>*{box-sizing:border-box}body{font:16px/1.5 system-ui,-apple-system,sans-serif;"
+        "margin:0;min-height:100vh;min-height:100dvh;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom);"
+        "display:flex;justify-content:center;color:#111827;background:#f8fafc}.shell{width:100%;max-width:480px;"
+        "margin:auto 0;padding:16px 0}.brand{background:var(--brand);color:var(--brand-text);border-radius:24px;"
+        "padding:24px 20px;display:flex;align-items:center;gap:16px}.avatar{width:68px;height:68px;flex:none;"
+        "position:relative;border-radius:50%;display:grid;place-items:center;background:rgba(255,255,255,.22);"
+        "font-size:22px;font-weight:800}.logo{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;"
+        "border-radius:50%}.brand h1{font-size:24px;line-height:1.2;margin:0 0 10px;overflow-wrap:anywhere}"
+        ".pill{display:inline-block;border:1px solid currentColor;border-radius:999px;padding:4px 10px;"
+        "font-size:13px;font-weight:650}.content{padding:24px 4px}.content h2{font-size:21px;margin:0 0 16px}"
+        ".action{min-height:60px;width:100%;padding:15px 18px;border:0;border-radius:16px;display:flex;"
+        "align-items:center;justify-content:center;gap:12px;color:#fff;text-decoration:none;font-size:17px;"
+        "font-weight:750;margin:0 0 12px}.action svg{width:24px;height:24px;flex:none}.telegram{background:#229ED9}"
+        ".whatsapp{background:#25D366}.muted{text-align:center;font-size:13px;color:#64748b;margin:-4px 0 22px}"
+        ".steps{border-top:1px solid #e2e8f0;padding-top:20px}.steps h2{font-size:17px;margin:0 0 12px}"
+        ".steps ol{list-style:none;padding:0;margin:0;display:grid;grid-template-columns:repeat(3,1fr);gap:8px}"
+        ".steps li{font-size:12px;color:#475569;text-align:center}.step{display:grid;place-items:center;width:30px;"
+        "height:30px;border-radius:50%;background:#e2e8f0;color:#0f172a;font-weight:800;margin:0 auto 7px}"
+        "footer{text-align:center;color:#64748b;font-size:12px;padding:18px 0 4px}@media(prefers-color-scheme:dark){"
+        "body{background:#0f172a;color:#f8fafc}.steps{border-color:#334155}.steps li,.muted,footer{color:#94a3b8}"
+        ".step{background:#334155;color:#f8fafc}}</style></head><body><main class=\"shell\">"
+        f"<header class=\"brand\" style=\"--brand:{brand_color};--brand-text:{brand_text_color}\">"
+        f"<span class=\"avatar\" aria-hidden=\"true\">{initials_html}{logo_html}</span>"
+        f"<div><h1>{title}</h1><span class=\"pill\">{table_pill}</span></div></header>"
+        "<section class=\"content\"><h2>How would you like to order?</h2>"
+        f"<a class=\"action telegram\" href=\"{html.escape(telegram_url, quote=True)}\">"
+        "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path fill=\"currentColor\" d=\"M21.8 3.2 18.7 20c-.2 1.2-.9 1.5-1.8.9l-5-3.7-2.4 2.3c-.3.3-.5.5-1 .5l.4-5.1 9.3-8.4c.4-.4-.1-.6-.6-.2L6.1 13.6l-5-1.6c-1.1-.3-1.1-1.1.2-1.6L20.9 2.7c.9-.3 1.6.2.9.5Z\"/></svg>"
+        "Continue on Telegram</a>"
+        f"<a class=\"action whatsapp\" href=\"{html.escape(whatsapp_url, quote=True)}\">"
+        "<svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path fill=\"currentColor\" d=\"M12 2a9.8 9.8 0 0 0-8.5 14.7L2 22l5.5-1.4A10 10 0 1 0 12 2Zm0 18a8 8 0 0 1-4.1-1.1l-.3-.2-3.2.8.9-3.1-.2-.3A8 8 0 1 1 12 20Zm4.4-6c-.2-.1-1.5-.8-1.8-.9-.2-.1-.4-.1-.5.1l-.8 1c-.1.2-.3.2-.5.1a6.5 6.5 0 0 1-3.2-2.8c-.2-.3.2-.3.7-1.2.1-.2 0-.3 0-.4l-.8-1.9c-.2-.5-.4-.4-.5-.4h-.5c-.2 0-.4.1-.6.3-.2.2-.8.8-.8 2s.8 2.3.9 2.4a9 9 0 0 0 3.5 3.1c1.3.6 1.8.7 2.4.6.4-.1 1.5-.6 1.7-1.2.2-.6.2-1.1.1-1.2 0-.1-.2-.2-.4-.3Z\"/></svg>"
+        "Continue on WhatsApp</a>"
+        f"<p class=\"muted\">or message us on {phone_label}</p></section>"
+        "<section class=\"steps\"><h2>How it works</h2><ol>"
+        "<li><span class=\"step\">1</span>Pick your items</li>"
+        "<li><span class=\"step\">2</span>Choose how to pay</li>"
+        "<li><span class=\"step\">3</span>We prepare it</li></ol></section>"
+        "<footer>Powered by Chowlin</footer></main>"
         "</body></html>"
     )
     return HTMLResponse(page, headers=no_store)
