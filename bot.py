@@ -665,7 +665,9 @@ def order_short_id(order_id: str) -> str:
 def available_payment_methods(order_type, pod_enabled, paystack_enabled, has_bank) -> list[str]:
     """Return enabled payment method ids for an order's fulfillment type."""
     methods = []
-    if order_type in {"dine_in", "pickup"} and pod_enabled:
+    if order_type == "dine_in":
+        methods.append("cash")
+    elif order_type == "pickup" and pod_enabled:
         methods.append("cash")
     if has_bank:
         methods.append("bank")
@@ -2025,8 +2027,15 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
         restaurant_settings.get("paystack_enabled"),
         bool(restaurant_settings.get("bank_name") and restaurant_settings.get("account_number")),
     )
+    if not allowed_methods:
+        await callback_query.message.answer(
+            "This order type isn't available right now. Please contact the restaurant."
+        )
+        await state.clear()
+        await callback_query.answer()
+        return
     button_details = {
-        "cash": ("💰 Cash Payment", "pay_cash"),
+        "cash": ("💰 Cash at pickup" if order_type == "pickup" else "💰 Cash Payment", "pay_cash"),
         "bank": ("🏦 Bank Transfer", "pay_bank"),
         "pod": ("💵 Pay on Delivery", "pay_delivery"),
         "paystack": ("💳 Pay with Card (Paystack)", "pay_paystack"),

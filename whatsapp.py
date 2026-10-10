@@ -407,11 +407,11 @@ async def send_buttons(phone_number_id: str, token: str, to: str, body: str, but
     await send_whatsapp_message(phone_number_id, token, to, build_buttons_payload(body, buttons))
 
 
-async def send_payment_options(phone_number_id, token, to, allowed_methods: list[str], state):
+async def send_payment_options(phone_number_id, token, to, allowed_methods: list[str], state, order_type):
     if not allowed_methods:
         await send_text(
             phone_number_id, token, to,
-            "Delivery isn't available right now. Please contact the restaurant.",
+            "This order type isn't available right now. Please contact the restaurant.",
         )
         await state.clear()
         return
@@ -421,6 +421,8 @@ async def send_payment_options(phone_number_id, token, to, allowed_methods: list
         "pod": ("pay_pod", "Pay on delivery"),
         "paystack": ("pay_paystack", "Pay with card"),
     }
+    if order_type == "pickup":
+        titles["cash"] = ("pay_cash", "Cash at pickup")
     rows = [
         {"id": titles[method][0], "title": titles[method][1]}
         for method in allowed_methods if method in titles
@@ -428,7 +430,7 @@ async def send_payment_options(phone_number_id, token, to, allowed_methods: list
     if not rows:
         await send_text(
             phone_number_id, token, to,
-            "Delivery isn't available right now. Please contact the restaurant.",
+            "This order type isn't available right now. Please contact the restaurant.",
         )
         await state.clear()
         return
@@ -1376,7 +1378,7 @@ async def choose_pickup(state, restaurant, from_number):
     )
     await send_payment_options(
         restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"],
-        from_number, allowed_methods, state,
+        from_number, allowed_methods, state, "pickup",
     )
 
 
@@ -1434,7 +1436,7 @@ async def request_payment_method(state, restaurant, from_number):
     )
     await send_payment_options(
         restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"],
-        from_number, allowed_methods, state,
+        from_number, allowed_methods, state, data.get("order_type", "delivery"),
     )
 
 
