@@ -1784,13 +1784,34 @@ async def confirm_order_cancellation(order_id, state, restaurant, from_number, s
     kitchen_chat_id = restaurant.get("kitchen_chat_id")
     if kitchen_chat_id:
         kitchen_bot = delivery_bots.get(restaurant["id"], bot)
+        saved = {}
         try:
-            await kitchen_bot.send_message(
-                kitchen_chat_id,
-                html.escape(f"ORDER #{order_id[:8]} CANCELLED by customer"),
-            )
+            kitchen_order = supabase.table("orders").select(
+                "kitchen_message_id, kitchen_message_text"
+            ).eq("id", order_id).eq("restaurant_id", restaurant["id"]).execute()
+            saved = (kitchen_order.data or [{}])[0]
         except Exception:
-            logging.exception("Failed to notify kitchen of cancelled order %s", order_id)
+            logging.exception("Failed to read kitchen message details for cancelled order %s", order_id)
+        try:
+            message_id = saved.get("kitchen_message_id")
+            stored_text = saved.get("kitchen_message_text")
+            if message_id and stored_text:
+                await kitchen_bot.edit_message_text(
+                    chat_id=kitchen_chat_id,
+                    message_id=message_id,
+                    text=stored_text + "\n\n❌ <b>CANCELLED BY CUSTOMER</b>",
+                    reply_markup=None,
+                )
+            else:
+                raise ValueError("Kitchen message details are unavailable")
+        except Exception:
+            logging.exception("Failed to edit kitchen ticket for cancelled order %s", order_id)
+            try:
+                await kitchen_bot.send_message(
+                    kitchen_chat_id, f"❌ ORDER #{order_id[:8]} CANCELLED by customer"
+                )
+            except Exception:
+                logging.exception("Failed to notify kitchen of cancelled order %s", order_id)
     try:
         await refresh_kitchen_order_board(bot, restaurant["id"])
     except Exception:

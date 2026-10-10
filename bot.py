@@ -661,6 +661,26 @@ def order_short_id(order_id: str) -> str:
     return order_id.replace("-", "")[:4].upper()
 
 
+def format_order_headline(order_type, table_number, payment_method, total, delivery_address=None):
+    """Format the prominent location and payment lines for a kitchen ticket."""
+    if order_type == "delivery":
+        location_line = "🛵 DELIVERY"
+    elif order_type == "pickup":
+        location_line = "🏃 PICKUP"
+    else:
+        location_line = f"🪑 TABLE {escape(str(table_number or 'Unknown'))} · DINE-IN"
+
+    total_display = f"₦{Decimal(str(total or 0)):,.0f}"
+    payment_lines = {
+        "Cash Payment": f"💰 CASH · COLLECT {total_display}",
+        "Pay on Delivery": f"💵 PAY ON DELIVERY · COLLECT {total_display}",
+        "Bank Transfer": "🏦 BANK TRANSFER · VERIFY PROOF",
+        "Paystack": "💳 PAID ONLINE (PAYSTACK)",
+    }
+    payment_line = payment_lines.get(payment_method, escape(str(payment_method or "Unknown")).upper())
+    return f"<b>{location_line}</b>", f"<b>{payment_line}</b>"
+
+
 def parse_created_at(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
@@ -824,14 +844,6 @@ async def send_order_to_kitchen_from_db(bot: Bot, order_id: str):
     total_price = float(order.get("total_amount") or 0)
     payment_method = order.get("payment_method", "Unknown")
 
-    if order_type == "delivery":
-        order_location = f"Delivery\n📍 {order.get('delivery_address') or 'No address provided'}"
-    elif order_type == "pickup":
-        order_location = "Pickup"
-    else:
-        table = order.get("restaurant_tables") or {}
-        order_location = f"Table {table.get('table_number') or 'Unknown'} — Dine-in"
-
     if not kitchen_chat_id:
         print("⚠️ No kitchen_chat_id configured for this restaurant")
         return
@@ -839,9 +851,17 @@ async def send_order_to_kitchen_from_db(bot: Bot, order_id: str):
     user_id = order.get("telegram_user_id")
     customer_name = order.get("customer_name") or "Customer"
 
-    order_text = f"🆕 <b>NEW ORDER  #{order_short_id(order_id)}</b>\n"
+    table = order.get("restaurant_tables") or {}
+    location_line, payment_line = format_order_headline(
+        order_type, table.get("table_number"), payment_method, total_price,
+        order.get("delivery_address"),
+    )
+    order_text = f"🆕 <b>NEW ORDER #{order_short_id(order_id)}</b>\n"
     order_text += f"🏪 {escape(restaurant_name)}\n"
-    order_text += f"📍 {escape(order_location)}\n"
+    order_text += "─────────────────\n"
+    order_text += f"{location_line}\n{payment_line}\n"
+    if order_type == "delivery":
+        order_text += f"📍 {escape(order.get('delivery_address') or 'No address provided')}\n"
     order_text += "─────────────────\n"
 
     for item in order.get("order_items") or []:
@@ -851,16 +871,30 @@ async def send_order_to_kitchen_from_db(bot: Bot, order_id: str):
         order_text += f"• {escape(name)} × {qty}\n"
 
     order_text += "─────────────────"
-    order_text += f"\n💰 {format_money(total_price)}  |  {escape(payment_method)}"
+    order_text += f"\n💰 <b>{format_money(total_price)}</b>"
+    delivery_fee = Decimal(str(order.get("delivery_fee") or 0))
+    if delivery_fee > 0:
+        order_text += f" (incl. ₦{delivery_fee:,.0f} delivery)"
     order_text += f"\n⏱ {datetime.now(pytz.timezone('Africa/Lagos')).strftime('%I:%M %p').lstrip('0')}"
+    if payment_method == "Bank Transfer":
+        order_text += "\n⏳ Status: Pending Verification"
     order_text += f"\n👤 Customer: {escape(customer_name)}"
+    if order.get("customer_contact"):
+        order_text += f"\n📱 Contact: {escape(str(order.get('customer_contact')))}"
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🍳 Mark as Preparing", callback_data=f"preparing_{order_id}" )],
         [InlineKeyboardButton(text="✅ Mark as Ready", callback_data=f"ready_{order_id}" )]
     ])
     print(f"DEBUG kitchen_chat_id={kitchen_chat_id!r} type={type(kitchen_chat_id)}")
-    await bot.send_message(kitchen_chat_id, text=order_text, reply_markup=keyboard)
+    try:
+        sent_message = await bot.send_message(kitchen_chat_id, text=order_text, reply_markup=keyboard)
+        supabase.table("orders").update({
+            "kitchen_message_id": sent_message.message_id,
+            "kitchen_message_text": order_text,
+        }).eq("id", order_id).eq("restaurant_id", order.get("restaurant_id")).execute()
+    except Exception:
+        logging.exception("Failed to save kitchen message details for order %s", order_id)
     await refresh_kitchen_order_board(bot, order.get("restaurant_id"))
 
 
@@ -2107,19 +2141,20 @@ def build_kitchen_order_text(
     order_type = data.get("order_type", "dine_in")
 
     if order_type == "delivery":
-        order_location = f"Delivery\n📍 {data.get('delivery_address') or 'No address provided'}"
         delivery_lat = data.get("delivery_lat")
         delivery_lon = data.get("delivery_lon")
-        if delivery_lat is not None and delivery_lon is not None:
-            order_location += f"\n🗺 {format_maps_link(float(delivery_lat), float(delivery_lon))}"
-    elif order_type == "pickup":
-        order_location = "Pickup"
-    else:
-        order_location = f"Table {table_number} — Dine-in"
-
-    order_text = f"🆕 <b>NEW ORDER  #{order_short_id(order_id)}</b>\n"
+    location_line, payment_line = format_order_headline(
+        order_type, table_number, data.get("payment_method", "Unknown"), total_price,
+        data.get("delivery_address"),
+    )
+    order_text = f"🆕 <b>NEW ORDER #{order_short_id(order_id)}</b>\n"
     order_text += f"🏪 {escape(restaurant_name)}\n"
-    order_text += f"📍 {escape(order_location)}\n"
+    order_text += "─────────────────\n"
+    order_text += f"{location_line}\n{payment_line}\n"
+    if order_type == "delivery":
+        order_text += f"📍 {escape(data.get('delivery_address') or 'No address provided')}\n"
+        if delivery_lat is not None and delivery_lon is not None:
+            order_text += f"🗺 {format_maps_link(float(delivery_lat), float(delivery_lon))}\n"
     order_text += "─────────────────\n"
     for item in cart.values():
         if item.get("modifiers"):
@@ -2132,12 +2167,11 @@ def build_kitchen_order_text(
             order_text += f"• {escape(item['name'])} × {item['qty']}\n"
 
     payment_method = data.get("payment_method", "Unknown")
-    delivery_fee = data.get("delivery_fee", 0)
+    delivery_fee = Decimal(str(data.get("delivery_fee") or 0))
     order_text += "─────────────────"
-    order_text += f"\n💰 {format_money(total_price)}"
+    order_text += f"\n💰 <b>{format_money(total_price)}</b>"
     if delivery_fee > 0:
         order_text += f" (incl. ₦{delivery_fee:,.0f} delivery)"
-    order_text += f"  |  {escape(payment_method)}"
     order_text += f"\n⏱ {datetime.now(pytz.timezone('Africa/Lagos')).strftime('%I:%M %p').lstrip('0')}"
     if payment_method == "Bank Transfer":
         order_text += "\n⏳ Status: Pending Verification"
@@ -2169,6 +2203,8 @@ async def send_order_to_kitchen(
     # the main bot, and the kitchen group is only ever added to one of them.
     bot = delivery_bots.get(restaurant_id, bot)    
     order_text = build_kitchen_order_text(order_id, data, customer_name, customer_contact)
+    if payment_proof:
+        order_text = order_text[:1024]
     
     # Send to kitchen
     if payment_proof:
@@ -2180,7 +2216,7 @@ async def send_order_to_kitchen(
             ]
         ])
         
-        await bot.send_photo(
+        sent_message = await bot.send_photo(
             kitchen_chat_id,
             photo=payment_proof,
             caption=order_text,
@@ -2196,11 +2232,19 @@ async def send_order_to_kitchen(
             kitchen_buttons.append([InlineKeyboardButton(text="🛵 Send to Rider", callback_data=f"dispatch_{order_id}")])
         keyboard = InlineKeyboardMarkup(inline_keyboard=kitchen_buttons)
         print(f"DEBUG kitchen_chat_id={kitchen_chat_id!r} type={type(kitchen_chat_id)}")
-        await bot.send_message(
+        sent_message = await bot.send_message(
             kitchen_chat_id,
             text=order_text,
             reply_markup=keyboard
         )
+
+    try:
+        supabase.table("orders").update({
+            "kitchen_message_id": sent_message.message_id,
+            "kitchen_message_text": order_text,
+        }).eq("id", order_id).eq("restaurant_id", restaurant_id).execute()
+    except Exception:
+        logging.exception("Failed to save kitchen message details for order %s", order_id)
 
     if restaurant_id:
         await refresh_kitchen_order_board(bot, restaurant_id)
@@ -2212,8 +2256,8 @@ async def dispatch_to_rider_handler(callback_query: types.CallbackQuery, bot: Bo
     order_id = callback_query.data.replace("dispatch_", "")
 
     order = supabase.table("orders").select(
-        "id, customer_name, customer_contact, delivery_address, delivery_lat, delivery_lon, "
-        "total_amount, order_type, restaurant_id, restaurants(name, dispatch_group_id)"
+        "id, order_status, restaurant_id, customer_name, customer_contact, delivery_address, delivery_lat, delivery_lon, "
+        "total_amount, order_type, restaurants(name, dispatch_group_id)"
     ).eq("id", order_id).execute()
 
     if not order.data:
@@ -2221,6 +2265,9 @@ async def dispatch_to_rider_handler(callback_query: types.CallbackQuery, bot: Bo
         return
 
     order_data = order.data[0]
+    if order_data.get("order_status") == "cancelled":
+        await callback_query.answer("This order was cancelled.", show_alert=True)
+        return
     restaurant = order_data.get("restaurants") or {}
     dispatch_group_id = restaurant.get("dispatch_group_id")
 
@@ -2259,7 +2306,7 @@ async def dispatch_to_rider_handler(callback_query: types.CallbackQuery, bot: Bo
     supabase.table("orders").update({
         "dispatch_sent_at": datetime.now(pytz.timezone("Africa/Lagos")).isoformat(),
         "dispatch_sent_by": staff.username or str(staff.id),
-    }).eq("id", order_id).execute()
+    }).eq("id", order_id).eq("restaurant_id", order_data.get("restaurant_id")).execute()
 
     await callback_query.answer("Sent to dispatch ✅", show_alert=True)
 
@@ -2694,15 +2741,25 @@ async def reject_payment_handler(callback_query: types.CallbackQuery, bot: Bot):
 @dp.callback_query(F.data.startswith("preparing_"))
 async def handle_preparing(callback_query: types.CallbackQuery, bot: Bot):
     order_id = callback_query.data.replace("preparing_", "")
-    
-    supabase.table("orders")\
+    result = supabase.table("orders")\
         .update({"order_status": "preparing"})\
         .eq("id", order_id)\
+        .eq("order_status", "pending")\
+        .select("id, restaurant_id")\
         .execute()
+    if not result.data:
+        await callback_query.answer("This order was cancelled or already updated.", show_alert=True)
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    restaurant_id = result.data[0].get("restaurant_id")
     
     order = supabase.table("orders")\
-        .select("telegram_user_id, customer_contact, order_channel, restaurant_id, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
+        .select("telegram_user_id, customer_contact, order_channel, restaurant_id, order_type, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
         .eq("id", order_id)\
+        .eq("restaurant_id", restaurant_id)\
         .execute()
     
     if order.data:
@@ -2739,19 +2796,28 @@ async def handle_ready(callback_query: CallbackQuery, bot: Bot):
     """Kitchen marks order as ready"""
     order_id = callback_query.data.replace("ready_", "")
     
-    # Update order status
-    supabase.table("orders")\
+    # Update only an order that has not already advanced or been cancelled.
+    result = supabase.table("orders")\
         .update({"order_status": "ready"})\
         .eq("id", order_id)\
+        .in_("order_status", ["pending", "preparing"])\
+        .select("id, restaurant_id")\
         .execute()
+    if not result.data:
+        await callback_query.answer("This order was cancelled or already updated.", show_alert=True)
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    restaurant_id = result.data[0].get("restaurant_id")
     
     # Get order details
     order = supabase.table("orders")\
         .select("telegram_user_id, customer_name, customer_contact, order_channel, restaurant_id, order_type, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
         .eq("id", order_id)\
+        .eq("restaurant_id", restaurant_id)\
         .execute()
-
-    restaurant_id = None
 
     # Determine if we need to show the "Send to Rider" button for delivery orders    
     final_keyboard = None

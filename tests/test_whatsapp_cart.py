@@ -39,6 +39,7 @@ from whatsapp import (
     can_skip_group,
     validate_group_selection,
 )
+from bot import format_order_headline
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +151,40 @@ class TestOrderStatusFormatting(unittest.TestCase):
             "id": "order-123", "order_status": "pending", "payment_method": "Bank Transfer",
             "payment_status": "pending", "total_amount": 2500,
         }))
+
+
+class TestKitchenOrderHeadline(unittest.TestCase):
+
+    def test_location_lines_for_each_order_type(self):
+        expected = {
+            "dine_in": "<b>🪑 TABLE 5 · DINE-IN</b>",
+            "pickup": "<b>🏃 PICKUP</b>",
+            "delivery": "<b>🛵 DELIVERY</b>",
+        }
+        for order_type, location in expected.items():
+            with self.subTest(order_type=order_type):
+                self.assertEqual(
+                    format_order_headline(order_type, "5", "Cash Payment", 1250)[0],
+                    location,
+                )
+
+    def test_payment_lines_for_each_payment_method(self):
+        expected = {
+            "Cash Payment": "<b>💰 CASH · COLLECT ₦1,250</b>",
+            "Pay on Delivery": "<b>💵 PAY ON DELIVERY · COLLECT ₦1,250</b>",
+            "Bank Transfer": "<b>🏦 BANK TRANSFER · VERIFY PROOF</b>",
+            "Paystack": "<b>💳 PAID ONLINE (PAYSTACK)</b>",
+        }
+        for payment_method, payment_line in expected.items():
+            with self.subTest(payment_method=payment_method):
+                self.assertEqual(
+                    format_order_headline("pickup", None, payment_method, 1250)[1],
+                    payment_line,
+                )
+
+    def test_table_number_is_html_escaped(self):
+        location_line, _ = format_order_headline("dine_in", "A&B", "Cash Payment", 0)
+        self.assertEqual(location_line, "<b>🪑 TABLE A&amp;B · DINE-IN</b>")
 
 
 class TestSelfCancellationPolicy(unittest.TestCase):
