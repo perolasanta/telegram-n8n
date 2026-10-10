@@ -16,6 +16,7 @@ os.environ.setdefault("SUPABASE_SERVICE_KEY", "test-service-key")
 
 # Import only the pure functions and constants we need — no I/O triggered
 from whatsapp import (
+    available_payment_methods,
     MAX_LINE_QTY,
     MAX_COMPOSITE_UNITS,
     WHATSAPP_COMPOSITES_ENABLED,
@@ -185,6 +186,37 @@ class TestKitchenOrderHeadline(unittest.TestCase):
     def test_table_number_is_html_escaped(self):
         location_line, _ = format_order_headline("dine_in", "A&B", "Cash Payment", 0)
         self.assertEqual(location_line, "<b>🪑 TABLE A&amp;B · DINE-IN</b>")
+
+
+class TestAvailablePaymentMethods(unittest.TestCase):
+
+    def test_order_type_and_enabled_method_matrix(self):
+        for order_type in ("dine_in", "pickup", "delivery"):
+            for pod_enabled in (False, True):
+                for paystack_enabled in (False, True):
+                    for has_bank in (False, True):
+                        with self.subTest(
+                            order_type=order_type, pod_enabled=pod_enabled,
+                            paystack_enabled=paystack_enabled, has_bank=has_bank,
+                        ):
+                            expected = []
+                            if order_type in {"dine_in", "pickup"}:
+                                expected.append("cash")
+                            if has_bank:
+                                expected.append("bank")
+                            if paystack_enabled:
+                                expected.append("paystack")
+                            if order_type == "delivery" and pod_enabled:
+                                expected.append("pod")
+                            self.assertEqual(
+                                available_payment_methods(
+                                    order_type, pod_enabled, paystack_enabled, has_bank,
+                                ),
+                                expected,
+                            )
+
+    def test_delivery_can_have_no_available_methods(self):
+        self.assertEqual(available_payment_methods("delivery", False, False, False), [])
 
 
 class TestSelfCancellationPolicy(unittest.TestCase):

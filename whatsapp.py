@@ -18,6 +18,7 @@ from aiogram.types import BufferedInputFile
 from whatsapp_state import WhatsAppState
 from receipt_generator import generate_receipt_pdf
 from bot import (
+    available_payment_methods,
     build_composite_cart_line,
     delivery_bots,
     create_order_in_db,
@@ -338,15 +339,31 @@ async def send_buttons(phone_number_id: str, token: str, to: str, body: str, but
     await send_whatsapp_message(phone_number_id, token, to, build_buttons_payload(body, buttons))
 
 
-async def send_payment_options(phone_number_id, token, to, order_type: str, paystack_enabled: bool):
+async def send_payment_options(phone_number_id, token, to, allowed_methods: list[str], state):
+    if not allowed_methods:
+        await send_text(
+            phone_number_id, token, to,
+            "Delivery isn't available right now. Please contact the restaurant.",
+        )
+        await state.clear()
+        return
+    titles = {
+        "cash": ("pay_cash", "Cash"),
+        "bank": ("pay_bank", "Bank transfer"),
+        "pod": ("pay_pod", "Pay on delivery"),
+        "paystack": ("pay_paystack", "Pay with card"),
+    }
     rows = [
-        {"id": "pay_cash", "title": "Cash"},
-        {"id": "pay_bank", "title": "Bank transfer"},
+        {"id": titles[method][0], "title": titles[method][1]}
+        for method in allowed_methods if method in titles
     ]
-    if order_type == "delivery":
-        rows.append({"id": "pay_pod", "title": "Pay on delivery"})
-    if paystack_enabled:
-        rows.append({"id": "pay_paystack", "title": "Pay with card"})
+    if not rows:
+        await send_text(
+            phone_number_id, token, to,
+            "Delivery isn't available right now. Please contact the restaurant.",
+        )
+        await state.clear()
+        return
     await send_list(phone_number_id, token, to, "How would you like to pay?", "Choose payment", rows)
 
 
@@ -521,7 +538,8 @@ async def handle_whatsapp_webhook(payload: dict, supabase, bot):
     response = supabase.table("restaurants").select(
         "id, name, kitchen_chat_id, whatsapp_phone_number_id, whatsapp_access_token, "
         "whatsapp_addon_enabled, whatsapp_addon_expires_at, "
-        "pickup_enabled, delivery_fee_type, delivery_fee_flat, paystack_enabled, paystack_subaccount_code"
+        "pickup_enabled, delivery_fee_type, delivery_fee_flat, paystack_enabled, paystack_subaccount_code, "
+        "pay_on_delivery_enabled, bank_name, account_number, account_name"
     ).eq("whatsapp_phone_number_id", phone_number_id).execute()
     if not response.data:
         logging.error("No restaurant configured for whatsapp_phone_number_id=%s (message_id=%s)", phone_number_id, message_id)
@@ -1284,7 +1302,14 @@ async def choose_pickup(state, restaurant, from_number):
     await state.update_data(order_type="pickup", delivery_fee=0, delivery_zone_id=None, delivery_zone_name=None)
     await recalculate_total(state, restaurant)
     await state.set_state("waiting_for_payment_method")
-    await send_payment_options(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "pickup", bool(restaurant.get("paystack_enabled")))
+    allowed_methods = available_payment_methods(
+        "pickup", restaurant.get("pay_on_delivery_enabled"), restaurant.get("paystack_enabled"),
+        bool(restaurant.get("bank_name") and restaurant.get("account_number")),
+    )
+    await send_payment_options(
+        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"],
+        from_number, allowed_methods, state,
+    )
 
 
 async def continue_after_delivery_address(state, restaurant, from_number):
@@ -1334,7 +1359,15 @@ async def request_payment_method(state, restaurant, from_number):
     await state.set_state("waiting_for_payment_method")
     await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"💰 Total: ₦{float(total):,.0f}")
     data = await state.get_data()
-    await send_payment_options(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, data.get("order_type", "delivery"), bool(restaurant.get("paystack_enabled")))
+    allowed_methods = available_payment_methods(
+        data.get("order_type", "delivery"), restaurant.get("pay_on_delivery_enabled"),
+        restaurant.get("paystack_enabled"),
+        bool(restaurant.get("bank_name") and restaurant.get("account_number")),
+    )
+    await send_payment_options(
+        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"],
+        from_number, allowed_methods, state,
+    )
 
 
 async def advance_composite_group(state, restaurant, from_number, active_unit):
@@ -1998,8 +2031,17 @@ async def handle_payment_selection(button_id, state, restaurant, from_number, su
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please choose a payment option from the current order.")
         return
     data = await state.get_data()
-    if button_id == "pay_pod" and data.get("order_type") != "delivery":
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Pay on delivery is only available for delivery orders.")
+    allowed_methods = available_payment_methods(
+        data.get("order_type", "delivery"), restaurant.get("pay_on_delivery_enabled"),
+        restaurant.get("paystack_enabled"),
+        bool(restaurant.get("bank_name") and restaurant.get("account_number")),
+    )
+    method_ids = {"pay_cash": "cash", "pay_bank": "bank", "pay_pod": "pod", "pay_paystack": "paystack"}
+    if method_ids.get(button_id) not in allowed_methods:
+        await send_text(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "That payment method isn't available for this order.",
+        )
         return
     try:
         total = await recalculate_total(state, restaurant)

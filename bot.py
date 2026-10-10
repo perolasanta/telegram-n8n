@@ -661,6 +661,20 @@ def order_short_id(order_id: str) -> str:
     return order_id.replace("-", "")[:4].upper()
 
 
+def available_payment_methods(order_type, pod_enabled, paystack_enabled, has_bank) -> list[str]:
+    """Return enabled payment method ids for an order's fulfillment type."""
+    methods = []
+    if order_type in {"dine_in", "pickup"}:
+        methods.append("cash")
+    if has_bank:
+        methods.append("bank")
+    if paystack_enabled:
+        methods.append("paystack")
+    if order_type == "delivery" and pod_enabled:
+        methods.append("pod")
+    return methods
+
+
 def format_order_headline(order_type, table_number, payment_method, total, delivery_address=None):
     """Format the prominent location and payment lines for a kitchen ticket."""
     if order_type == "delivery":
@@ -1956,15 +1970,18 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
 
     subtotal = sum(item["price"] * item["qty"] for item in cart.values())
     order_type = data.get("order_type", "dine_in")
+    restaurant_settings = {}
+    if data.get("restaurant_id"):
+        restaurant_state = supabase.table("restaurants")\
+            .select("delivery_fee_type, pay_on_delivery_enabled, bank_name, account_number, paystack_enabled")\
+            .eq("id", data["restaurant_id"])\
+            .execute()
+        restaurant_settings = restaurant_state.data[0] if restaurant_state.data else {}
 
     delivery_fee = 0
     zone_name = None
     if order_type == "delivery":
-        restaurant = supabase.table("restaurants")\
-            .select("delivery_fee_type")\
-            .eq("id", data.get("restaurant_id"))\
-            .execute()
-        fee_type = restaurant.data[0].get("delivery_fee_type", "none") if restaurant.data else "none"
+        fee_type = restaurant_settings.get("delivery_fee_type", "none")
         if fee_type == "zone" and data.get("delivery_zone_fee") is None:
             await callback_query.message.answer(
                 "📍 Please select your delivery zone before continuing."
@@ -1983,22 +2000,21 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
         summary += f"🚚 Delivery fee{zone_label}: ₦{delivery_fee:,.0f}\n"
     summary += f"\n💰 <b>Total: ₦{total:,.0f}</b>\n\nSelect payment method:"
 
-    payment_buttons = []
-    if order_type == "delivery":
-        payment_buttons.append([InlineKeyboardButton(text="💵 Pay on Delivery", callback_data="pay_delivery")])
-    payment_buttons.append([InlineKeyboardButton(text="💰 Cash Payment", callback_data="pay_cash")])
-    payment_buttons.append([InlineKeyboardButton(text="🏦 Bank Transfer", callback_data="pay_bank")])
-
-    show_paystack = False
-    if data.get("restaurant_id"):
-        restaurant_state = supabase.table("restaurants")\
-            .select("paystack_enabled")\
-            .eq("id", data["restaurant_id"])\
-            .execute()
-        if restaurant_state.data:
-            show_paystack = bool(restaurant_state.data[0].get("paystack_enabled"))
-    if show_paystack:
-        payment_buttons.append([InlineKeyboardButton(text="💳 Pay with Card (Paystack)", callback_data="pay_paystack")])
+    allowed_methods = available_payment_methods(
+        order_type, restaurant_settings.get("pay_on_delivery_enabled"),
+        restaurant_settings.get("paystack_enabled"),
+        bool(restaurant_settings.get("bank_name") and restaurant_settings.get("account_number")),
+    )
+    button_details = {
+        "cash": ("💰 Cash Payment", "pay_cash"),
+        "bank": ("🏦 Bank Transfer", "pay_bank"),
+        "pod": ("💵 Pay on Delivery", "pay_delivery"),
+        "paystack": ("💳 Pay with Card (Paystack)", "pay_paystack"),
+    }
+    payment_buttons = [
+        [InlineKeyboardButton(text=button_details[method][0], callback_data=button_details[method][1])]
+        for method in allowed_methods
+    ]
     payment_buttons.append([InlineKeyboardButton(text="🔙 Back to Cart", callback_data="view_cart")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=payment_buttons)
@@ -2344,9 +2360,27 @@ async def rider_marked_delivered_handler(callback_query: types.CallbackQuery, bo
 # ========== ORDER CONFIRMATION & PAYMENT ==========
 # ====== PAYMENT HANDLERS SECTION ======
 
+async def get_telegram_allowed_payment_methods(state: FSMContext) -> list[str]:
+    data = await state.get_data()
+    restaurant_id = data.get("restaurant_id")
+    if not restaurant_id:
+        return []
+    result = supabase.table("restaurants").select(
+        "pay_on_delivery_enabled, bank_name, account_number, paystack_enabled"
+    ).eq("id", restaurant_id).execute()
+    restaurant = result.data[0] if result.data else {}
+    return available_payment_methods(
+        data.get("order_type", "dine_in"), restaurant.get("pay_on_delivery_enabled"),
+        restaurant.get("paystack_enabled"),
+        bool(restaurant.get("bank_name") and restaurant.get("account_number")),
+    )
+
 @dp.callback_query(F.data == "pay_delivery")
 async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContext, bot: Bot):
     """Handle Pay on Delivery payment method"""
+    if "pod" not in await get_telegram_allowed_payment_methods(state):
+        await callback_query.answer("That payment method isn't available for this order.", show_alert=True)
+        return
     user_id = callback_query.from_user.id
     
     try:
@@ -2395,6 +2429,9 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
 @dp.callback_query(F.data == "pay_cash")
 async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext, bot: Bot):
     """Handle Cash Payment method"""
+    if "cash" not in await get_telegram_allowed_payment_methods(state):
+        await callback_query.answer("That payment method isn't available for this order.", show_alert=True)
+        return
     user_id = callback_query.from_user.id
     
     try:
@@ -3611,6 +3648,30 @@ async def activate_restaurant(message: types.Message):
     days = int(args[2]) if args[2].isdigit() else 30
     await upgrade_restaurant(restaurant_id, days=days)
     await message.answer(f"✅ Restaurant activated for {days} days.")
+
+
+@dp.message(Command("set_pod"))
+async def set_pay_on_delivery(message: types.Message):
+    admin_telegram_id = int(ADMIN_TELEGRAM_ID)
+    if message.from_user.id != admin_telegram_id:
+        return
+    args = (message.text or "").split()
+    if len(args) != 3 or args[2].lower() not in {"on", "off"}:
+        await message.answer("Usage: /set_pod <restaurant_id> on|off")
+        return
+
+    restaurant_id = args[1]
+    enabled = args[2].lower() == "on"
+    result = supabase.table("restaurants").update({
+        "pay_on_delivery_enabled": enabled,
+    }).eq("id", restaurant_id).select("id, name").execute()
+    if not result.data:
+        await message.answer("Restaurant not found.")
+        return
+    await message.answer(
+        f"✅ Pay on delivery {'enabled' if enabled else 'disabled'} for "
+        f"{escape(str(result.data[0].get('name') or restaurant_id))}."
+    )
 
 
 @dp.message(Command("set_whatsapp_addon"))
