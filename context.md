@@ -70,11 +70,11 @@ The base tables predate the migration folder. The following is the application-l
 
 | Table | Important fields / role |
 |---|---|
-| `restaurants` | Tenant, manager and kitchen Telegram ids, subscription fields, bank details, kitchen-board state, optional delivery bot token, delivery fee/pickup configuration, Paystack configuration, WhatsApp credentials and entitlement (`whatsapp_addon_enabled`, `whatsapp_addon_expires_at`, `whatsapp_display_number`), `dispatch_group_id` (rider dispatch Telegram group), and `whatsapp_catalog_id` (Meta catalog for availability sync). |
+| `restaurants` | Tenant, manager and kitchen Telegram ids, subscription fields, bank details, kitchen-board state, optional delivery bot token, delivery fee/pickup configuration, Paystack configuration, WhatsApp credentials and entitlement (`whatsapp_addon_enabled`, `whatsapp_addon_expires_at`, `whatsapp_display_number`), `pay_on_delivery_enabled`, optional landing-page branding (`brand_color`, `logo_url`), `dispatch_group_id` (rider dispatch Telegram group), and `whatsapp_catalog_id` (Meta catalog for availability sync). |
 | `restaurant_tables` | Tenant table/Qr mapping: `public_code`, `table_number`, active status, optional `menu_filter`. `NULL` or `EXTERNAL` represents external delivery/pickup ordering. |
 | `menu_categories` | Tenant categories with active flag and display order. |
 | `menu_items` | Tenant category items: price, availability, inventory fields, image URL, and `item_type` (`simple` or `composite`). |
-| `orders` | Restaurant/table/customer/order totals, payment and fulfilment states, delivery data, inventory flag, source channel, customer contact, and dispatch tracking fields (`dispatch_sent_at`, `dispatch_sent_by`). |
+| `orders` | Restaurant/table/customer/order totals, payment and fulfilment states, delivery data, inventory flag, source channel, customer contact, kitchen ticket references (`kitchen_message_id`, `kitchen_message_text`), and dispatch tracking fields (`dispatch_sent_at`, `dispatch_sent_by`). |
 | `order_items` | Snapshotted menu item quantity, unit price, and subtotal. |
 | `payments` | Bank-transfer/Paystack payment records and provider references. |
 | `delivery_zones` | Per-restaurant active named delivery fees. |
@@ -89,6 +89,10 @@ The base tables predate the migration folder. The following is the application-l
 - `create_order_in_db()` in `bot.py` is intentionally channel-agnostic. Both Telegram and WhatsApp call it. Preserve that interface when adding a channel feature.
 - It validates tracked inventory before insertion and creates `order_items` plus modifier snapshots when present.
 - Cash orders are stored as `payment_status = confirmed`; bank transfer, pay-on-delivery, and Paystack begin pending.
+- Migration 015 adds `restaurants.pay_on_delivery_enabled` with default `false` for new restaurants and backfills existing restaurants to `true` once, only when the column is first created.
+- Payment availability is order-type-specific: dine-in and pickup may use cash, bank transfer when bank details exist, and Paystack when enabled; they never offer pay-on-delivery. Delivery may use bank transfer when bank details exist, Paystack when enabled, and pay-on-delivery when `pay_on_delivery_enabled` is true; it never offers Cash Payment. Cash on delivery is represented by the Pay on Delivery method.
+- `/set_pod <restaurant_id> on|off` is admin-only and updates `pay_on_delivery_enabled` for that restaurant.
+- `/set_branding <restaurant_id> <#hex> [https-logo-url|none]` is admin-only. `brand_color` must be a six-digit hex color; `logo_url` is optional, HTTPS-only, and under 500 characters. The optional logo argument sets or clears `logo_url`, and omission leaves the current logo unchanged. Landing pages use a neutral `#1F2937` fallback for invalid stored colors and omit invalid logo URLs.
 - `deduct_order_inventory(order_id)` calls the PostgreSQL function from migration 003. That function only deducts confirmed orders and is idempotent through `orders.inventory_deducted`.
 - In the current implementation, cash and pay-on-delivery flows call inventory deduction immediately. For pay-on-delivery, the database function does not deduct because that payment remains pending.
 - All customer-visible money is Nigerian naira (`₦`). Use `Decimal` or database numeric values for new money calculations when practical; do not introduce float rounding errors.
@@ -102,12 +106,13 @@ The base tables predate the migration folder. The following is the application-l
 3. Delivery accepts typed addresses or Telegram locations. Telegram attempts reverse geocoding with Nominatim and asks the customer to confirm a shared location.
 4. Customers browse active categories and available items, choose quantities, manage/clear a cart, and confirm the order.
 5. Composite items walk customers through modifier groups, selection limits, and optional modifier quantities. Selections are persisted in `order_item_modifiers`.
-6. Payment choices are cash, bank transfer with photo proof, pay-on-delivery, and Paystack when the restaurant has a configured subaccount.
+6. Payment choices follow the shared order-type rule: dine-in/pickup offer cash, bank transfer when bank details exist, and enabled Paystack; delivery offers bank transfer when configured, enabled Paystack, and Pay on Delivery only when the restaurant enables it. Cash Payment is never offered for delivery.
 7. Customers can use `/cancel`, `/history`, `/status`, and reorder from history after availability checks. Telegram sends PDF receipts after applicable orders and after confirmed Paystack webhooks.
 
 ### Kitchen and manager operations
 
 - Every submitted order is sent to the restaurant kitchen Telegram group. Bank-transfer orders contain proof plus confirm/reject controls; other orders contain preparing/ready/dispatch controls.
+- The sent kitchen message id and exact text/caption are saved to `orders.kitchen_message_id` and `orders.kitchen_message_text`. When a customer cancels an eligible WhatsApp order, the bot edits that ticket to mark it cancelled; if no saved message is available or editing fails, it sends a separate cancellation notice. The kitchen board is then refreshed.
 - Delivery orders show a "Send to Rider" button (`dispatch_`). Tapping it sends a dispatch message with customer name, contact, address, Google Maps link, and total to `restaurants.dispatch_group_id`. The dispatch message has a "Delivered" button (`delivered_`) for the rider to close the order loop. Delivery status and customer notification are updated on confirmation.
 - Kitchen status actions update the order and notify customers (Telegram or WhatsApp via `notify_order_customer()`). A pinned live board tracks pending, preparing, and recent ready orders. A manager rush alert is sent once per day above `RUSH_HOUR_PENDING_THRESHOLD`.
 - Kitchen commands include `/pending`, `/board`, `/menu`, and `/restock`; menu controls toggle item availability and composite-option availability.
@@ -123,7 +128,7 @@ WhatsApp is not a Telegram UI clone. It begins when Meta sends an `order` messag
 3. When `pickup_enabled` is true, the customer is offered delivery or pickup via an interactive list. Delivery proceeds to address collection; pickup skips directly to payment.
 4. Delivery fee is applied based on `delivery_fee_type`: flat fee is applied automatically; zone-based fee presents an interactive zone picker (capped at `MAX_WHATSAPP_LIST_ROWS`). `handle_unusable_zone_config()` falls back to flat fee or pickup when zone config is broken.
 5. The customer provides a typed delivery address or WhatsApp location pin. Coordinates are stored; no reverse geocoding or confirmation screen is implemented.
-6. Interactive buttons offer cash, bank transfer, pay-on-delivery, and Paystack (when `paystack_enabled` is true for the restaurant).
+6. Interactive payment choices use the shared order-type rule: dine-in/pickup offer cash, configured bank transfer, and enabled Paystack; delivery offers configured bank transfer, enabled Paystack, and Pay on Delivery only when `pay_on_delivery_enabled` is true. Delivery never offers Cash Payment. A submitted payment reply is checked against the current session order type and restaurant settings.
 7. Cash/pay-on-delivery create `order_channel = whatsapp`, carry the phone number in `customer_contact`, send a Telegram kitchen notification, attempt inventory deduction, and send a WhatsApp PDF receipt.
 8. Bank transfer sends bank details, accepts an image proof, downloads it from Meta, creates the order/payment record, and forwards the proof to the Telegram kitchen for manual confirmation.
 9. Paystack: `start_paystack_payment()` creates a pending order, generates a checkout link using a deterministic `<digits>@chowlin.ng` email, and sends the URL to the customer. The Paystack webhook in `main.py` confirms the order and sends a WhatsApp receipt.
@@ -133,8 +138,8 @@ WhatsApp is not a Telegram UI clone. It begins when Meta sends an `order` messag
 
 ### WhatsApp dine-in
 
-- `GET /t/{public_code}` in `main.py` is the table landing route. It offers Telegram and, when the WhatsApp number and add-on entitlement are valid, WhatsApp. QR codes can encode this route with `generate_qr_codes.py --landing`.
-- A WhatsApp landing link includes a `ref:` token. When a customer sends it while idle, the bot looks up an active table belonging to the receiving restaurant and stores `table_id`, `table_number`, `menu_filter`, and the original UTC `table_bound_at` in `whatsapp_sessions` data.
+- `GET /t/{public_code}` in `main.py` is the table landing route. It offers Telegram and, when the WhatsApp number, add-on entitlement, and `TABLE_LINK_SECRET` are available, WhatsApp. Without the signing secret the route logs an error and hides WhatsApp; Telegram-only restaurants still redirect to Telegram. QR codes can encode this route with `generate_qr_codes.py --landing`.
+- The WhatsApp landing message includes `ref:<public_code>.<expiry_unix_base36>.<signature>`, an HMAC-SHA256 token that expires after `LANDING_TOKEN_TTL_MINUTES` (15 minutes by default). The bot verifies the signature and expiry before looking up an active table belonging to the receiving restaurant. Unsigned raw refs are rejected unless `ALLOW_RAW_TABLE_REF=true`. After a valid tenant-scoped lookup while idle, the bot stores `table_id`, `table_number`, `menu_filter`, and the original UTC `table_bound_at` in `whatsapp_sessions` data.
 - The binding expires after 3 hours. A fresh binding makes checkout dine-in and is preserved across successful order rounds without refreshing its timestamp.
 - When `menu_filter` is set, cart and reorder lines are accepted only when their category name starts with `{menu_filter} —` (case-insensitive). A mismatched line is rejected while other valid lines can continue.
 
@@ -188,7 +193,10 @@ Runtime environment variables:
 | `WHATSAPP_VERIFY_TOKEN` | Required to verify Meta's webhook | Must match the verification token configured in Meta. |
 | `FASTAPI_WEBHOOK_URL` | Optional; defaults to `https://telegram-n8n-restaurant-bot.onrender.com` | Public application base URL, used for webhook/payment callback URLs. |
 | `TELEGRAM_BOT_USERNAME` | Required for the `/t/{public_code}` landing route; no `@` | Username used to build the table's Telegram deep link. |
-| `PUBLIC_BASE_URL` | Optional | Base URL used by `generate_qr_codes.py --landing`; falls back to `FASTAPI_WEBHOOK_URL`. |
+| `PUBLIC_BASE_URL` | Optional | Public base URL used by `generate_qr_codes.py --landing`; falls back to `FASTAPI_WEBHOOK_URL`. |
+| `TABLE_LINK_SECRET` | Required for WhatsApp table landing links | Secret used to sign expiring table-reference tokens. If unset, the WhatsApp choice is hidden on the landing page. |
+| `LANDING_TOKEN_TTL_MINUTES` | Optional; defaults to `15` | Lifetime of a signed WhatsApp table-reference token. The separate WhatsApp table binding remains valid for up to 3 hours. |
+| `ALLOW_RAW_TABLE_REF` | Optional; defaults to `false` | Set to `true` to accept unsigned raw table refs from WhatsApp messages; keep disabled for signed-link-only binding. |
 | `N8N_WEBHOOK_URL` | Optional; defaults to the configured Chowlin n8n new-order URL | Sends new-order events to n8n. |
 | `N8N_UPDATE_WEBHOOK_URL` | Optional; defaults to the configured Chowlin n8n update URL | Sends order updates to n8n. |
 | `N8N_HEARTBEAT_URL` | Optional; defaults to the configured Chowlin n8n heartbeat URL | Sends service heartbeat events. |
