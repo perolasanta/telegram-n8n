@@ -41,6 +41,11 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 RUSH_HOUR_PENDING_THRESHOLD = int(os.getenv("RUSH_HOUR_PENDING_THRESHOLD", "5"))
+HELD_RECEIPT_METHODS = ("Cash Payment", "Pay on Delivery")
+
+
+def receipt_is_held(payment_method, release):
+    return payment_method in HELD_RECEIPT_METHODS and not release
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_COMMISSION_PERCENTAGE = float(os.getenv("PAYSTACK_COMMISSION_PERCENTAGE", "5"))
@@ -1256,19 +1261,25 @@ async def get_cart_summary(user_id: int, restaurant_id: str):
     # We'll manage cart in memory via state since it's temporary
     return {}
 
-async def send_receipt_to_customer(bot: Bot, user_id: int, order_id: str):
+async def send_receipt_to_customer(bot: Bot, user_id: int, order_id: str, *, release: bool = False, restaurant_id: str | None = None):
     """Generate and send PDF receipt to customer"""
     try:
         # Get order details
+        if not restaurant_id:
+            return False
         order = supabase.table("orders")\
             .select("*, order_items(*, menu_items(name, price)), restaurant_tables(table_number), restaurants(name, phone)")\
             .eq("id", order_id)\
+            .eq("restaurant_id", restaurant_id)\
             .execute()
         
         if not order.data:
             return False
         
         order_data = order.data[0]
+        if receipt_is_held(order_data.get("payment_method"), release):
+            logging.info("Receipt held until order is ready for order %s", order_id)
+            return False
         
         # Prepare receipt data
         items = []
@@ -1326,16 +1337,16 @@ async def send_receipt_to_customer(bot: Bot, user_id: int, order_id: str):
         return False
 
 
-async def send_order_receipt(bot: Bot, order: dict, order_id: str) -> bool:
+async def send_order_receipt(bot: Bot, order: dict, order_id: str, *, release: bool = False) -> bool:
     """Send a receipt through the customer channel recorded on an order."""
     if order.get("order_channel") == "whatsapp":
         from whatsapp import send_whatsapp_receipt
-        return await send_whatsapp_receipt(supabase, order, order_id)
+        return await send_whatsapp_receipt(supabase, order, order_id, release=release)
 
     user_id = order.get("telegram_user_id")
     if not user_id:
         return False
-    return await send_receipt_to_customer(bot, user_id, order_id)
+    return await send_receipt_to_customer(bot, user_id, order_id, release=release, restaurant_id=order.get("restaurant_id"))
 
 
 async def try_send_receipt_after_order(bot: Bot, message: types.Message, user_id: int, order_id: str):
@@ -1345,8 +1356,7 @@ async def try_send_receipt_after_order(bot: Bot, message: types.Message, user_id
         print(f"Receipt generation failed for order {order_id}: {e}")
         receipt_sent = False
 
-    if not receipt_sent:
-        await message.answer("📄 Receipt could not be generated. Please ask staff for a copy.")
+    # Deliberately held receipts and delivery failures are left for staff handling.
 
 
 async def load_pending_reorder(message: types.Message, state: FSMContext):
@@ -2557,7 +2567,7 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💵 Payment Method: Pay on Delivery\n\n"
             f"Please have cash ready when your order arrives.\n"
-            f"📄 Your receipt will be sent when your order is ready.\n\n"
+            f"Your receipt will be sent when your order is ready.\n\n"
             f"<i>Powered by Chowlin 🍽️</i>"
         )
         
@@ -2605,7 +2615,7 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext, b
             f"💰 Total: ₦{total_price:,.0f}\n"
             f"💵 Payment Method: Cash Payment\n\n"
             f"Please pay cash when collecting your order.\n"
-            f"📄 Your receipt will be sent when your order is ready.\n\n"
+            f"Your receipt will be sent when your order is ready.\n\n"
             f"<i>Powered by Chowlin 🍽️</i>"
         )
         
@@ -3020,8 +3030,11 @@ async def handle_ready(callback_query: CallbackQuery, bot: Bot):
             ready_message = f"✅ Hi {customer_name}, your order #{order_short_id(order_id)} is ready for collection! Please come pick it up at the counter."
         
         await notify_order_customer(bot, order_data, ready_message)
-        if order_data.get("payment_method") in {"Cash Payment", "Pay on Delivery"}:
-            await send_order_receipt(bot, order_data, order_id)
+        if order_data.get("payment_method") in HELD_RECEIPT_METHODS:
+            try:
+                await send_order_receipt(bot, order_data, order_id, release=True)
+            except Exception:
+                logging.exception("Failed to release ready receipt for order %s", order_id)
     
     # Update kitchen message
     if callback_query.message.photo:

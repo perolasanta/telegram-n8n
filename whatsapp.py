@@ -35,6 +35,7 @@ from bot import (
     reverse_geocode,
     format_delivery_coordinates,
     validate_cart_inventory,
+    HELD_RECEIPT_METHODS,
 )
 
 GRAPH_API = "https://graph.facebook.com/v25.0"
@@ -503,7 +504,7 @@ async def sync_catalog_item_availability(
         logging.exception("Failed to sync catalog availability for retailer_id=%s (menu_item_id=%s)", retailer_id, menu_item_id)
 
 
-async def send_whatsapp_receipt(supabase, order: dict, order_id: str) -> bool:
+async def send_whatsapp_receipt(supabase, order: dict, order_id: str, *, release: bool = False) -> bool:
     """Generate and deliver a PDF receipt for a WhatsApp-originated order."""
     restaurant = order.get("restaurants") or {}
     contact = order.get("customer_contact")
@@ -513,10 +514,13 @@ async def send_whatsapp_receipt(supabase, order: dict, order_id: str) -> bool:
     try:
         result = supabase.table("orders").select(
             "*, order_items(*, menu_items(name, price)), restaurant_tables(table_number), restaurants(name, phone)"
-        ).eq("id", order_id).execute()
+        ).eq("id", order_id).eq("restaurant_id", order.get("restaurant_id")).execute()
         if not result.data:
             return False
         data = result.data[0]
+        if data.get("payment_method") in HELD_RECEIPT_METHODS and not release:
+            logging.info("WhatsApp receipt held until order is ready for order %s", order_id)
+            return False
         items = [{
             "name": (item.get("menu_items") or {}).get("name", "Item"),
             "qty": item["quantity"],
@@ -2109,7 +2113,7 @@ async def create_and_send_order(state, restaurant, from_number, customer_name, p
         await send_order_to_kitchen(bot, order_id, state, customer_name, from_number)
         low_stock_items = await deduct_inventory_for_order(order_id)
         await send_restock_alert(bot, restaurant["id"], restaurant.get("kitchen_chat_id"), low_stock_items)
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\nPayment: {truncate(payment_method, 100)}\n\nWe'll notify you when it is ready. Your receipt will be sent when your order is ready.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\nPayment: {truncate(payment_method, 100)}\n\nWe'll notify you when it is ready.\nYour receipt will be sent when your order is ready.")
         await clear_keeping_table_binding(state)
     except ValueError as exc:
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}")

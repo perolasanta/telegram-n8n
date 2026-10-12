@@ -47,12 +47,27 @@ from bot import (
     build_kitchen_order_board_sections,
     format_kitchen_item_line,
     format_order_headline,
+    receipt_is_held,
 )
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+class TestReceiptHoldRule(unittest.TestCase):
+
+    def test_all_payment_methods_with_and_without_release(self):
+        expected = {
+            "Cash Payment": (True, False),
+            "Pay on Delivery": (True, False),
+            "Paystack": (False, False),
+            "Bank Transfer": (False, False),
+        }
+        for method, (held_without_release, held_with_release) in expected.items():
+            with self.subTest(method=method):
+                self.assertEqual(receipt_is_held(method, False), held_without_release)
+                self.assertEqual(receipt_is_held(method, True), held_with_release)
 
 class TestParseCustomerIntent(unittest.TestCase):
 
