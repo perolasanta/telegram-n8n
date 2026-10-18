@@ -32,7 +32,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 import pytz
 from datetime import datetime, timedelta
-from reports import generate_daily_report, generate_weekly_report
+from reports import generate_daily_report_for_window, generate_weekly_report, get_daily_report_window
 from whatsapp import handle_whatsapp_webhook, is_whatsapp_addon_active, make_table_token
 
 
@@ -240,34 +240,129 @@ async def table_landing(public_code: str):
 
 # ADD THESE FUNCTIONS
 
+def _parse_cutoff(raw):
+    """Parse a Supabase timestamptz value into a timezone-aware datetime, or None.
+
+    Supabase returns timestamptz columns as ISO strings (e.g.
+    ``2026-10-04T20:00:00+00:00``). Returns None when the cursor is NULL or
+    the value can't be parsed, which lets the caller treat it as a first run.
+    """
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _advance_daily_report_cursor(supabase, restaurant_id: str, end: datetime, old_cutoff) -> bool:
+    """Conditionally advance a restaurant's daily-report cursor to ``end``.
+
+    Issues ``UPDATE restaurants SET last_daily_report_cutoff = :end
+    WHERE id = :rid AND last_daily_report_cutoff IS NOT DISTINCT FROM :old_cutoff``
+    (using ``.is_`` for the NULL case and ``.eq`` otherwise). Returns True if a
+    row was updated by this call (this run advanced the cursor), or False if no
+    row matched (another run already advanced it) or the update errored.
+
+    The cursor is set to the window end, not to the send time, so no order falls
+    in a gap between reports.
+    """
+    end_iso = end.astimezone(pytz.utc).isoformat()
+    query = supabase.table("restaurants")\
+        .update({"last_daily_report_cutoff": end_iso})\
+        .eq("id", restaurant_id)
+    if old_cutoff is None:
+        query = query.is_("last_daily_report_cutoff", "null")
+    else:
+        query = query.eq("last_daily_report_cutoff", old_cutoff.astimezone(pytz.utc).isoformat())
+    try:
+        result = query.execute()
+    except Exception as e:
+        logger.error(f"Failed to advance daily report cursor for restaurant_id={restaurant_id}: {e}")
+        return False
+    return any((row.get("id") == restaurant_id) for row in (result.data or []))
+
+
 async def send_daily_reports():
-    """Send daily reports to all restaurant managers"""
+    """Cursor-based daily reports: each report covers [previous cutoff, now).
+
+    Per restaurant, reads ``last_daily_report_cutoff``, computes the window with
+    ``get_daily_report_window``, builds and sends the report, and only after the
+    Telegram send succeeds conditionally advances the cursor to the window end.
+
+    Guarantees:
+      * A failed send leaves the cursor untouched, so the next run re-covers the
+        missed span (clamped to 48h by get_daily_report_window).
+      * The conditional update prevents a concurrent run from double-advancing
+        the cursor; if another run already advanced it, this run logs and skips.
+      * One restaurant failing never stops the loop for the others.
+    """
+    now = datetime.now(pytz.utc)  # captured once, at the start of generation
     try:
         restaurants = supabase.table("restaurants")\
-            .select("id, name, manager_telegram_id, manager_name")\
+            .select("id, name, manager_telegram_id, manager_name, last_daily_report_cutoff")\
             .eq("subscription_status", "active")\
             .not_.is_("manager_telegram_id", "null")\
             .execute()
-        
-        for restaurant in restaurants.data:
-            manager_id = restaurant.get("manager_telegram_id")
-            if not manager_id:
+    except Exception as e:
+        logger.error(f"Error fetching restaurants for daily reports: {e}", exc_info=True)
+        return
+
+    for restaurant in restaurants.data:
+        restaurant_id = restaurant["id"]
+        manager_id = restaurant.get("manager_telegram_id")
+        if not manager_id:
+            continue
+        try:
+            old_cutoff = _parse_cutoff(restaurant.get("last_daily_report_cutoff"))
+            start, end = get_daily_report_window(old_cutoff, now)
+            if start is None or end is None:
+                logger.info(
+                    "Daily report: empty window for restaurant_id=%s, skipping",
+                    restaurant_id,
+                )
                 continue
-            
-            report = await generate_daily_report(supabase, restaurant["id"])
-            
+
+            report = await generate_daily_report_for_window(supabase, restaurant_id, start, end)
+
             try:
                 await bot.send_message(
                     manager_id,
                     report,
                     parse_mode="Markdown"
                 )
-                logger.info(f"Daily report sent to manager of {restaurant['name']}")
             except Exception as e:
-                logger.error(f"Failed to send daily report: {e}")
-                
-    except Exception as e:
-        logger.error(f"Error in send_daily_reports: {e}")
+                # Leave the cursor unchanged so the next run covers this span.
+                logger.error(
+                    "Failed to send daily report to manager of %s "
+                    "(restaurant_id=%s, window=%s to %s): %s",
+                    restaurant.get("name"), restaurant_id,
+                    start.isoformat(), end.isoformat(), e,
+                )
+                continue
+
+            advanced = _advance_daily_report_cursor(supabase, restaurant_id, end, old_cutoff)
+            if advanced:
+                logger.info(
+                    "Daily report sent to manager of %s "
+                    "(restaurant_id=%s, window=%s to %s)",
+                    restaurant.get("name"), restaurant_id,
+                    start.isoformat(), end.isoformat(),
+                )
+            else:
+                # Another run already advanced the cursor; don't advance again.
+                logger.warning(
+                    "Daily report cursor for restaurant_id=%s was already advanced "
+                    "by another run; not advancing again (window=%s to %s)",
+                    restaurant_id, start.isoformat(), end.isoformat(),
+                )
+        except Exception as e:
+            # One restaurant failing must not stop the loop for the others.
+            logger.error(
+                "Error in daily report for restaurant_id=%s: %s",
+                restaurant_id, e, exc_info=True,
+            )
+            continue
 
 
 async def send_weekly_reports():
@@ -567,10 +662,15 @@ async def on_startup():
     asyncio.create_task(ping_n8n_periodically())
 
     # SCHEDULE REPORT
+    # max_instances=1 + coalesce=True guarantee the job never runs twice for the
+    # same 21:00 fire (no double-send); the conditional cursor advance in
+    # send_daily_reports is the belt-and-suspenders guard against overlap.
     scheduler.add_job(
         send_daily_reports,
         CronTrigger(hour=21, minute=00),
-        id='daily_reports'
+        id='daily_reports',
+        max_instances=1,
+        coalesce=True,
     )
     
     scheduler.add_job(
