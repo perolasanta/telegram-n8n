@@ -6,6 +6,7 @@ from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.utils.markdown import hbold 
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.exceptions import TelegramBadRequest
 
 import logging
 import asyncio
@@ -2376,11 +2377,12 @@ async def send_order_to_kitchen(
     # Resolve the bot that's actually a member of this restaurant's kitchen
     # chat — a restaurant may use a dedicated delivery_bot_token instead of
     # the main bot, and the kitchen group is only ever added to one of them.
-    bot = delivery_bots.get(restaurant_id, bot)    
-    order_text = build_kitchen_order_text(order_id, data, customer_name, customer_contact)
-    if payment_proof:
-        order_text = order_text[:1024]
-    
+    bot = delivery_bots.get(restaurant_id, bot)
+    full_text = build_kitchen_order_text(order_id, data, customer_name, customer_contact)
+    # Captions are capped at 1024 chars; plain text messages at 4096.
+    order_text = full_text[:1024] if payment_proof else full_text
+    sent_text = order_text
+
     # Send to kitchen
     if payment_proof:
         # Bank transfer - with payment proof
@@ -2390,13 +2392,30 @@ async def send_order_to_kitchen(
                 InlineKeyboardButton(text="❌ Reject Payment", callback_data=f"reject_pay_{order_id}")
             ]
         ])
-        
-        sent_message = await bot.send_photo(
-            kitchen_chat_id,
-            photo=payment_proof,
-            caption=order_text,
-            reply_markup=keyboard
-        )
+
+        try:
+            sent_message = await bot.send_photo(
+                kitchen_chat_id,
+                photo=payment_proof,
+                caption=order_text,
+                reply_markup=keyboard
+            )
+        except TelegramBadRequest:
+            # The proof couldn't be attached (bad file_id, expired media, etc.),
+            # but the kitchen must always receive a ticket. Fall back to the full
+            # ticket as text with the same confirm/reject controls.
+            logging.exception(
+                "Failed to send proof photo to kitchen for order %s; falling back to text ticket",
+                order_id,
+            )
+            sent_text = (
+                full_text + "\n\nProof could not be attached, ask the customer to resend."
+            )[:4096]
+            sent_message = await bot.send_message(
+                kitchen_chat_id,
+                text=sent_text,
+                reply_markup=keyboard
+            )
     else:
         # Other payment methods
         kitchen_buttons = [
@@ -2414,7 +2433,7 @@ async def send_order_to_kitchen(
     try:
         supabase.table("orders").update({
             "kitchen_message_id": sent_message.message_id,
-            "kitchen_message_text": order_text,
+            "kitchen_message_text": sent_text,
         }).eq("id", order_id).eq("restaurant_id", restaurant_id).execute()
     except Exception:
         logging.exception("Failed to save kitchen message details for order %s", order_id)
@@ -2542,16 +2561,30 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
         await callback_query.answer("That payment method isn't available for this order.", show_alert=True)
         return
     user_id = callback_query.from_user.id
-    
+
+    # PRE-INSERT: a failure here means no order row exists yet, so the existing
+    # "try again" message is correct.
+    order_id = None
     try:
         await state.update_data(payment_method="Pay on Delivery")
-        
-        # CREATE ORDER IN DATABASE
         customer_name = callback_query.from_user.username or callback_query.from_user.first_name or "Customer"
         order_id, order = await create_order_in_db(
             user_id, state, "Pay on Delivery", customer_name, "telegram", None
         )
-        
+    except ValueError as e:
+        await callback_query.message.answer(f"⚠️ {e}")
+        await callback_query.answer()
+        return
+    except Exception:
+        logging.exception("Order failed before insert (Pay on Delivery)")
+        await callback_query.message.answer("❌ Failed to place order. Please try again.")
+        await callback_query.answer()
+        return
+
+    # POST-INSERT: the order row exists. A failure in the notification/receipt
+    # section must not tell the customer the order failed — log it with the order
+    # id and let them know their order was received.
+    try:
         # SEND TO KITCHEN
         await send_order_to_kitchen(bot, order_id, state, customer_name)
 
@@ -2560,7 +2593,7 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
         await send_restock_alert(bot, data.get("restaurant_id"), data.get("kitchen_chat_id"), low_stock_items)
 
         total_price = data.get("total_price", 0)
-        
+
         await callback_query.message.answer(
             f"✅ Order placed successfully!\n"
             f"Order ID: #{order_id[:8]}\n"
@@ -2570,16 +2603,20 @@ async def payment_delivery(callback_query: types.CallbackQuery, state: FSMContex
             f"Your receipt will be sent when your order is ready.\n\n"
             f"<i>Powered by Chowlin 🍽️</i>"
         )
-        
+
         # Clear cart
         await state.update_data(cart={})
-        
-    except ValueError as e:
-        await callback_query.message.answer(f"⚠️ {e}")
-    except Exception as e:
-        print(f"Order error: {e}")
-        await callback_query.message.answer("❌ Failed to place order. Please try again.")
-    
+    except Exception:
+        logging.exception("Post-insert notification failed for order %s", order_id)
+        await callback_query.message.answer(
+            f"✅ Your order has been received (Order ID: #{order_id[:8]}).\n"
+            "We'll let you know once it's being prepared. If you don't hear from us shortly, please contact the restaurant."
+        )
+        try:
+            await state.update_data(cart={})
+        except Exception:
+            logging.exception("Failed to clear cart after post-insert failure for order %s", order_id)
+
     await callback_query.answer()
 
 
@@ -2590,16 +2627,30 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext, b
         await callback_query.answer("That payment method isn't available for this order.", show_alert=True)
         return
     user_id = callback_query.from_user.id
-    
+
+    # PRE-INSERT: a failure here means no order row exists yet, so the existing
+    # "try again" message is correct.
+    order_id = None
     try:
         await state.update_data(payment_method="Cash Payment")
-        
-        # CREATE ORDER IN DATABASE
         customer_name = callback_query.from_user.username or callback_query.from_user.first_name or "Customer"
         order_id, order = await create_order_in_db(
             user_id, state, "Cash Payment", customer_name, "telegram", None
         )
-        
+    except ValueError as e:
+        await callback_query.message.answer(f"⚠️ {e}")
+        await callback_query.answer()
+        return
+    except Exception:
+        logging.exception("Order failed before insert (Cash Payment)")
+        await callback_query.message.answer("❌ Failed to place order. Please try again.")
+        await callback_query.answer()
+        return
+
+    # POST-INSERT: the order row exists. A failure in the notification/receipt
+    # section must not tell the customer the order failed — log it with the order
+    # id and let them know their order was received.
+    try:
         # SEND TO KITCHEN
         await send_order_to_kitchen(bot, order_id, state, customer_name)
 
@@ -2608,7 +2659,7 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext, b
         await send_restock_alert(bot, data.get("restaurant_id"), data.get("kitchen_chat_id"), low_stock_items)
 
         total_price = data.get("total_price", 0)
-        
+
         await callback_query.message.answer(
             f"✅ Order placed successfully!\n"
             f"Order ID: #{order_id[:8]}\n"
@@ -2618,16 +2669,20 @@ async def payment_cash(callback_query: types.CallbackQuery, state: FSMContext, b
             f"Your receipt will be sent when your order is ready.\n\n"
             f"<i>Powered by Chowlin 🍽️</i>"
         )
-        
+
         # Clear cart
         await state.update_data(cart={})
-        
-    except ValueError as e:
-        await callback_query.message.answer(f"⚠️ {e}")
-    except Exception as e:
-        print(f"Order error: {e}")
-        await callback_query.message.answer("❌ Failed to place order. Please try again.")
-    
+    except Exception:
+        logging.exception("Post-insert notification failed for order %s", order_id)
+        await callback_query.message.answer(
+            f"✅ Your order has been received (Order ID: #{order_id[:8]}).\n"
+            "We'll let you know once it's being prepared. If you don't hear from us shortly, please contact the restaurant."
+        )
+        try:
+            await state.update_data(cart={})
+        except Exception:
+            logging.exception("Failed to clear cart after post-insert failure for order %s", order_id)
+
     await callback_query.answer()
 
 
@@ -2749,26 +2804,67 @@ async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
     await callback_query.answer()
 
 
-@dp.message(OrderStates.waiting_for_payment_proof, F.photo)
+def is_valid_proof_message(message: types.Message) -> bool:
+    """Pure: True if the message carries a photo or an image document we can forward as proof.
+
+    Accepts ``message.photo`` (any size present; callers pick the largest) or a
+    document whose ``mime_type`` starts with ``image/``. Text, stickers, voice
+    notes, videos and PDFs are rejected so we never try to send a non-image as a
+    kitchen proof photo.
+    """
+    if message.photo:
+        return True
+    document = message.document
+    if document is not None:
+        mime_type = document.mime_type or ""
+        if mime_type.startswith("image/"):
+            return True
+    return False
+
+
+@dp.message(OrderStates.waiting_for_payment_proof)
 async def receive_payment_proof(message: types.Message, state: FSMContext, bot: Bot):
-    """Handle payment proof screenshot for bank transfer"""
-    photo = message.photo[-1]
-    file_id = photo.file_id
+    """Handle payment proof screenshot for bank transfer.
+
+    Accepts only a photo or an image document; anything else re-prompts and
+    keeps the FSM state so no order is created for an invalid proof.
+    """
+    if not is_valid_proof_message(message):
+        await message.answer("Please send a photo of your transfer receipt.")
+        return  # keep FSM state
+
+    if message.photo:
+        file_id = message.photo[-1].file_id  # largest size
+    else:
+        file_id = message.document.file_id
     user_id = message.from_user.id
-    
+
+    # PRE-INSERT: a failure here means no order row exists yet, so the existing
+    # "try again" message is correct.
+    order_id = None
     try:
-        # CREATE ORDER with payment proof
         customer_name = message.from_user.username or message.from_user.first_name or "Customer"
         order_id, order = await create_order_in_db(
             user_id, state, "Bank Transfer", customer_name, "telegram", file_id,
         )
-        
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}")
+        return
+    except Exception:
+        logging.exception("Order failed before insert (Bank Transfer proof)")
+        await message.answer("❌ Failed to place order. Please try again.")
+        return
+
+    # POST-INSERT: the order row exists. A failure in the notification/receipt
+    # section must not tell the customer the order failed — log it with the order
+    # id and let them know their order was received.
+    try:
         data = await state.get_data()
         total_price = data.get("total_price", 0)
-        
+
         # SEND TO KITCHEN with payment proof
         await send_order_to_kitchen(bot, order_id, state, customer_name, payment_proof=file_id)
-        
+
         await message.answer(
             f"✅ Order placed successfully!\n"
             f"Order ID: #{order_id[:8]}\n"
@@ -2779,25 +2875,22 @@ async def receive_payment_proof(message: types.Message, state: FSMContext, bot: 
             f"📄 Receipt will be sent after payment confirmation.\n\n"
             f"<i>Powered by Chowlin 🍽️</i>"
         )
-        
+
         # Clear cart and state
         await state.update_data(cart={})
         await state.clear()
-        
-    except ValueError as e:
-        await message.answer(f"⚠️ {e}")
-    except Exception as e:
-        print(f"Order error: {e}")
-        await message.answer("❌ Failed to place order. Please try again.")
-
-
-@dp.message(OrderStates.waiting_for_payment_proof)
-async def payment_proof_invalid(message: types.Message):
-    """Handle invalid payment proof"""
-    await message.answer(
-        "⚠️ Please send a screenshot/photo of your payment receipt.\n"
-        "Or type /cancel to cancel."
-    )
+    except Exception:
+        logging.exception("Post-insert notification failed for order %s", order_id)
+        await message.answer(
+            f"✅ Your order has been received (Order ID: #{order_id[:8]}).\n"
+            "We're verifying your payment. If you don't hear from us shortly, "
+            "please contact the restaurant."
+        )
+        try:
+            await state.update_data(cart={})
+            await state.clear()
+        except Exception:
+            logging.exception("Failed to clear state after post-insert failure for order %s", order_id)
 
 
 # ========== KITCHEN CALLBACKS ==========
