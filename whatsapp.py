@@ -40,6 +40,7 @@ from bot import (
 
 GRAPH_API = "https://graph.facebook.com/v25.0"
 MAX_WHATSAPP_LIST_ROWS = 10
+MAX_WHATSAPP_CATALOG_FOOTER_LENGTH = 60
 MAX_LINE_QTY = 50
 MAX_COMPOSITE_UNITS = 5
 SESSION_TTL_MINUTES = 120
@@ -334,7 +335,7 @@ async def send_whatsapp_message(phone_number_id: str, token: str, to: str, paylo
         response = await client.post(
             f"{GRAPH_API}/{phone_number_id}/messages",
             headers={"Authorization": f"Bearer {token}"},
-            json={"messaging_product": "whatsapp", "to": to, **payload},
+            json={"messaging_product": "whatsapp", "recipient_type": "individual", "to": to, **payload},
         )
         response.raise_for_status()
         return response.json()
@@ -362,19 +363,21 @@ def build_catalog_welcome_text(restaurant_name: str, pickup_enabled: bool) -> tu
         "3. Tap *View cart*, then *Send*\n\n"
         f"{closing}"
     )
-    footer = f"Can't see it? Tap {name} at the top of this chat, then View catalog."
+    footer = "Can't see it? Tap the shop icon at the top right."
     return truncate(body, 1024), footer
 
 
 def build_catalog_payload(body: str, footer: str) -> dict:
+    interactive = {
+        "type": "catalog_message",
+        "body": {"text": truncate(body, 1024).strip()},
+        "action": {"name": "catalog_message"},
+    }
+    if footer and len(str(footer)) <= MAX_WHATSAPP_CATALOG_FOOTER_LENGTH:
+        interactive["footer"] = {"text": str(footer).strip()}
     return {
         "type": "interactive",
-        "interactive": {
-            "type": "catalog_message",
-            "body": {"text": truncate(body, 1024)},
-            "footer": {"text": str(footer)},
-            "action": {"name": "catalog_message"},
-        },
+        "interactive": interactive,
     }
 
 
@@ -382,19 +385,25 @@ async def send_catalog_message(restaurant, to: str, supabase):
     body, footer = build_catalog_welcome_text(
         restaurant.get("name") or "the restaurant", restaurant.get("pickup_enabled") is True
     )
+    recipient = re.sub(r"\D", "", str(to))
+    if not recipient:
+        raise ValueError("WhatsApp recipient must contain digits")
+    fallback_body = f"{body}\n\nCan't see it? Tap {restaurant.get('name') or 'the restaurant'} at the top of this chat, then View catalog."
     try:
         result = await send_whatsapp_message(
-            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], to,
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], recipient,
             build_catalog_payload(body, footer),
         )
         if isinstance(result, dict) and result.get("error"):
             meta_error = result["error"]
+            error_data = meta_error.get("error_data") or result.get("error_data") or {}
             logging.warning(
-                "WhatsApp welcome path=fallback message_id=%s http_status=%s meta_error_code=%s meta_error_message=%s",
+                "WhatsApp welcome path=fallback message_id=%s http_status=%s meta_error_code=%s meta_error_message=%s error_data_details=%s fbtrace_id=%s body_length=%s footer_length=%s",
                 result.get("messages", [{}])[0].get("id") if result.get("messages") else None,
                 result.get("http_status"), meta_error.get("code"), meta_error.get("message"),
+                error_data.get("details"), meta_error.get("fbtrace_id") or result.get("fbtrace_id"), len(body), len(footer),
             )
-            await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], to, body)
+            await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], recipient, fallback_body)
             return
         logging.info(
             "WhatsApp welcome path=interactive message_id=%s",
@@ -410,14 +419,16 @@ async def send_catalog_message(restaurant, to: str, supabase):
             except Exception:
                 error_body = {}
         meta_error = error_body.get("error") or {}
+        error_data = meta_error.get("error_data") or error_body.get("error_data") or {}
         result_id = (result.get("messages", [{}])[0].get("id")
                      if isinstance(locals().get("result"), dict) else
                      meta_error.get("fbtrace_id"))
         logging.warning(
-            "WhatsApp welcome path=fallback message_id=%s http_status=%s meta_error_code=%s meta_error_message=%s",
+            "WhatsApp welcome path=fallback message_id=%s http_status=%s meta_error_code=%s meta_error_message=%s error_data_details=%s fbtrace_id=%s body_length=%s footer_length=%s",
             result_id, getattr(response, "status_code", None), meta_error.get("code"), meta_error.get("message"),
+            error_data.get("details"), meta_error.get("fbtrace_id") or error_body.get("fbtrace_id"), len(body), len(footer),
         )
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], to, body)
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], recipient, fallback_body)
         return
 
 

@@ -11,6 +11,7 @@ os.environ.setdefault("SUPABASE_SERVICE_KEY", "test-service-key")
 from whatsapp import (
     build_buttons_payload, build_list_payload, build_catalog_payload,
     build_catalog_welcome_text, send_catalog_message, send_text,
+    MAX_WHATSAPP_CATALOG_FOOTER_LENGTH,
 )
 
 
@@ -24,8 +25,14 @@ class TestWhatsAppPayloadBuilders(unittest.TestCase):
         self.assertIn("pickup", pickup)
         self.assertIn("delivery address", delivery)
         self.assertNotIn("or *pickup*", delivery)
-        self.assertIn("View catalog", footer)
-        self.assertIn("View catalog", delivery_footer)
+        self.assertEqual(footer, "Can't see it? Tap the shop icon at the top right.")
+        self.assertEqual(delivery_footer, footer)
+        self.assertLessEqual(len(footer), MAX_WHATSAPP_CATALOG_FOOTER_LENGTH)
+        for name in ("A", "a" * 250, "餐厅" * 100):
+            self.assertLessEqual(
+                len(build_catalog_welcome_text(name, False)[1]),
+                MAX_WHATSAPP_CATALOG_FOOTER_LENGTH,
+            )
         self.assertLess(len(pickup), 1024)
         self.assertLess(len(delivery), 1024)
 
@@ -38,6 +45,15 @@ class TestWhatsAppPayloadBuilders(unittest.TestCase):
         self.assertIn("footer", interactive)
         self.assertNotIn("thumbnail_product_retailer_id", interactive["action"])
         self.assertNotIn("parameters", interactive["action"])
+
+    def test_catalog_payload_omits_overlong_footer(self):
+        payload = build_catalog_payload("Welcome", "x" * (MAX_WHATSAPP_CATALOG_FOOTER_LENGTH + 1))
+        self.assertNotIn("footer", payload["interactive"])
+
+    def test_catalog_payload_strips_body_and_footer_whitespace(self):
+        payload = build_catalog_payload("  Welcome  ", "  Footer  ")
+        self.assertEqual(payload["interactive"]["body"]["text"], "Welcome")
+        self.assertEqual(payload["interactive"]["footer"]["text"], "Footer")
 
     def test_list_body_label_title_and_description_are_truncated(self):
         payload = build_list_payload(
@@ -132,5 +148,7 @@ class TestSendTextLimit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(supabase.table_calls, [])
         self.assertEqual(calls[1]["type"], "text")
         self.assertEqual(
-            calls[1]["text"]["body"], build_catalog_welcome_text("Chowlin", False)[0]
+            calls[1]["text"]["body"],
+            build_catalog_welcome_text("Chowlin", False)[0]
+            + "\n\nCan't see it? Tap Chowlin at the top of this chat, then View catalog.",
         )
