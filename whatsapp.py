@@ -347,6 +347,25 @@ async def send_text(phone_number_id, token, to, text):
     )
 
 
+def build_catalog_welcome_text(restaurant_name: str, pickup_enabled: bool) -> tuple[str, str]:
+    name = truncate(restaurant_name or "the restaurant", 250)
+    closing = (
+        "Next I'll ask if you want *delivery* or *pickup*, then payment."
+        if pickup_enabled else
+        "Next I'll ask for your delivery address, then payment."
+    )
+    body = (
+        f"Welcome to *{name}*! 🍽️\n\n"
+        "To order:\n"
+        "1. Tap the *shop icon* 🏪 at the top right of this chat (or the *View catalog* button below)\n"
+        "2. Add the items you want\n"
+        "3. Tap *View cart*, then *Send*\n\n"
+        f"{closing}"
+    )
+    footer = f"Can't see it? Tap {name} at the top of this chat, then View catalog."
+    return truncate(body, 1024), footer
+
+
 def build_catalog_payload(body: str, footer: str, thumbnail_product_retailer_id: str | None = None) -> dict:
     action = {"name": "catalog_message"}
     if thumbnail_product_retailer_id:
@@ -363,32 +382,57 @@ def build_catalog_payload(body: str, footer: str, thumbnail_product_retailer_id:
 
 
 async def send_catalog_message(restaurant, to: str, supabase):
-    name = truncate(restaurant.get("name") or "the restaurant", 250)
-    body = (
-        f"Welcome to *{name}*! 🍽️\n\n"
-        "To order:\n"
-        "1. Tap *View catalog* below\n"
-        "2. Add the items you want\n"
-        "3. Tap *View cart*, then *Send*\n\n"
-        "I'll then ask for your delivery address and payment."
+    body, footer = build_catalog_welcome_text(
+        restaurant.get("name") or "the restaurant", restaurant.get("pickup_enabled") is True
     )
-    footer = "Or tap the restaurant name at the top of this chat, then View catalog."
     thumbnail = None
     try:
-        mapped = supabase.table("menu_item_catalog_map").select(
-            "catalog_retailer_id, menu_items(is_available)"
-        ).eq("restaurant_id", restaurant["id"]).eq("menu_items.is_available", True).limit(1).execute()
-        if mapped.data:
-            thumbnail = mapped.data[0].get("catalog_retailer_id")
+        try:
+            mapped = supabase.table("menu_item_catalog_map").select(
+                "catalog_retailer_id, menu_items(is_available)"
+            ).eq("restaurant_id", restaurant["id"]).eq(
+                "menu_items.is_available", True
+            ).limit(1).execute()
+            if mapped.data:
+                thumbnail = mapped.data[0].get("catalog_retailer_id")
+        except Exception:
+            logging.warning("Catalog thumbnail lookup failed for restaurant_id=%s; omitting thumbnail", restaurant.get("id"))
         result = await send_whatsapp_message(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], to,
             build_catalog_payload(body, footer, thumbnail),
         )
+        if isinstance(result, dict) and result.get("error"):
+            meta_error = result["error"]
+            logging.warning(
+                "WhatsApp welcome path=fallback message_id=%s http_status=%s meta_error_code=%s meta_error_message=%s",
+                result.get("messages", [{}])[0].get("id") if result.get("messages") else None,
+                result.get("http_status"), meta_error.get("code"), meta_error.get("message"),
+            )
+            await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], to, body)
+            return
+        logging.info(
+            "WhatsApp welcome path=interactive message_id=%s",
+            result.get("messages", [{}])[0].get("id") if isinstance(result, dict) and result.get("messages") else None,
+        )
         return result
     except Exception as exc:
-        result_id = result.get("messages", [{}])[0].get("id") if isinstance(locals().get("result"), dict) else None
-        logging.warning("Catalog message failed for message_id=%s: %s", result_id, type(exc).__name__)
+        response = getattr(exc, "response", None)
+        error_body = {}
+        if response is not None:
+            try:
+                error_body = response.json()
+            except Exception:
+                error_body = {}
+        meta_error = error_body.get("error") or {}
+        result_id = (result.get("messages", [{}])[0].get("id")
+                     if isinstance(locals().get("result"), dict) else
+                     meta_error.get("fbtrace_id"))
+        logging.warning(
+            "WhatsApp welcome path=fallback message_id=%s http_status=%s meta_error_code=%s meta_error_message=%s",
+            result_id, getattr(response, "status_code", None), meta_error.get("code"), meta_error.get("message"),
+        )
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], to, body)
+        return
 
 
 def build_list_payload(body: str, button_label: str, rows: list[dict]) -> dict:

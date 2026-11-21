@@ -8,10 +8,35 @@ os.environ.setdefault("TOKEN", "123456:TEST_TOKEN")
 os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_SERVICE_KEY", "test-service-key")
 
-from whatsapp import build_buttons_payload, build_list_payload, send_text
+from whatsapp import (
+    build_buttons_payload, build_list_payload, build_catalog_payload,
+    build_catalog_welcome_text, send_catalog_message, send_text,
+)
 
 
 class TestWhatsAppPayloadBuilders(unittest.TestCase):
+
+    def test_catalog_welcome_text_adapts_to_pickup(self):
+        pickup, footer = build_catalog_welcome_text("Chowlin", True)
+        delivery, delivery_footer = build_catalog_welcome_text("Chowlin", False)
+        self.assertIn("shop icon", pickup)
+        self.assertIn("delivery", pickup)
+        self.assertIn("pickup", pickup)
+        self.assertIn("delivery address", delivery)
+        self.assertNotIn("or *pickup*", delivery)
+        self.assertIn("View catalog", footer)
+        self.assertIn("View catalog", delivery_footer)
+        self.assertLess(len(pickup), 1024)
+        self.assertLess(len(delivery), 1024)
+
+    def test_catalog_payload_shape_and_optional_thumbnail(self):
+        payload = build_catalog_payload("Welcome", "Footer")
+        interactive = payload["interactive"]
+        self.assertEqual(payload["type"], "interactive")
+        self.assertEqual(interactive["type"], "catalog_message")
+        self.assertEqual(interactive["action"], {"name": "catalog_message"})
+        self.assertIn("footer", interactive)
+        self.assertNotIn("thumbnail_product_retailer_id", interactive["action"])
 
     def test_list_body_label_title_and_description_are_truncated(self):
         payload = build_list_payload(
@@ -79,3 +104,35 @@ class TestSendTextLimit(unittest.IsolatedAsyncioTestCase):
         body = payload["text"]["body"]
         self.assertEqual(len(body), 4096)
         self.assertTrue(body.endswith("…"))
+
+    async def test_catalog_fallback_sends_same_built_text_without_thumbnail(self):
+        class Result:
+            data = []
+
+        class Query:
+            def select(self, *_args): return self
+            def eq(self, *_args): return self
+            def limit(self, *_args): return self
+            def execute(self): return Result()
+
+        class FakeSupabase:
+            def table(self, *_args): return Query()
+
+        calls = []
+
+        async def sender(*args):
+            calls.append(args[3])
+            if len(calls) == 1:
+                raise RuntimeError("catalog unavailable")
+            return {"messages": [{"id": "fallback-1"}]}
+
+        restaurant = {
+            "id": "restaurant-1", "name": "Chowlin", "pickup_enabled": False,
+            "whatsapp_phone_number_id": "phone-id", "whatsapp_access_token": "token",
+        }
+        with patch("whatsapp.send_whatsapp_message", sender):
+            await send_catalog_message(restaurant, "+234", FakeSupabase())
+        self.assertEqual(calls[1]["type"], "text")
+        self.assertEqual(
+            calls[1]["text"]["body"], build_catalog_welcome_text("Chowlin", False)[0]
+        )
