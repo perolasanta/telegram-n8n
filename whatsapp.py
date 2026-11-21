@@ -366,17 +366,14 @@ def build_catalog_welcome_text(restaurant_name: str, pickup_enabled: bool) -> tu
     return truncate(body, 1024), footer
 
 
-def build_catalog_payload(body: str, footer: str, thumbnail_product_retailer_id: str | None = None) -> dict:
-    action = {"name": "catalog_message"}
-    if thumbnail_product_retailer_id:
-        action["thumbnail_product_retailer_id"] = str(thumbnail_product_retailer_id)
+def build_catalog_payload(body: str, footer: str) -> dict:
     return {
         "type": "interactive",
         "interactive": {
             "type": "catalog_message",
             "body": {"text": truncate(body, 1024)},
             "footer": {"text": str(footer)},
-            "action": action,
+            "action": {"name": "catalog_message"},
         },
     }
 
@@ -385,21 +382,10 @@ async def send_catalog_message(restaurant, to: str, supabase):
     body, footer = build_catalog_welcome_text(
         restaurant.get("name") or "the restaurant", restaurant.get("pickup_enabled") is True
     )
-    thumbnail = None
     try:
-        try:
-            mapped = supabase.table("menu_item_catalog_map").select(
-                "catalog_retailer_id, menu_items(is_available)"
-            ).eq("restaurant_id", restaurant["id"]).eq(
-                "menu_items.is_available", True
-            ).limit(1).execute()
-            if mapped.data:
-                thumbnail = mapped.data[0].get("catalog_retailer_id")
-        except Exception:
-            logging.warning("Catalog thumbnail lookup failed for restaurant_id=%s; omitting thumbnail", restaurant.get("id"))
         result = await send_whatsapp_message(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], to,
-            build_catalog_payload(body, footer, thumbnail),
+            build_catalog_payload(body, footer),
         )
         if isinstance(result, dict) and result.get("error"):
             meta_error = result["error"]

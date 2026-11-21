@@ -29,7 +29,7 @@ class TestWhatsAppPayloadBuilders(unittest.TestCase):
         self.assertLess(len(pickup), 1024)
         self.assertLess(len(delivery), 1024)
 
-    def test_catalog_payload_shape_and_optional_thumbnail(self):
+    def test_catalog_payload_shape(self):
         payload = build_catalog_payload("Welcome", "Footer")
         interactive = payload["interactive"]
         self.assertEqual(payload["type"], "interactive")
@@ -37,6 +37,7 @@ class TestWhatsAppPayloadBuilders(unittest.TestCase):
         self.assertEqual(interactive["action"], {"name": "catalog_message"})
         self.assertIn("footer", interactive)
         self.assertNotIn("thumbnail_product_retailer_id", interactive["action"])
+        self.assertNotIn("parameters", interactive["action"])
 
     def test_list_body_label_title_and_description_are_truncated(self):
         payload = build_list_payload(
@@ -105,18 +106,13 @@ class TestSendTextLimit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(body), 4096)
         self.assertTrue(body.endswith("…"))
 
-    async def test_catalog_fallback_sends_same_built_text_without_thumbnail(self):
-        class Result:
-            data = []
-
-        class Query:
-            def select(self, *_args): return self
-            def eq(self, *_args): return self
-            def limit(self, *_args): return self
-            def execute(self): return Result()
-
         class FakeSupabase:
-            def table(self, *_args): return Query()
+            def __init__(self):
+                self.table_calls = []
+
+            def table(self, table_name):
+                self.table_calls.append(table_name)
+                raise AssertionError("catalog map query should not be made")
 
         calls = []
 
@@ -130,8 +126,10 @@ class TestSendTextLimit(unittest.IsolatedAsyncioTestCase):
             "id": "restaurant-1", "name": "Chowlin", "pickup_enabled": False,
             "whatsapp_phone_number_id": "phone-id", "whatsapp_access_token": "token",
         }
+        supabase = FakeSupabase()
         with patch("whatsapp.send_whatsapp_message", sender):
-            await send_catalog_message(restaurant, "+234", FakeSupabase())
+            await send_catalog_message(restaurant, "+234", supabase)
+        self.assertEqual(supabase.table_calls, [])
         self.assertEqual(calls[1]["type"], "text")
         self.assertEqual(
             calls[1]["text"]["body"], build_catalog_welcome_text("Chowlin", False)[0]
