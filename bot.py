@@ -866,7 +866,19 @@ def format_order_location(order: dict, include_type: bool = False) -> str:
     return label
 
 
+def filter_orders_visible_to_kitchen(orders: list[dict]) -> list[dict]:
+    """Return orders that are allowed to appear in kitchen-facing views."""
+    return [
+        order for order in orders
+        if not (
+            order.get("payment_method") == "Paystack"
+            and order.get("payment_status") != "confirmed"
+        )
+    ]
+
+
 def build_kitchen_order_board_sections(orders: list[dict]):
+    orders = filter_orders_visible_to_kitchen(orders)
     pending = [order for order in orders if order.get("order_status") == "pending"]
     preparing = [order for order in orders if order.get("order_status") == "preparing"]
     ready = sorted(
@@ -1001,6 +1013,9 @@ async def send_order_to_kitchen_from_db(bot: Bot, order_id: str):
         return
 
     order = order_resp.data[0]
+    if not filter_orders_visible_to_kitchen([order]):
+        logging.warning("Blocked unconfirmed Paystack kitchen notification for order %s", order_id)
+        return
     kitchen_chat_id = (order.get("restaurants") or {}).get("kitchen_chat_id")
     restaurant_name = (order.get("restaurants") or {}).get("name", "Restaurant")
     order_type = order.get("order_type", "dine_in")
@@ -4229,7 +4244,7 @@ async def pending_orders(message: types.Message):
         return
     
     pending = supabase.table("orders")\
-        .select("id", count="exact")\
+        .select("id, payment_method, payment_status")\
         .eq("restaurant_id", restaurant.data[0]["id"])\
         .eq("order_status", "pending")\
         .execute()
@@ -4242,7 +4257,7 @@ async def pending_orders(message: types.Message):
     
     await message.answer(
         f"📊 <b>Current Queue</b>\n\n"
-        f"⏳ Pending: {pending.count or 0}\n"
+        f"⏳ Pending: {len(filter_orders_visible_to_kitchen(pending.data or []))}\n"
         f"🍳 Preparing: {preparing.count or 0}"
     )
 

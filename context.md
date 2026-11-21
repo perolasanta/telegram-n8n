@@ -216,6 +216,9 @@ Paystack requires an email address. For WhatsApp orders, use the documented dete
 
 ## Known implementation notes for future work
 
+- Paystack orders remain pending in the database but are hidden from the kitchen board, `/pending`, and rush-hour counts until payment is confirmed. The verified Paystack webhook is the notification path after confirmation.
+- The WhatsApp welcome now uses Meta `catalog_message` with a plain-text fallback if the interactive catalog message fails.
+
 - `Dockerfile` copies only the runtime modules it currently imports. If a new runtime module/asset is added, include it in the image build.
 - Migration 010 has no `.sql` extension but contains SQL and is the WhatsApp schema migration. Keep migration execution/documentation aware of that filename.
 - The existing report implementation totals all orders in its time range; it does not filter to confirmed payments. Clarify the desired revenue definition before changing financial reporting.

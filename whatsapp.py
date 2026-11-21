@@ -337,6 +337,7 @@ async def send_whatsapp_message(phone_number_id: str, token: str, to: str, paylo
             json={"messaging_product": "whatsapp", "to": to, **payload},
         )
         response.raise_for_status()
+        return response.json()
 
 
 async def send_text(phone_number_id, token, to, text):
@@ -344,6 +345,50 @@ async def send_text(phone_number_id, token, to, text):
         phone_number_id, token, to,
         {"type": "text", "text": {"body": truncate(text, 4096)}},
     )
+
+
+def build_catalog_payload(body: str, footer: str, thumbnail_product_retailer_id: str | None = None) -> dict:
+    action = {"name": "catalog_message"}
+    if thumbnail_product_retailer_id:
+        action["thumbnail_product_retailer_id"] = str(thumbnail_product_retailer_id)
+    return {
+        "type": "interactive",
+        "interactive": {
+            "type": "catalog_message",
+            "body": {"text": truncate(body, 1024)},
+            "footer": {"text": str(footer)},
+            "action": action,
+        },
+    }
+
+
+async def send_catalog_message(restaurant, to: str, supabase):
+    name = truncate(restaurant.get("name") or "the restaurant", 250)
+    body = (
+        f"Welcome to *{name}*! 🍽️\n\n"
+        "To order:\n"
+        "1. Tap *View catalog* below\n"
+        "2. Add the items you want\n"
+        "3. Tap *View cart*, then *Send*\n\n"
+        "I'll then ask for your delivery address and payment."
+    )
+    footer = "Or tap the restaurant name at the top of this chat, then View catalog."
+    thumbnail = None
+    try:
+        mapped = supabase.table("menu_item_catalog_map").select(
+            "catalog_retailer_id, menu_items(is_available)"
+        ).eq("restaurant_id", restaurant["id"]).eq("menu_items.is_available", True).limit(1).execute()
+        if mapped.data:
+            thumbnail = mapped.data[0].get("catalog_retailer_id")
+        result = await send_whatsapp_message(
+            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], to,
+            build_catalog_payload(body, footer, thumbnail),
+        )
+        return result
+    except Exception as exc:
+        result_id = result.get("messages", [{}])[0].get("id") if isinstance(locals().get("result"), dict) else None
+        logging.warning("Catalog message failed for message_id=%s: %s", result_id, type(exc).__name__)
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], to, body)
 
 
 def build_list_payload(body: str, button_label: str, rows: list[dict]) -> dict:
@@ -1671,9 +1716,8 @@ async def handle_text(msg, state, restaurant, from_number, current_state, supaba
         table_number = row.get("table_number")
         if table_number is None or table_number == "EXTERNAL":
             await clear_table_binding(state)
-            await send_text(
-                restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-                f"Hi! To order from {truncate(restaurant.get('name') or 'the restaurant', 250)}, browse our WhatsApp catalog and send your cart.",
+            await send_catalog_message(
+                restaurant, from_number, supabase,
             )
             return
         await state.update_data(
@@ -1681,17 +1725,15 @@ async def handle_text(msg, state, restaurant, from_number, current_state, supaba
             menu_filter=row.get("menu_filter"),
             table_bound_at=datetime.now(timezone.utc).isoformat(),
         )
-        await send_text(
-            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            f"Welcome to {truncate(restaurant.get('name') or 'the restaurant', 250)} (Table {truncate(table_number, 50)}). Open our catalog, add your items, and send your cart.",
+        await send_catalog_message(
+            restaurant, from_number, supabase,
         )
         return
     intent = parse_customer_intent(body)
     if intent == "restart":
         await state.clear()
-        await send_text(
-            restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            "Your session has been reset. Browse our catalog and send your cart to start a new order.",
+        await send_catalog_message(
+            restaurant, from_number, supabase,
         )
         return
     if intent == "cancel" and current_state is not None and current_state not in (
@@ -1734,21 +1776,11 @@ async def handle_text(msg, state, restaurant, from_number, current_state, supaba
 
 
 async def handle_freeform_message(msg, state, restaurant, from_number, current_state):
-    await send_whatsapp_main_menu(restaurant, from_number)
+    await send_whatsapp_main_menu(restaurant, from_number, state.supabase)
 
 
-async def send_whatsapp_main_menu(restaurant, from_number):
-    await send_list(
-        restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-        f"Hi! To order from {restaurant.get('name', 'the restaurant')}, browse our WhatsApp catalog and send your cart. What would you like to do?",
-        "Menu",
-        [
-            {"id": "cmd_status", "title": "Order status"},
-            {"id": "cmd_history", "title": "Recent orders"},
-            {"id": "cmd_cancel", "title": "Cancel an order"},
-            {"id": "cmd_help", "title": "How to order"},
-        ],
-    )
+async def send_whatsapp_main_menu(restaurant, from_number, supabase):
+    await send_catalog_message(restaurant, from_number, supabase)
 
 
 async def fetch_customer_order(supabase, order_id, restaurant_id, from_number, select):
@@ -1977,7 +2009,7 @@ async def handle_command_reply(reply_id, state, restaurant, from_number, supabas
     elif reply_id == "cmd_history":
         await send_customer_order_history(state, restaurant, from_number, supabase)
     elif reply_id == "cmd_help":
-        await send_whatsapp_main_menu(restaurant, from_number)
+        await send_whatsapp_main_menu(restaurant, from_number, supabase)
     elif reply_id == "cmd_cancel":
         await send_cancellable_orders(state, restaurant, from_number, supabase)
 
