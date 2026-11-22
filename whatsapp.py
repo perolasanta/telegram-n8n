@@ -576,7 +576,8 @@ async def sync_catalog_item_availability(
                 data={"item_type": "PRODUCT_ITEM", "allow_upsert": "false", "requests": json.dumps([request])},
             )
             response.raise_for_status()
-            handle = response.json().get("handle")
+            handles = response.json().get("handles")
+            handle = handles[0] if isinstance(handles, list) and handles and isinstance(handles[0], str) else None
             if handle:
                 await asyncio.sleep(0.1)
                 status = await client.get(
@@ -584,10 +585,10 @@ async def sync_catalog_item_availability(
                     headers={"Authorization": f"Bearer {token}"},
                     params={"handle": handle, "load_ids_of_invalid_requests": "true"},
                 )
-                status.raise_for_status()
-                invalid = status.json().get("ids_of_invalid_requests") or status.json().get("invalid_requests") or []
-                if invalid:
-                    raise RuntimeError("Meta batch status reported invalid catalog request")
+                # Batch status is informational; a lagging/invalid handle must
+                # not turn an accepted catalog update into a failed submission.
+                if status.is_error:
+                    logging.warning("Catalog status check unavailable: http_status=%s", status.status_code)
     except Exception as exc:
         response = getattr(exc, "response", None)
         body = {}
@@ -647,9 +648,9 @@ async def resync_catalog_availability(restaurant_id: str, supabase) -> dict:
     mappings = supabase.table("menu_item_catalog_map").select(
         "menu_item_id, catalog_retailer_id, menu_items(is_available), restaurants(whatsapp_access_token, whatsapp_catalog_id)"
     ).eq("restaurant_id", restaurant_id).execute().data or []
-    synced = failed = 0
-    errors, catalog_ids, attempted, attempts = [], [], 0, []
-    visibility_supported = True
+    submitted = synced = failed = invalid_count = 0
+    errors, catalog_ids, attempted, attempts, handle_info = [], [], 0, [], []
+    visibility_supported = None
     groups = {}
     for row in mappings:
         restaurant = row.get("restaurants") or {}
@@ -669,6 +670,7 @@ async def resync_catalog_availability(restaurant_id: str, supabase) -> dict:
                 "availability": "in stock" if (row.get("menu_items") or {}).get("is_available") else "out of stock",
                 "visibility": "published" if (row.get("menu_items") or {}).get("is_available") else "staging",
             }} for row in chunk]
+            submitted_this_chunk = False
             for attempt_number, attempt_requests in ((1, requests), (2, [{"method": r["method"], "data": {k: v for k, v in r["data"].items() if k != "visibility"}} for r in requests])):
                 shape = catalog_request_shape(catalog_id, attempt_requests, False)
                 try:
@@ -676,21 +678,42 @@ async def resync_catalog_availability(restaurant_id: str, supabase) -> dict:
                         response = await client.post(f"{GRAPH_API}/{catalog_id}/items_batch", headers={"Authorization": f"Bearer {token}"}, data={"item_type": "PRODUCT_ITEM", "allow_upsert": "false", "requests": json.dumps(attempt_requests)})
                         response.raise_for_status()
                         attempts.append({"attempt": attempt_number, "fields_sent": list(attempt_requests[0]["data"]), "http_status": response.status_code, "ok": True, "meta_error_code": None, "error_subcode": None, "error_user_msg": None})
-                        handle = response.json().get("handle")
-                        await asyncio.sleep(0.1)
-                        status = await client.get(f"{GRAPH_API}/{catalog_id}/check_batch_request_status", headers={"Authorization": f"Bearer {token}"}, params={"handle": handle, "load_ids_of_invalid_requests": "true"})
-                        status.raise_for_status()
-                    invalid = (status.json().get("ids_of_invalid_requests") or status.json().get("invalid_requests") or [])
-                    failed += len(invalid); synced += len(chunk) - len(invalid)
-                    for item in invalid:
-                        errors.append({"http_status": None, "meta_error_code": None, "meta_error_message": str(item), "type": None, "error_subcode": None, "error_user_title": None, "error_user_msg": None, "error_data": None, "fbtrace_id": None, "retailer_id": str(item)})
-                    if attempt_number == 2: visibility_supported = False
+                        handles = response.json().get("handles")
+                        handle = handles[0] if isinstance(handles, list) and handles and isinstance(handles[0], str) else None
+                        info = {"type": type(handle).__name__ if handle is not None else None, "empty": not bool(handle), "length": len(handle) if isinstance(handle, str) else 0, "status_check": "skipped"}
+                        submitted += len(chunk); submitted_this_chunk = True
+                        if attempt_number == 2:
+                            visibility_supported = False
+                        if handle:
+                            # The batch processor can lag. Retry only this GET once.
+                            for status_attempt in range(2):
+                                await asyncio.sleep(1 if status_attempt == 0 else 4)
+                                status = await client.get(f"{GRAPH_API}/{catalog_id}/check_batch_request_status", headers={"Authorization": f"Bearer {token}"}, params={"handle": handle, "load_ids_of_invalid_requests": "true"})
+                                if not status.is_error:
+                                    listed = status.json().get("ids_of_invalid_requests") or status.json().get("invalid_requests") or []
+                                    invalid_count += len(listed)
+                                    info["status_check"] = "ok"
+                                    if attempt_number == 1 and not listed:
+                                        visibility_supported = True
+                                    for item in listed:
+                                        errors.append({"http_status": None, "meta_error_code": None, "meta_error_message": str(item), "type": None, "error_subcode": None, "error_user_title": None, "error_user_msg": None, "error_data": None, "fbtrace_id": None, "retailer_id": str(item)})
+                                    break
+                                status_error = catalog_error(httpx.HTTPStatusError("status check failed", request=status.request, response=status))
+                                # only retry a handle that has not propagated yet
+                                if status_attempt == 0 and "handle" in str(status_error["meta_error_message"]).lower():
+                                    continue
+                                info.update({"status_check": "unavailable", "http_status": status_error["http_status"], "meta_error_code": status_error["meta_error_code"], "error_user_msg": status_error["error_user_msg"]})
+                                errors.append({**status_error, "retailer_id": None})
+                                break
+                        handle_info.append(info)
+                        logging.info("Catalog batch handle info: %s", info)
                     break
                 except Exception as exc:
                     error = catalog_error(exc)
                     attempts.append({"attempt": attempt_number, "fields_sent": list(attempt_requests[0]["data"]), "http_status": error["http_status"], "ok": False, "meta_error_code": error["meta_error_code"], "error_subcode": error["error_subcode"], "error_user_msg": error["error_user_msg"]})
                     logging.warning("Catalog resync failed: error=%s request_shape=%s", error, shape)
                     if attempt_number == 1 and error["meta_error_code"] == 100:
+                        visibility_supported = False
                         continue
                     failed += len(chunk)
                     errors.extend([{**error, "retailer_id": row.get("catalog_retailer_id")} for row in chunk])
@@ -699,7 +722,9 @@ async def resync_catalog_availability(restaurant_id: str, supabase) -> dict:
     for error in errors:
         if error not in deduped:
             deduped.append(error)
-    return {"synced": synced, "failed": failed, "errors": deduped[:5], "catalog_id_used": catalog_ids[0] if len(catalog_ids) == 1 else catalog_ids, "items_attempted": attempted, "request_shape": catalog_request_shape(catalog_ids[0], requests, False) if catalog_ids and attempted else None, "attempts": attempts, "visibility_supported": visibility_supported}
+    failed += invalid_count
+    synced = submitted - invalid_count
+    return {"submitted": submitted, "invalid": invalid_count, "synced": synced, "failed": failed, "errors": deduped[:5], "catalog_id_used": catalog_ids[0] if len(catalog_ids) == 1 else catalog_ids, "items_attempted": attempted, "request_shape": catalog_request_shape(catalog_ids[0], requests, False) if catalog_ids and attempted else None, "attempts": attempts, "batch_handle_info": handle_info, "visibility_supported": visibility_supported}
 
 
 async def send_whatsapp_receipt(supabase, order: dict, order_id: str, *, release: bool = False) -> bool:
