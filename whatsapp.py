@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import html
+import json
 import logging
 import os
 import re
@@ -572,7 +573,7 @@ async def sync_catalog_item_availability(
             response = await client.post(
                 f"{GRAPH_API}/{catalog_id}/items_batch",
                 headers={"Authorization": f"Bearer {token}"},
-                data={"item_type": "PRODUCT_ITEM", "requests": __import__("json").dumps([request])},
+                data={"item_type": "PRODUCT_ITEM", "allow_upsert": "false", "requests": json.dumps([request])},
             )
             response.raise_for_status()
             handle = response.json().get("handle")
@@ -595,7 +596,7 @@ async def sync_catalog_item_availability(
         except Exception:
             pass
         meta = body.get("error") or {}
-        if "visibility" not in str(meta.get("message") or "").lower():
+        if meta.get("code") != 100:
             logging.warning("Catalog availability sync failed without visibility retry: http_status=%s meta_error_code=%s meta_error_message=%s", getattr(response, "status_code", None), meta.get("code"), meta.get("message"))
             return
         logging.warning("Catalog visibility update rejected; retrying availability only: http_status=%s meta_error_code=%s meta_error_message=%s",
@@ -604,7 +605,7 @@ async def sync_catalog_item_availability(
             async with httpx.AsyncClient() as client:
                 retry = await client.post(
                     f"{GRAPH_API}/{catalog_id}/items_batch", headers={"Authorization": f"Bearer {token}"},
-                    data={"item_type": "PRODUCT_ITEM", "requests": __import__("json").dumps([{"method": "UPDATE", "data": {
+                    data={"item_type": "PRODUCT_ITEM", "allow_upsert": "false", "requests": json.dumps([{"method": "UPDATE", "data": {
                         "id": retailer_id, "availability": availability,
                     }}])},
                 )
@@ -627,8 +628,18 @@ def catalog_error(exc, retailer_id=None) -> dict:
     if meta.get("code") in {10, 190, 200} or "permission" in message.lower():
         message = "Access token lacks catalog_management permission or catalog not accessible"
     return {"http_status": getattr(response, "status_code", None), "meta_error_code": meta.get("code"),
-            "meta_error_message": message, "error_subcode": meta.get("error_subcode"),
-            "fbtrace_id": meta.get("fbtrace_id"), "retailer_id": retailer_id}
+            "meta_error_message": message, "type": meta.get("type"), "error_subcode": meta.get("error_subcode"),
+            "error_user_title": meta.get("error_user_title"), "error_user_msg": meta.get("error_user_msg"),
+            "error_data": meta.get("error_data"), "fbtrace_id": meta.get("fbtrace_id"), "retailer_id": retailer_id}
+
+
+def catalog_request_shape(catalog_id, requests, allow_upsert=False):
+    return {"method": "POST", "url_path": f"/{catalog_id}/items_batch",
+            "content_type": "application/x-www-form-urlencoded",
+            "top_level_parameters": ["item_type", "requests", "allow_upsert"],
+            "item_type": "PRODUCT_ITEM", "allow_upsert": allow_upsert,
+            "request_count": len(requests),
+            "first_request": {"method": requests[0]["method"], "data": requests[0]["data"]} if requests else None}
 
 
 async def resync_catalog_availability(restaurant_id: str, supabase) -> dict:
@@ -637,7 +648,8 @@ async def resync_catalog_availability(restaurant_id: str, supabase) -> dict:
         "menu_item_id, catalog_retailer_id, menu_items(is_available), restaurants(whatsapp_access_token, whatsapp_catalog_id)"
     ).eq("restaurant_id", restaurant_id).execute().data or []
     synced = failed = 0
-    errors, catalog_ids, attempted = [], [], 0
+    errors, catalog_ids, attempted, attempts = [], [], 0, []
+    visibility_supported = True
     groups = {}
     for row in mappings:
         restaurant = row.get("restaurants") or {}
@@ -653,55 +665,41 @@ async def resync_catalog_availability(restaurant_id: str, supabase) -> dict:
             chunk = rows[start:start + 100]
             attempted += len(chunk)
             requests = [{"method": "UPDATE", "data": {
-                "id": row["catalog_retailer_id"],
+                "id": str(row["catalog_retailer_id"]).strip(),
                 "availability": "in stock" if (row.get("menu_items") or {}).get("is_available") else "out of stock",
                 "visibility": "published" if (row.get("menu_items") or {}).get("is_available") else "staging",
             }} for row in chunk]
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(f"{GRAPH_API}/{catalog_id}/items_batch", headers={"Authorization": f"Bearer {token}"}, data={"item_type": "PRODUCT_ITEM", "requests": __import__("json").dumps(requests)})
-                    response.raise_for_status()
-                    handle = response.json().get("handle")
-                    await asyncio.sleep(0.1)
-                    status = await client.get(f"{GRAPH_API}/{catalog_id}/check_batch_request_status", headers={"Authorization": f"Bearer {token}"}, params={"handle": handle, "load_ids_of_invalid_requests": "true"})
-                    status.raise_for_status()
-                result = status.json()
-                invalid = result.get("ids_of_invalid_requests") or result.get("invalid_requests") or []
-                failed += len(invalid)
-                synced += len(chunk) - len(invalid)
-                for invalid_id in invalid:
-                    errors.append({"http_status": None, "meta_error_code": None, "meta_error_message": "Meta rejected catalog item", "error_subcode": None, "fbtrace_id": None, "retailer_id": str(invalid_id)})
-            except Exception as exc:
-                response = getattr(exc, "response", None)
-                body = {}
-                try: body = response.json() if response is not None else {}
-                except Exception: pass
-                meta = body.get("error") or {}
-                error = catalog_error(exc)
-                logging.warning("Catalog resync failed: %s", error)
-                # Meta field validation is the only condition that gets a retry.
-                visibility_rejected = "visibility" in str(error["meta_error_message"]).lower()
-                if not visibility_rejected:
-                    failed += len(chunk)
-                    errors.extend([{**error, "retailer_id": row.get("catalog_retailer_id")} for row in chunk])
-                    continue
+            for attempt_number, attempt_requests in ((1, requests), (2, [{"method": r["method"], "data": {k: v for k, v in r["data"].items() if k != "visibility"}} for r in requests])):
+                shape = catalog_request_shape(catalog_id, attempt_requests, False)
                 try:
-                    for request in requests:
-                        request["data"].pop("visibility", None)
                     async with httpx.AsyncClient() as client:
-                        retry = await client.post(f"{GRAPH_API}/{catalog_id}/items_batch", headers={"Authorization": f"Bearer {token}"}, data={"item_type": "PRODUCT_ITEM", "requests": __import__("json").dumps(requests)})
-                        retry.raise_for_status()
-                    synced += len(chunk)
-                except Exception as retry_exc:
+                        response = await client.post(f"{GRAPH_API}/{catalog_id}/items_batch", headers={"Authorization": f"Bearer {token}"}, data={"item_type": "PRODUCT_ITEM", "allow_upsert": "false", "requests": json.dumps(attempt_requests)})
+                        response.raise_for_status()
+                        attempts.append({"attempt": attempt_number, "fields_sent": list(attempt_requests[0]["data"]), "http_status": response.status_code, "ok": True, "meta_error_code": None, "error_subcode": None, "error_user_msg": None})
+                        handle = response.json().get("handle")
+                        await asyncio.sleep(0.1)
+                        status = await client.get(f"{GRAPH_API}/{catalog_id}/check_batch_request_status", headers={"Authorization": f"Bearer {token}"}, params={"handle": handle, "load_ids_of_invalid_requests": "true"})
+                        status.raise_for_status()
+                    invalid = (status.json().get("ids_of_invalid_requests") or status.json().get("invalid_requests") or [])
+                    failed += len(invalid); synced += len(chunk) - len(invalid)
+                    for item in invalid:
+                        errors.append({"http_status": None, "meta_error_code": None, "meta_error_message": str(item), "type": None, "error_subcode": None, "error_user_title": None, "error_user_msg": None, "error_data": None, "fbtrace_id": None, "retailer_id": str(item)})
+                    if attempt_number == 2: visibility_supported = False
+                    break
+                except Exception as exc:
+                    error = catalog_error(exc)
+                    attempts.append({"attempt": attempt_number, "fields_sent": list(attempt_requests[0]["data"]), "http_status": error["http_status"], "ok": False, "meta_error_code": error["meta_error_code"], "error_subcode": error["error_subcode"], "error_user_msg": error["error_user_msg"]})
+                    logging.warning("Catalog resync failed: error=%s request_shape=%s", error, shape)
+                    if attempt_number == 1 and error["meta_error_code"] == 100:
+                        continue
                     failed += len(chunk)
-                    error = catalog_error(retry_exc)
-                    logging.warning("Catalog resync retry failed: %s", error)
                     errors.extend([{**error, "retailer_id": row.get("catalog_retailer_id")} for row in chunk])
+                    break
     deduped = []
     for error in errors:
         if error not in deduped:
             deduped.append(error)
-    return {"synced": synced, "failed": failed, "errors": deduped[:5], "catalog_id_used": catalog_ids[0] if len(catalog_ids) == 1 else catalog_ids, "items_attempted": attempted}
+    return {"synced": synced, "failed": failed, "errors": deduped[:5], "catalog_id_used": catalog_ids[0] if len(catalog_ids) == 1 else catalog_ids, "items_attempted": attempted, "request_shape": catalog_request_shape(catalog_ids[0], requests, False) if catalog_ids and attempted else None, "attempts": attempts, "visibility_supported": visibility_supported}
 
 
 async def send_whatsapp_receipt(supabase, order: dict, order_id: str, *, release: bool = False) -> bool:

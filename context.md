@@ -42,7 +42,7 @@ The application is an async Python service. It is deployed behind FastAPI webhoo
 | `GET /paystack/callback` | Simple browser confirmation page; it does not confirm a payment. |
 | `POST /webhook/delivery/{restaurant_id}` | Routes Telegram updates to a restaurant-specific delivery bot. |
 | `POST /admin/paystack/subaccount/{restaurant_id}` | Creates a Paystack subaccount; requires `X-Admin-Key`. |
-| `POST /admin/whatsapp/resync-catalog/{restaurant_id}` | Pushes mapped item availability and visibility to the tenant's Meta catalog; requires `X-Admin-Key`, and returns attempted/synced/failed counts, catalog id, and up to five safe Meta errors. |
+| `POST /admin/whatsapp/resync-catalog/{restaurant_id}` | Pushes mapped item availability and visibility to the tenant's Meta catalog; requires `X-Admin-Key`, and returns attempted/synced/failed counts, catalog id, request shape, retry attempts, visibility support, and up to five safe Meta errors. |
 | `POST /admin/reload-delivery-bots` | Loads/removes dedicated delivery bots; requires `X-Admin-Key`. |
 | `GET /` | Health response. |
 
@@ -135,7 +135,7 @@ WhatsApp is not a Telegram UI clone. It begins when Meta sends an `order` messag
 9. Paystack: `start_paystack_payment()` creates a pending order, generates a checkout link using a deterministic `<digits>@chowlin.ng` email, and sends the URL to the customer. The Paystack webhook in `main.py` confirms the order and sends a WhatsApp receipt.
 10. Status notifications (payment confirmed/rejected, preparing, ready, delivered) are sent to the customer's WhatsApp number via `notify_order_customer()`.
 11. State lives in Supabase, so it survives service restarts. `WhatsAppState` offers `get_data`, `update_data`, `set_state`, and `clear` so it can be passed to shared persistence/kitchen functions.
-12. `sync_catalog_item_availability()` in `whatsapp.py` pushes availability and visibility (`published`/`staging`) changes to the Meta Catalog Batch API using `restaurants.whatsapp_catalog_id`; a full resync checks Meta's batch handle status and reports safe, de-duplicated errors. It retries availability-only only when Meta rejects the visibility field.
+12. `sync_catalog_item_availability()` in `whatsapp.py` pushes availability and visibility (`published`/`staging`) changes to the Meta Catalog Batch API using `restaurants.whatsapp_catalog_id`. `items_batch` sends form-encoded `item_type=PRODUCT_ITEM`, `allow_upsert=false`, and a JSON-string `requests` field; each request uses the mapped `catalog_retailer_id` as `data.id`. A full resync checks the batch handle status and reports safe, de-duplicated errors. Code 100 gets one availability-only retry; authentication/permission errors do not retry.
 
 ### WhatsApp dine-in
 
