@@ -1,13 +1,22 @@
 services:
   chowlin:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: chowlin_bot
     restart: unless-stopped
     env_file: .env
     ports:
-      - "127.0.0.1:8001:8001"
+      - "127.0.0.1:${CHOWLIN_HOST_PORT:-8001}:8001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8001/', timeout=5).read()",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 20s
