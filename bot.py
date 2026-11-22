@@ -2477,7 +2477,7 @@ async def dispatch_to_rider_handler(callback_query: types.CallbackQuery, bot: Bo
 
     order = supabase.table("orders").select(
         "id, order_status, restaurant_id, customer_name, customer_contact, delivery_address, delivery_lat, delivery_lon, "
-        "total_amount, order_type, restaurants(name, dispatch_group_id)"
+        "total_amount, order_type, dispatch_sent_at, restaurants(name, dispatch_group_id)"
     ).eq("id", order_id).execute()
 
     if not order.data:
@@ -2514,22 +2514,30 @@ async def dispatch_to_rider_handler(callback_query: types.CallbackQuery, bot: Bo
         lines.append(f"🗺 {format_maps_link(float(lat), float(lon))}")
     lines.append(f"💰 {format_money(order_data.get('total_amount', 0))}")
 
+    staff = callback_query.from_user
+    claim = supabase.table("orders").update({
+        "dispatch_sent_at": datetime.now(pytz.timezone("Africa/Lagos")).isoformat(),
+        "dispatch_sent_by": staff.username or str(staff.id),
+    }).eq("id", order_id).eq("restaurant_id", order_data["restaurant_id"]).is_("dispatch_sent_at", "null").select("id").execute()
+    if not claim.data:
+        await callback_query.answer("Already sent to rider", show_alert=True)
+        return
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Delivered", callback_data=f"delivered_{order_id}")]
     ])
-
-    await bot.send_message(dispatch_group_id, text="\n".join(lines), reply_markup=keyboard)
-    if callback_query.message.text:
-        await callback_query.message.edit_reply_markup(
-            reply_markup=None,
-        )
-    
-
-    staff = callback_query.from_user
-    supabase.table("orders").update({
-        "dispatch_sent_at": datetime.now(pytz.timezone("Africa/Lagos")).isoformat(),
-        "dispatch_sent_by": staff.username or str(staff.id),
-    }).eq("id", order_id).eq("restaurant_id", order_data.get("restaurant_id")).execute()
+    try:
+        await bot.send_message(dispatch_group_id, text="\n".join(lines), reply_markup=keyboard)
+    except Exception:
+        supabase.table("orders").update({"dispatch_sent_at": None, "dispatch_sent_by": None}).eq(
+            "id", order_id).eq("restaurant_id", order_data["restaurant_id"]).execute()
+        await callback_query.answer("Could not send to rider. Please try again.", show_alert=True)
+        return
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            logging.warning("Could not remove dispatch button for order %s: %s", order_id, exc)
 
     await callback_query.answer("Sent to dispatch ✅", show_alert=True)
 
@@ -2543,18 +2551,23 @@ async def rider_marked_delivered_handler(callback_query: types.CallbackQuery, bo
         "id, telegram_user_id, customer_name, customer_contact, order_channel, restaurant_id, "
         "restaurants(whatsapp_phone_number_id, whatsapp_access_token)"
     ).eq("id", order_id).execute()
+    if not order.data:
+        await callback_query.answer("Order not found.", show_alert=True)
+        return
+    order_data = order.data[0]
+    delivered = supabase.table("orders").update({"order_status": "delivered"}).eq("id", order_id).eq(
+        "restaurant_id", order_data["restaurant_id"]).eq("order_status", "ready").select("id").execute()
+    if not delivered.data:
+        await callback_query.answer("Already marked delivered", show_alert=True)
+        return
 
-    supabase.table("orders").update({"order_status": "delivered"}).eq("id", order_id).execute()
-
-    if order.data:
-        order_data = order.data[0]
-        try:
-            await notify_order_customer(
-                bot, order_data,
-                f"✅ Hi {order_data.get('customer_name', 'there')}, your order #{order_short_id(order_id)} has been delivered. Enjoy your meal!",
-            )
-        except ValueError:
-            logging.warning("Could not notify customer of delivery for order %s (missing contact details)", order_id)
+    try:
+        await notify_order_customer(
+            bot, order_data,
+            f"✅ Hi {order_data.get('customer_name', 'there')}, your order #{order_short_id(order_id)} has been delivered. Enjoy your meal!",
+        )
+    except ValueError:
+        logging.warning("Could not notify customer of delivery for order %s (missing contact details)", order_id)
 
     if callback_query.message.text:
         await callback_query.message.edit_text(
@@ -3125,14 +3138,14 @@ async def handle_ready(callback_query: CallbackQuery, bot: Bot):
     
     # Get order details
     order = supabase.table("orders")\
-        .select("telegram_user_id, customer_name, customer_contact, order_channel, restaurant_id, order_type, payment_method, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
+        .select("telegram_user_id, customer_name, customer_contact, order_channel, restaurant_id, order_type, payment_method, dispatch_sent_at, restaurants(whatsapp_phone_number_id, whatsapp_access_token)")\
         .eq("id", order_id)\
         .eq("restaurant_id", restaurant_id)\
         .execute()
 
     # Determine if we need to show the "Send to Rider" button for delivery orders    
     final_keyboard = None
-    if order.data and order.data[0].get("order_type") == "delivery":
+    if order.data and order.data[0].get("order_type") == "delivery" and not order.data[0].get("dispatch_sent_at"):
         final_keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🛵 Send to Rider", callback_data=f"dispatch_{order_id}")]
         ])

@@ -599,8 +599,8 @@ async def admin_create_paystack_subaccount(restaurant_id: str, request: Request)
 async def admin_resync_whatsapp_catalog(restaurant_id: str, request: Request):
     if request.headers.get("X-Admin-Key") != os.getenv("ADMIN_API_KEY"):
         return {"ok": False, "error": "unauthorized"}
-    synced, failed = await resync_catalog_availability(restaurant_id, supabase)
-    return {"ok": True, "synced": synced, "failed": failed}
+    result = await resync_catalog_availability(restaurant_id, supabase)
+    return {"ok": True, **result}
 
 
 @app.post("/webhook/delivery/{restaurant_id}")

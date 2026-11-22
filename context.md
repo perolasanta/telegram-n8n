@@ -42,7 +42,7 @@ The application is an async Python service. It is deployed behind FastAPI webhoo
 | `GET /paystack/callback` | Simple browser confirmation page; it does not confirm a payment. |
 | `POST /webhook/delivery/{restaurant_id}` | Routes Telegram updates to a restaurant-specific delivery bot. |
 | `POST /admin/paystack/subaccount/{restaurant_id}` | Creates a Paystack subaccount; requires `X-Admin-Key`. |
-| `POST /admin/whatsapp/resync-catalog/{restaurant_id}` | Pushes mapped item availability and visibility to the tenant's Meta catalog; requires `X-Admin-Key`. |
+| `POST /admin/whatsapp/resync-catalog/{restaurant_id}` | Pushes mapped item availability and visibility to the tenant's Meta catalog; requires `X-Admin-Key`, and returns attempted/synced/failed counts, catalog id, and up to five safe Meta errors. |
 | `POST /admin/reload-delivery-bots` | Loads/removes dedicated delivery bots; requires `X-Admin-Key`. |
 | `GET /` | Health response. |
 
@@ -114,7 +114,7 @@ The base tables predate the migration folder. The following is the application-l
 
 - Every submitted order is sent to the restaurant kitchen Telegram group. Bank-transfer orders contain proof plus confirm/reject controls; other orders contain preparing/ready/dispatch controls.
 - The sent kitchen message id and exact text/caption are saved to `orders.kitchen_message_id` and `orders.kitchen_message_text`. When a customer cancels an eligible WhatsApp order, the bot edits that ticket to mark it cancelled; if no saved message is available or editing fails, it sends a separate cancellation notice. The kitchen board is then refreshed.
-- Delivery orders show a "Send to Rider" button (`dispatch_`). Tapping it sends a dispatch message with customer name, contact, address, Google Maps link, and total to `restaurants.dispatch_group_id`. The dispatch message has a "Delivered" button (`delivered_`) for the rider to close the order loop. Delivery status and customer notification are updated on confirmation.
+- Delivery orders show a "Send to Rider" button (`dispatch_`). An atomic claim prevents duplicate sends; the kitchen button is removed once sent and released if the dispatch message fails. The rider's `delivered_` action is likewise idempotent and removes its button.
 - Kitchen status actions update the order and notify customers (Telegram or WhatsApp via `notify_order_customer()`). A pinned live board tracks pending, preparing, and recent ready orders. A manager rush alert is sent once per day above `RUSH_HOUR_PENDING_THRESHOLD`.
 - Kitchen commands include `/pending`, `/board`, `/menu`, and `/restock`; menu controls toggle item availability and composite-option availability.
 - Manager/reporting commands include `/daily_report`, `/weekly_report`, `/monthly_report`, `/register_manager`, and `/set_manager`. `/activate` is restricted by `ADMIN_TELEGRAM_ID`.
@@ -135,7 +135,7 @@ WhatsApp is not a Telegram UI clone. It begins when Meta sends an `order` messag
 9. Paystack: `start_paystack_payment()` creates a pending order, generates a checkout link using a deterministic `<digits>@chowlin.ng` email, and sends the URL to the customer. The Paystack webhook in `main.py` confirms the order and sends a WhatsApp receipt.
 10. Status notifications (payment confirmed/rejected, preparing, ready, delivered) are sent to the customer's WhatsApp number via `notify_order_customer()`.
 11. State lives in Supabase, so it survives service restarts. `WhatsAppState` offers `get_data`, `update_data`, `set_state`, and `clear` so it can be passed to shared persistence/kitchen functions.
-12. `sync_catalog_item_availability()` in `whatsapp.py` pushes item availability and visibility (`published`/`hidden`) changes to the Meta Catalog Batch API using `restaurants.whatsapp_catalog_id`; it safely retries availability-only if Meta rejects visibility.
+12. `sync_catalog_item_availability()` in `whatsapp.py` pushes availability and visibility (`published`/`staging`) changes to the Meta Catalog Batch API using `restaurants.whatsapp_catalog_id`; a full resync checks Meta's batch handle status and reports safe, de-duplicated errors. It retries availability-only only when Meta rejects the visibility field.
 
 ### WhatsApp dine-in
 
