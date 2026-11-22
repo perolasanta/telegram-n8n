@@ -652,7 +652,18 @@ async def send_restock_alert(bot: Bot, restaurant_id: str, kitchen_chat_id: int 
 
 async def deduct_inventory_for_order(order_id: str):
     response = supabase.rpc("deduct_order_inventory", {"p_order_id": order_id}).execute()
-    return response.data or []
+    items = response.data or []
+    # Inventory RPC returns changed item rows in current deployments.  Syncing is
+    # deliberately best-effort: checkout/kitchen actions must never wait on Meta.
+    try:
+        from whatsapp import sync_catalog_item_availability
+        for item in items:
+            if item.get("id") and int(item.get("inventory_count") or 0) <= 0:
+                await sync_catalog_item_availability(item["id"], False, supabase,
+                    restaurant_id=item.get("restaurant_id"))
+    except Exception:
+        logging.exception("Catalog sync after inventory deduction failed for order %s", order_id)
+    return items
 
 
 async def restore_inventory_for_order(order_id: str):
@@ -667,9 +678,10 @@ async def cancel_pending_order(
     telegram_user_id=None,
     customer_contact=None,
     restaurant_id=None,
+    allow_unconfirmed_online=False,
 ) -> dict:
     query = supabase.table("orders").select(
-        "id, restaurant_id, telegram_user_id, customer_contact, order_status, payment_method, "
+        "id, restaurant_id, telegram_user_id, customer_contact, order_status, payment_method, payment_status, "
         "total_amount, order_type, kitchen_message_id, kitchen_message_text, "
         "restaurants(kitchen_chat_id)"
     ).eq("id", order_id)
@@ -694,7 +706,8 @@ async def cancel_pending_order(
 
     if not order:
         return result("not_found")
-    if not can_self_cancel(order):
+    permitted_whatsapp_payment = allow_unconfirmed_online and order.get("payment_status") != "confirmed"
+    if not (can_self_cancel(order) or permitted_whatsapp_payment):
         if (
             order.get("payment_method") in {"Cash Payment", "Pay on Delivery"}
             and order.get("order_status") != "pending"
@@ -2920,7 +2933,7 @@ async def notify_order_customer(bot: Bot, order: dict, message: str) -> None:
         if not (contact and phone_number_id and token):
             raise ValueError("WhatsApp notification details are missing for this order")
         from whatsapp import send_text
-        await send_text(phone_number_id, token, contact, message)
+        await send_text(phone_number_id, token, contact, message + "\n\nReply MENU for options.")
     elif order.get("telegram_user_id"):
         await bot.send_message(order["telegram_user_id"], message)
     else:
@@ -3684,6 +3697,12 @@ async def handle_restock_quantity(message: types.Message, state: FSMContext):
         .update({"inventory_count": new_count, "is_available": new_count > 0})\
         .eq("id", item_id)\
         .execute()
+
+    try:
+        from whatsapp import sync_catalog_item_availability
+        await sync_catalog_item_availability(item_id, new_count > 0, supabase)
+    except Exception:
+        logging.exception("Catalog sync after restock failed for menu_item_id=%s", item_id)
 
     await state.clear()
     await message.answer(

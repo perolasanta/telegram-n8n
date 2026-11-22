@@ -182,26 +182,15 @@ def is_whatsapp_addon_active(restaurant: dict, now=None) -> bool:
 
 
 def parse_customer_intent(text: str) -> str | None:
-    normalized = " ".join(str(text or "").lower().split())
-    while normalized and unicodedata.category(normalized[-1]).startswith("P"):
-        normalized = normalized[:-1].rstrip()
+    # Commands are deliberately exact.  In particular, do not turn an address
+    # such as "Cancel Street" into a destructive action.
+    normalized = str(text or "").strip().casefold()
     return {
         "status": "status",
-        "track": "status",
-        "my order": "status",
         "orders": "history",
-        "history": "history",
-        "my orders": "history",
         "cancel": "cancel",
-        "restart": "restart",
-        "reset": "restart",
-        "start over": "restart",
         "help": "help",
         "menu": "help",
-        "hi": "help",
-        "hello": "help",
-        "hey": "help",
-        "start": "help",
     }.get(normalized)
 
 
@@ -362,6 +351,7 @@ def build_catalog_welcome_text(restaurant_name: str, pickup_enabled: bool) -> tu
         "2. Add the items you want\n"
         "3. Tap *View cart*, then *Send*\n\n"
         f"{closing}"
+        "\n\nReply *MENU* anytime for help, order status or to cancel."
     )
     footer = "Can't see it? Tap the shop icon at the top right."
     return truncate(body, 1024), footer
@@ -572,6 +562,10 @@ async def sync_catalog_item_availability(
         return  # catalog not configured for this restaurant yet
 
     availability = "in stock" if is_available else "out of stock"
+    visibility = "published" if is_available else "hidden"
+    request = {"method": "UPDATE", "data": {
+        "id": retailer_id, "availability": availability, "visibility": visibility,
+    }}
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -579,15 +573,79 @@ async def sync_catalog_item_availability(
                 headers={"Authorization": f"Bearer {token}"},
                 json={
                     "item_type": "PRODUCT_ITEM",
-                    "requests": [{
-                        "method": "UPDATE",
-                        "data": {"id": retailer_id, "availability": availability},
-                    }],
+                    "requests": [request],
                 },
             )
             response.raise_for_status()
-    except Exception:
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        body = {}
+        try:
+            body = response.json() if response is not None else {}
+        except Exception:
+            pass
+        meta = body.get("error") or {}
+        logging.warning("Catalog visibility update rejected; retrying availability only: http_status=%s meta_error_code=%s meta_error_message=%s",
+                        getattr(response, "status_code", None), meta.get("code"), meta.get("message"))
+        try:
+            async with httpx.AsyncClient() as client:
+                retry = await client.post(
+                    f"{GRAPH_API}/{catalog_id}/items_batch", headers={"Authorization": f"Bearer {token}"},
+                    json={"item_type": "PRODUCT_ITEM", "requests": [{"method": "UPDATE", "data": {
+                        "id": retailer_id, "availability": availability,
+                    }}]},
+                )
+                retry.raise_for_status()
+                return
+        except Exception:
+            pass
         logging.exception("Failed to sync catalog availability for retailer_id=%s (menu_item_id=%s)", retailer_id, menu_item_id)
+
+
+async def resync_catalog_availability(restaurant_id: str, supabase) -> tuple[int, int]:
+    """Best-effort tenant-scoped full catalog resync, in batches of at most 100."""
+    mappings = supabase.table("menu_item_catalog_map").select(
+        "menu_item_id, catalog_retailer_id, menu_items(is_available), restaurants(whatsapp_access_token, whatsapp_catalog_id)"
+    ).eq("restaurant_id", restaurant_id).execute().data or []
+    synced = failed = 0
+    groups = {}
+    for row in mappings:
+        restaurant = row.get("restaurants") or {}
+        key = (restaurant.get("whatsapp_access_token"), restaurant.get("whatsapp_catalog_id"))
+        if key[0] and key[1] and row.get("catalog_retailer_id"):
+            groups.setdefault(key, []).append(row)
+        else:
+            failed += 1
+    for (token, catalog_id), rows in groups.items():
+        for start in range(0, len(rows), 100):
+            chunk = rows[start:start + 100]
+            requests = [{"method": "UPDATE", "data": {
+                "id": row["catalog_retailer_id"],
+                "availability": "in stock" if (row.get("menu_items") or {}).get("is_available") else "out of stock",
+                "visibility": "published" if (row.get("menu_items") or {}).get("is_available") else "hidden",
+            }} for row in chunk]
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(f"{GRAPH_API}/{catalog_id}/items_batch", headers={"Authorization": f"Bearer {token}"}, json={"item_type": "PRODUCT_ITEM", "requests": requests})
+                    response.raise_for_status()
+                synced += len(chunk)
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                body = {}
+                try: body = response.json() if response is not None else {}
+                except Exception: pass
+                meta = body.get("error") or {}
+                logging.warning("Catalog resync visibility rejected; retrying availability only: http_status=%s meta_error_code=%s meta_error_message=%s", getattr(response, "status_code", None), meta.get("code"), meta.get("message"))
+                try:
+                    for request in requests:
+                        request["data"].pop("visibility", None)
+                    async with httpx.AsyncClient() as client:
+                        retry = await client.post(f"{GRAPH_API}/{catalog_id}/items_batch", headers={"Authorization": f"Bearer {token}"}, json={"item_type": "PRODUCT_ITEM", "requests": requests})
+                        retry.raise_for_status()
+                    synced += len(chunk)
+                except Exception:
+                    failed += len(chunk)
+    return synced, failed
 
 
 async def send_whatsapp_receipt(supabase, order: dict, order_id: str, *, release: bool = False) -> bool:
@@ -941,6 +999,18 @@ def format_order_status_line(order: dict) -> str:
         }.get(order_status, "Received")
     total = f"{money(order.get('total_amount')):,.0f}"
     return f"#{order_id} — {status_label} — ₦{total}"
+
+
+def order_status_words(status) -> str:
+    return {"pending": "Received", "preparing": "Being prepared", "ready": "Ready",
+            "dispatched": "Dispatched", "delivered": "Delivered", "cancelled": "Cancelled"}.get(
+        str(status or "pending").lower(), "Received")
+
+
+def payment_status_words(order: dict) -> str:
+    if order.get("payment_status") == "confirmed":
+        return "Confirmed"
+    return "Awaiting confirmation" if order.get("payment_method") == "Bank Transfer" else "Awaiting payment"
 
 
 async def validate_cart_inventory_and_drop_shortages(cart: dict, problems: list[str], restaurant_id: str):
@@ -1771,11 +1841,16 @@ async def handle_text(msg, state, restaurant, from_number, current_state, supaba
         )
         return
     intent = parse_customer_intent(body)
-    if intent == "restart":
+    free_text_state = current_state in {"waiting_for_address", "entering_modifier_qty"}
+    exact_word = body.strip().casefold()
+    if exact_word == "menu":
         await state.clear()
-        await send_catalog_message(
-            restaurant, from_number, supabase,
-        )
+        await send_whatsapp_command_menu(restaurant, from_number)
+        return
+    if exact_word == "help" and not free_text_state:
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "To order: tap the *shop icon*, add items, tap *View cart*, then *Send*.\n\nCommands: *MENU*, *STATUS*, *CANCEL*, *ORDERS*.")
+        await send_whatsapp_command_menu(restaurant, from_number)
         return
     if intent == "cancel" and current_state is not None and current_state not in (
         "browsing_orders", "confirming_cancel"
@@ -1786,7 +1861,7 @@ async def handle_text(msg, state, restaurant, from_number, current_state, supaba
             "Your current order was cancelled. Send a new cart anytime.",
         )
         return
-    if intent and current_state in (None, "browsing_orders"):
+    if intent and not free_text_state:
         reply_id = {
             "status": "cmd_status",
             "history": "cmd_history",
@@ -1824,6 +1899,16 @@ async def send_whatsapp_main_menu(restaurant, from_number, supabase):
     await send_catalog_message(restaurant, from_number, supabase)
 
 
+async def send_whatsapp_command_menu(restaurant, from_number):
+    await send_list(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+        "Choose an option.", "Options", [
+            {"id": "cmd_status", "title": "Order status"},
+            {"id": "cmd_cancel", "title": "Cancel order"},
+            {"id": "cmd_history", "title": "Recent orders"},
+            {"id": "cmd_help", "title": "Help"},
+        ])
+
+
 async def fetch_customer_order(supabase, order_id, restaurant_id, from_number, select):
     result = supabase.table("orders").select(select).eq(
         "id", order_id
@@ -1838,14 +1923,16 @@ async def send_customer_order_status(restaurant, from_number, supabase):
         "id, order_status, payment_method, payment_status, total_amount"
     ).eq("restaurant_id", restaurant["id"]).eq(
         "order_channel", "whatsapp"
-    ).eq("customer_contact", from_number).in_(
-        "order_status", ["pending", "preparing", "ready"]
-    ).order("created_at", desc=True).limit(3).execute()
+    ).eq("customer_contact", from_number).order("created_at", desc=True).limit(1).execute()
     orders = result.data or []
     if not orders:
-        body = "No active orders. Reply ORDERS to see your recent orders."
+        body = "You have no orders yet. Tap the shop icon to place one."
     else:
-        body = "\n".join(format_order_status_line(order) for order in orders)
+        order = orders[0]
+        detail = await fetch_customer_order(supabase, order["id"], restaurant["id"], from_number,
+            "id, total_amount, order_status, payment_method, payment_status, order_items(quantity, menu_items(name))")
+        items = ", ".join(f"{x.get('quantity') or 0} x {(x.get('menu_items') or {}).get('name', 'Item')}" for x in (detail or {}).get("order_items") or [])
+        body = f"Order #{str(order.get('id'))[:8]}\n{truncate(items or 'No item details available.', 500)}\nTotal: ₦{money(order.get('total_amount')):,.0f}\nPayment: {payment_status_words(order)}\nStatus: {order_status_words(order.get('order_status'))}"
     await send_text(
         restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
         body,
@@ -1859,7 +1946,7 @@ async def send_customer_order_history(state, restaurant, from_number, supabase):
         "order_channel", "whatsapp"
     ).eq("customer_contact", from_number).order(
         "created_at", desc=True
-    ).limit(5).execute()
+    ).limit(3).execute()
     orders = result.data or []
     await state.set_state("browsing_orders")
     if not orders:
@@ -1880,7 +1967,7 @@ async def send_customer_order_history(state, restaurant, from_number, supabase):
         })
     await send_list(
         restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-        "Choose a recent order to view or reorder.", "Orders", rows,
+        "Your 3 most recent orders.", "Orders", rows,
     )
 
 
@@ -1922,11 +2009,15 @@ async def begin_order_cancellation(order_id, state, restaurant, from_number, sup
         supabase, order_id, restaurant["id"], from_number,
         "id, order_status, payment_method, payment_status",
     )
-    if not order or not can_self_cancel(order):
+    if not order:
         await send_text(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
-            "Please contact the restaurant to cancel this order.",
+            "That order could not be found.",
         )
+        return
+    if order.get("order_status") != "pending":
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                        "It is too late to cancel; the restaurant is already working on this order.")
         return
     await state.update_data(cancel_order_id=str(order.get("id") or ""))
     await state.set_state("confirming_cancel")
@@ -1948,9 +2039,19 @@ async def confirm_order_cancellation(order_id, state, restaurant, from_number, s
             "Please use the buttons for the current order.",
         )
         return
-    outcome = await cancel_pending_order(
-        bot, order_id, customer_contact=from_number, restaurant_id=restaurant["id"]
-    )
+    order = await fetch_customer_order(supabase, order_id, restaurant["id"], from_number,
+                                      "id, order_status, payment_method, payment_status")
+    confirmed_online = order and order.get("payment_method") in {"Paystack", "Bank Transfer"} and order.get("payment_status") == "confirmed"
+    if confirmed_online:
+        kitchen = restaurant.get("kitchen_chat_id")
+        if kitchen:
+            await (delivery_bots.get(restaurant["id"], bot)).send_message(kitchen, f"⚠️ Cancellation requested for order #{order_id[:8]} (payment confirmed).")
+        await state.clear()
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+                        "Your payment is confirmed, so we've asked the restaurant to review your cancellation. They'll get back to you here.")
+        return
+    outcome = await cancel_pending_order(bot, order_id, customer_contact=from_number,
+                                         restaurant_id=restaurant["id"], allow_unconfirmed_online=True)
     if outcome["result"] != "cancelled":
         message = {
             "not_found": "We couldn't find that order. Please contact the restaurant.",
@@ -2050,7 +2151,9 @@ async def handle_command_reply(reply_id, state, restaurant, from_number, supabas
     elif reply_id == "cmd_history":
         await send_customer_order_history(state, restaurant, from_number, supabase)
     elif reply_id == "cmd_help":
-        await send_whatsapp_main_menu(restaurant, from_number, supabase)
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
+            "To order: tap the *shop icon*, add items, tap *View cart*, then *Send*.\n\nCommands: *MENU*, *STATUS*, *CANCEL*, *ORDERS*.")
+        await send_whatsapp_command_menu(restaurant, from_number)
     elif reply_id == "cmd_cancel":
         await send_cancellable_orders(state, restaurant, from_number, supabase)
 
@@ -2186,7 +2289,7 @@ async def create_and_send_order(state, restaurant, from_number, customer_name, p
         await send_order_to_kitchen(bot, order_id, state, customer_name, from_number)
         low_stock_items = await deduct_inventory_for_order(order_id)
         await send_restock_alert(bot, restaurant["id"], restaurant.get("kitchen_chat_id"), low_stock_items)
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\nPayment: {truncate(payment_method, 100)}\n\nWe'll notify you when it is ready.\nYour receipt will be sent when your order is ready.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\nPayment: {truncate(payment_method, 100)}\n\nWe'll notify you when it is ready.\nYour receipt will be sent when your order is ready.\n\nReply MENU for options.")
         await clear_keeping_table_binding(state)
     except ValueError as exc:
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}")
@@ -2206,7 +2309,7 @@ async def start_paystack_payment(state, restaurant, from_number, customer_name, 
         email = f"{''.join(character for character in from_number if character.isdigit())}@chowlin.ng"
         payment_url = await create_paystack_payment_link(order_id, float(total), email, restaurant["paystack_subaccount_code"])
         state.supabase.table("payments").insert({"order_id": order_id, "restaurant_id": restaurant["id"], "amount": str(total), "provider": "Paystack", "status": "pending", "provider_reference": order_id, "paystack_reference": order_id, "paystack_subaccount_code": restaurant["paystack_subaccount_code"]}).execute()
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order #{order_id[:8]} is pending payment.\nTotal: ₦{float(total):,.0f}\n\nComplete payment here:\n{truncate(payment_url, 2500)}\n\nWe'll confirm payment and send your order to the kitchen.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order #{order_id[:8]} is pending payment.\nTotal: ₦{float(total):,.0f}\n\nComplete payment here:\n{truncate(payment_url, 2500)}\n\nWe'll confirm payment and send your order to the kitchen.\n\nReply MENU for options.")
         await clear_keeping_table_binding(state)
     except Exception:
         logging.exception("WhatsApp Paystack setup failed")
@@ -2245,7 +2348,7 @@ async def handle_payment_proof(msg, state, restaurant, from_number, supabase, bo
             return
         order_id, _ = await create_order_in_db(None, state, "Bank Transfer", data.get("customer_name", "Customer"), "whatsapp", f"wa_media:{media_id}", from_number)
         await send_order_to_kitchen(bot, order_id, state, data.get("customer_name", "Customer"), from_number, BufferedInputFile(image_bytes, filename="payment_proof.jpg"))
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\n\nYour payment proof is being verified.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"✅ Order placed!\n\nOrder ID: #{order_id[:8]}\nTotal: ₦{float(total):,.0f}\n\nYour payment proof is being verified.\n\nReply MENU for options.")
         await clear_keeping_table_binding(state)
     except ValueError as exc:
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}")

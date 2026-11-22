@@ -21,6 +21,7 @@ class TestWhatsAppPayloadBuilders(unittest.TestCase):
         pickup, footer = build_catalog_welcome_text("Chowlin", True)
         delivery, delivery_footer = build_catalog_welcome_text("Chowlin", False)
         self.assertIn("shop icon", pickup)
+        self.assertIn("Reply *MENU* anytime", pickup)
         self.assertIn("delivery", pickup)
         self.assertIn("pickup", pickup)
         self.assertIn("delivery address", delivery)

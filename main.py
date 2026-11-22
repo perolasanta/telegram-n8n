@@ -33,7 +33,7 @@ from apscheduler.triggers.cron import CronTrigger
 import pytz
 from datetime import datetime, timedelta
 from reports import generate_daily_report_for_window, generate_weekly_report, get_daily_report_window
-from whatsapp import handle_whatsapp_webhook, is_whatsapp_addon_active, make_table_token
+from whatsapp import handle_whatsapp_webhook, is_whatsapp_addon_active, make_table_token, resync_catalog_availability
 
 
 FASTAPI_WEBHOOK_URL = os.getenv("FASTAPI_WEBHOOK_URL","https://telegram-n8n-restaurant-bot.onrender.com")  # Replace with your actual webhook URL
@@ -593,6 +593,14 @@ async def admin_create_paystack_subaccount(restaurant_id: str, request: Request)
     except Exception as e:
         logger.error(f"Failed to create Paystack subaccount for {restaurant_id}: {e}", exc_info=True)
         return {"ok": False, "error": str(e)}
+
+
+@app.post("/admin/whatsapp/resync-catalog/{restaurant_id}")
+async def admin_resync_whatsapp_catalog(restaurant_id: str, request: Request):
+    if request.headers.get("X-Admin-Key") != os.getenv("ADMIN_API_KEY"):
+        return {"ok": False, "error": "unauthorized"}
+    synced, failed = await resync_catalog_availability(restaurant_id, supabase)
+    return {"ok": True, "synced": synced, "failed": failed}
 
 
 @app.post("/webhook/delivery/{restaurant_id}")

@@ -73,19 +73,16 @@ class TestParseCustomerIntent(unittest.TestCase):
 
     def test_supported_keywords(self):
         expected = {
-            "status": "status", "track": "status", "my order": "status",
-            "orders": "history", "history": "history", "my orders": "history",
-            "cancel": "cancel", "restart": "restart", "reset": "restart",
-            "start over": "restart", "help": "help", "menu": "help",
-            "hi": "help", "hello": "help", "hey": "help", "start": "help",
+            "status": "status", "orders": "history", "cancel": "cancel",
+            "help": "help", "menu": "help",
         }
         for text, intent in expected.items():
             with self.subTest(text=text):
                 self.assertEqual(parse_customer_intent(text), intent)
 
-    def test_case_punctuation_and_whitespace_are_normalized(self):
-        self.assertEqual(parse_customer_intent("  MY   ORDERS!!!  "), "history")
-        self.assertEqual(parse_customer_intent("\tStart over...\n"), "restart")
+    def test_case_and_outer_whitespace_are_normalized_but_punctuation_is_not(self):
+        self.assertEqual(parse_customer_intent("  STATUS  "), "status")
+        self.assertIsNone(parse_customer_intent("STATUS!"))
 
     def test_near_misses_and_addresses_do_not_match(self):
         for text in (
@@ -94,6 +91,7 @@ class TestParseCustomerIntent(unittest.TestCase):
             "12 High Street, Lagos",
             "14 My Order Road",
             "hello there",
+            "Cancel Street",
         ):
             with self.subTest(text=text):
                 self.assertIsNone(parse_customer_intent(text))
