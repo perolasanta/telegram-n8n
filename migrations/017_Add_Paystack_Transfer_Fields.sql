@@ -1,4 +1,4 @@
-ALTER TABLE payments
+ALTER TABLE public.payments
   ADD COLUMN IF NOT EXISTS account_number text,
   ADD COLUMN IF NOT EXISTS account_name text,
   ADD COLUMN IF NOT EXISTS bank_name text,

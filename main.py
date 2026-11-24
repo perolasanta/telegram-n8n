@@ -34,8 +34,10 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 import pytz
 from datetime import datetime, timedelta
+from decimal import Decimal
 from reports import generate_daily_report_for_window, generate_weekly_report, get_daily_report_window
 from whatsapp import handle_whatsapp_webhook, is_whatsapp_addon_active, make_table_token, resync_catalog_availability
+from paystack_transfer import transfer_customer_wording
 
 
 FASTAPI_WEBHOOK_URL = os.getenv("FASTAPI_WEBHOOK_URL","https://telegram-n8n-restaurant-bot.onrender.com")  # Replace with your actual webhook URL
@@ -533,7 +535,8 @@ async def paystack_webhook(request: Request):
         supabase.table("payments").update({"status": "rejected"}).eq("order_id", row.get("order_id")).eq("restaurant_id", row.get("restaurant_id")).eq("status", "pending").execute()
         order = supabase.table("orders").select("telegram_user_id, customer_contact, order_channel, restaurant_id").eq("id", row.get("order_id")).eq("restaurant_id", row.get("restaurant_id")).execute()
         if order.data:
-            await notify_order_customer(bot, order.data[0], "Your transfer was rejected, most commonly because the amount was wrong. Please check the amount, reply MENU to start again, or contact the restaurant.")
+            channel = order.data[0].get("order_channel")
+            await notify_order_customer(bot, order.data[0], f"Your transfer was rejected, most commonly because the amount was wrong. Please check the amount or contact the restaurant. {transfer_customer_wording(channel, 'restart')}")
         logger.info("Rejected Paystack transfer reference=%s", reference)
         return {"status": "ok"}
     if event.get("event") != "charge.success":
@@ -625,6 +628,41 @@ async def confirm_paystack_payment(reference: str, source: str, webhook_data: di
     return {"status": "ok"}
 
 
+async def refund_paystack_payment(reference: str, amount=None):
+    """Atomically claim and submit a Paystack refund; safe against double taps."""
+    payment_result = supabase.table("payments").select(
+        "order_id, restaurant_id, amount, status, paystack_reference, orders(telegram_user_id, customer_contact, order_channel)"
+    ).eq("paystack_reference", reference).execute()
+    payment = payment_result.data[0] if payment_result.data else None
+    if not payment or payment.get("status") in {"refund_pending", "refunded"}:
+        return {"status": "already_handled"}
+    claimed = supabase.table("payments").update({"status": "refund_pending"}).eq(
+        "paystack_reference", reference).eq("restaurant_id", payment.get("restaurant_id")).neq(
+        "status", "refund_pending").neq("status", "refunded").select("order_id").execute()
+    if not claimed.data:
+        return {"status": "already_handled"}
+    refund_amount = Decimal(str(amount if amount is not None else payment.get("amount") or 0))
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            payload = {"transaction": reference}
+            if amount is not None:
+                payload["amount"] = int((refund_amount * 100).to_integral_value())
+            async with session.post("https://api.paystack.co/refund", headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}, json=payload) as response:
+                data = await response.json(content_type=None)
+        refund = data.get("data") if isinstance(data, dict) else {}
+        if response.status >= 300 or not data.get("status"):
+            raise RuntimeError("Paystack refund request rejected")
+        supabase.table("payments").update({"status": "refunded", "refund_reference": refund.get("reference"), "refunded_at": datetime.now(pytz.utc).isoformat()}).eq("paystack_reference", reference).eq("restaurant_id", payment.get("restaurant_id")).execute()
+        order = payment.get("orders") or {}
+        await notify_order_customer(bot, order, f"Your refund of ₦{refund_amount:,.0f} has been initiated. It can take a few business days to reach your account. {transfer_customer_wording(order.get('order_channel'), 'restart')}")
+        return {"status": "ok"}
+    except Exception:
+        # Release the claim for staff retry; deliberately never include provider body/secret in logs.
+        supabase.table("payments").update({"status": payment.get("status") or "needs_review"}).eq("paystack_reference", reference).eq("restaurant_id", payment.get("restaurant_id")).eq("status", "refund_pending").execute()
+        logger.warning("Paystack refund failed reference=%s", reference)
+        return {"status": "failed"}
+
+
 async def expire_pending_transfer_accounts():
     """Reconcile expired temporary accounts before atomically cancelling them."""
     cutoff = (datetime.now(pytz.utc) - timedelta(minutes=5)).isoformat()
@@ -644,7 +682,7 @@ async def expire_pending_transfer_accounts():
                 await cancel_pending_order(bot, payment.get("order_id"), customer_contact=order.get("customer_contact"), restaurant_id=payment.get("restaurant_id"), allow_unconfirmed_online=True)
             else:
                 await cancel_pending_order(bot, payment.get("order_id"), telegram_user_id=order.get("telegram_user_id"), allow_unconfirmed_online=True)
-            await notify_order_customer(bot, order, "Your transfer account expired. Reply MENU to place your order again.")
+            await notify_order_customer(bot, order, f"Your transfer account expired. {transfer_customer_wording(order.get('order_channel'), 'restart')}")
         except Exception:
             logger.exception("Failed expiring transfer order_id=%s", payment.get("order_id"))
 

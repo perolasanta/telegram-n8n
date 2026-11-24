@@ -15,6 +15,13 @@ from typing import Any
 PAYSTACK_API_BASE = "https://api.paystack.co"
 
 
+def transfer_customer_wording(channel: str, purpose: str = "check") -> str:
+    """Keep transfer prompts channel-correct and easy to test."""
+    if purpose == "restart":
+        return "Reply MENU to place your order again." if channel == "whatsapp" else "Scan the restaurant's QR code again or send /start to order again."
+    return "Reply STATUS to check, or MENU for options." if channel == "whatsapp" else "Tap Check payment below if you have paid and not yet received confirmation. You can also use /status or /cancel."
+
+
 def amount_to_kobo(amount: Any) -> int:
     """Convert naira to kobo without binary-float rounding."""
     value = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)

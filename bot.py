@@ -27,7 +27,7 @@ from receipt_generator import generate_receipt_pdf
 from aiogram.types import FSInputFile
 import pytz
 from datetime import datetime, timedelta
-from paystack_transfer import create_transfer_charge, split_fields
+from paystack_transfer import create_transfer_charge, split_fields, transfer_customer_wording
 
 router = Router()
 load_dotenv()
@@ -2842,7 +2842,7 @@ async def payment_instant_transfer(callback_query: types.CallbackQuery, state: F
         await callback_query.message.answer(
             f"Bank: {details['bank_name']}\nAccount name: {details['account_name']}\nAccount number:\n{details['account_number']}\n"
             f"Amount: ₦{amount:,.0f}\nExpires: {expires} WAT\n\n"
-            "Transfer the exact amount. Your order is confirmed automatically once payment arrives. Reply STATUS to check, or MENU for options.",
+            f"Transfer the exact amount. Your order is confirmed automatically once payment arrives. {transfer_customer_wording('telegram')}",
             reply_markup=keyboard,
         )
         await state.update_data(cart={})
@@ -2869,6 +2869,19 @@ async def check_instant_transfer(callback_query: types.CallbackQuery):
     from main import confirm_paystack_payment
     result = await confirm_paystack_payment(reference, "telegram_status")
     await callback_query.answer("Payment confirmed." if result.get("status") == "ok" else "Payment is still pending.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("psrefund_"))
+async def refund_late_paystack_payment(callback_query: types.CallbackQuery):
+    """Kitchen-only buttons may use this short reference callback; helper is idempotent."""
+    reference = (callback_query.data or "")[9:]
+    from main import refund_paystack_payment
+    result = await refund_paystack_payment(reference)
+    if result.get("status") == "ok":
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+        await callback_query.answer("Refund initiated.")
+    else:
+        await callback_query.answer("Refund was already handled or could not be started.", show_alert=True)
 
 
 @dp.callback_query(F.data == "pay_bank")

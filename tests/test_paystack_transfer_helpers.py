@@ -3,7 +3,7 @@ import os
 import unittest
 from datetime import datetime, timezone
 os.environ.setdefault("PAYSTACK_COMMISSION_PERCENTAGE", "5")
-from paystack_transfer import amount_to_kobo, build_transfer_charge_payload, transfer_expiry
+from paystack_transfer import amount_to_kobo, build_transfer_charge_payload, transfer_expiry, transfer_customer_wording
 
 class PaystackTransferHelperTests(unittest.TestCase):
     def test_decimal_kobo_has_no_float_error(self):
@@ -17,5 +17,10 @@ class PaystackTransferHelperTests(unittest.TestCase):
         p = build_transfer_charge_payload({"id":"order-1","total_amount":"1000","restaurant_id":"r","order_channel":"whatsapp"}, {"id":"r","paystack_subaccount_code":"ACCT_x"}, "234@example.ng")
         self.assertEqual(p["amount"], 100000); self.assertEqual(p["subaccount"], "ACCT_x")
         self.assertIn("bank_transfer", p); self.assertEqual(p["transaction_charge"], 5000)
+    def test_channel_wording_does_not_leak_commands(self):
+        telegram = transfer_customer_wording("telegram")
+        whatsapp = transfer_customer_wording("whatsapp")
+        self.assertNotIn("STATUS", telegram); self.assertNotIn("MENU", telegram)
+        self.assertNotIn("/status", whatsapp); self.assertNotIn("Check payment", whatsapp)
 
 if __name__ == "__main__": unittest.main()
