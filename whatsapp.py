@@ -30,6 +30,7 @@ from bot import (
     delivery_bots,
     create_order_in_db,
     create_paystack_payment_link,
+    create_transfer_charge,
     deduct_inventory_for_order,
     is_subscription_active,
     send_order_to_kitchen,
@@ -498,6 +499,7 @@ async def send_payment_options(phone_number_id, token, to, allowed_methods: list
         "bank": ("pay_bank", "Bank transfer"),
         "pod": ("pay_pod", "Pay on delivery"),
         "paystack": ("pay_paystack", "Pay with card"),
+        "transfer": ("pay_transfer_instant", "Instant transfer"),
     }
     if order_type == "pickup":
         titles["cash"] = ("pay_cash", "Cash at pickup")
@@ -2322,7 +2324,7 @@ async def handle_interactive(msg, state, restaurant, from_number, supabase, bot,
 
 
 async def handle_payment_selection(button_id, state, restaurant, from_number, supabase, bot, current_state):
-    if current_state != "waiting_for_payment_method" or button_id not in {"pay_cash", "pay_bank", "pay_pod", "pay_paystack"}:
+    if current_state != "waiting_for_payment_method" or button_id not in {"pay_cash", "pay_bank", "pay_pod", "pay_paystack", "pay_transfer_instant"}:
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please choose a payment option from the current order.")
         return
     data = await state.get_data()
@@ -2331,7 +2333,7 @@ async def handle_payment_selection(button_id, state, restaurant, from_number, su
         restaurant.get("paystack_enabled"),
         bool(restaurant.get("bank_name") and restaurant.get("account_number")),
     )
-    method_ids = {"pay_cash": "cash", "pay_bank": "bank", "pay_pod": "pod", "pay_paystack": "paystack"}
+    method_ids = {"pay_cash": "cash", "pay_bank": "bank", "pay_pod": "pod", "pay_paystack": "paystack", "pay_transfer_instant": "paystack"}
     if method_ids.get(button_id) not in allowed_methods:
         await send_text(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
@@ -2356,6 +2358,9 @@ async def handle_payment_selection(button_id, state, restaurant, from_number, su
         return
     if button_id == "pay_paystack":
         await start_paystack_payment(state, restaurant, from_number, customer_name, total)
+        return
+    if button_id == "pay_transfer_instant":
+        await start_instant_transfer(state, restaurant, from_number, customer_name)
         return
     payment_method = "Cash Payment" if button_id == "pay_cash" else "Pay on Delivery"
     await state.update_data(payment_method=payment_method)
@@ -2393,6 +2398,31 @@ async def start_paystack_payment(state, restaurant, from_number, customer_name, 
     except Exception:
         logging.exception("WhatsApp Paystack setup failed")
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "❌ Could not create a Paystack payment link. Please choose another payment method.")
+
+
+async def start_instant_transfer(state, restaurant, from_number, customer_name):
+    """Create the pending Paystack order only after the normal stock re-check."""
+    try:
+        await state.update_data(payment_method="Paystack")
+        order_id, order = await create_order_in_db(None, state, "Paystack", customer_name, "whatsapp", None, from_number)
+        email = f"{''.join(ch for ch in from_number if ch.isdigit())}@chowlin.ng"
+        details = await create_transfer_charge(order, restaurant, email)
+        if not details:
+            supabase.table("orders").update({"order_status": "cancelled"}).eq("id", order_id).eq("restaurant_id", restaurant["id"]).execute()
+            await state.set_state("waiting_for_payment_method")
+            await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Instant transfer isn't available right now, please choose another payment method")
+            return
+        total = money(order.get("total_amount"))
+        supabase.table("payments").insert({"order_id": order_id, "restaurant_id": restaurant["id"], "amount": str(total), "provider": "Paystack", "status": "pending", "provider_reference": details["reference"], "paystack_reference": details["reference"], "paystack_subaccount_code": restaurant["paystack_subaccount_code"], "account_number": details["account_number"], "account_name": details["account_name"], "bank_name": details["bank_name"], "expires_at": details["expires_at"], "channel": "transfer"}).execute()
+        expires = datetime.fromisoformat(details["expires_at"].replace("Z", "+00:00")).astimezone(__import__('pytz').timezone("Africa/Lagos")).strftime("%I:%M %p")
+        await state.set_state("awaiting_transfer")
+        await state.update_data(active_transfer_order_id=order_id)
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"Bank: {details['bank_name']}\nAccount name: {details['account_name']}\nAccount number:\n{details['account_number']}\nAmount: ₦{total:,.0f}\nExpires: {expires} WAT\n\nTransfer the exact amount. Your order is confirmed automatically once payment arrives. Reply STATUS to check, or MENU for options.")
+    except ValueError as exc:
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}")
+    except Exception:
+        logging.exception("WhatsApp instant transfer setup failed")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Instant transfer isn't available right now, please choose another payment method")
 
 
 async def download_whatsapp_media(media_id: str, token: str) -> tuple[bytes, str]:

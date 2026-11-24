@@ -14,6 +14,7 @@ from bot import (
     notify_order_customer,
     send_order_receipt,
     is_subscription_active,
+    cancel_pending_order,
 )
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -30,6 +31,7 @@ from urllib.parse import quote
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 import pytz
 from datetime import datetime, timedelta
 from reports import generate_daily_report_for_window, generate_weekly_report, get_daily_report_window
@@ -518,6 +520,22 @@ async def paystack_webhook(request: Request):
         return {"status": "invalid signature"}
 
     event = json.loads(body)
+    if event.get("event") == "bank.transfer.rejected":
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        reference = data.get("reference")
+        if not reference:
+            return {"status": "missing reference"}
+        payment = supabase.table("payments").select("order_id, restaurant_id").eq("paystack_reference", reference).execute()
+        if not payment.data:
+            logger.info("Ignoring unknown rejected Paystack transfer reference=%s", reference)
+            return {"status": "ignored"}
+        row = payment.data[0]
+        supabase.table("payments").update({"status": "rejected"}).eq("order_id", row.get("order_id")).eq("restaurant_id", row.get("restaurant_id")).eq("status", "pending").execute()
+        order = supabase.table("orders").select("telegram_user_id, customer_contact, order_channel, restaurant_id").eq("id", row.get("order_id")).eq("restaurant_id", row.get("restaurant_id")).execute()
+        if order.data:
+            await notify_order_customer(bot, order.data[0], "Your transfer was rejected, most commonly because the amount was wrong. Please check the amount, reply MENU to start again, or contact the restaurant.")
+        logger.info("Rejected Paystack transfer reference=%s", reference)
+        return {"status": "ok"}
     if event.get("event") != "charge.success":
         return {"status": "ignored"}
 
@@ -526,6 +544,32 @@ async def paystack_webhook(request: Request):
     if not order_id:
         return {"status": "missing reference"}
 
+    return await confirm_paystack_payment(order_id, "webhook", data)
+
+
+async def confirm_paystack_payment(reference: str, source: str, webhook_data: dict | None = None):
+    """Idempotently release a verified Paystack order to the kitchen.
+
+    Webhooks already carry a Paystack-signed payload; a customer status check
+    calls this with no payload and therefore verifies the reference upstream.
+    """
+    data = webhook_data or {}
+    if not webhook_data:
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.get(f"https://api.paystack.co/transaction/verify/{reference}", headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}) as response:
+                    payload = await response.json(content_type=None)
+                    data = payload.get("data") if isinstance(payload, dict) else {}
+        except (aiohttp.ClientError, TimeoutError):
+            logger.warning("Paystack status verification failed reference=%s", reference)
+            return {"status": "unavailable"}
+    if not isinstance(data, dict) or str(data.get("reference") or reference) != reference:
+        return {"status": "invalid reference"}
+    if webhook_data is None and data.get("status") not in {"success", "successful"}:
+        return {"status": "pending"}
+
+    order_id = reference
     # Idempotency check: see if we've already processed this order's payment before doing any updates or notifications.
     current = supabase.table("orders").select("payment_status").eq("id", order_id).execute()
     if current.data and current.data[0]["payment_status"] == "confirmed":
@@ -535,7 +579,7 @@ async def paystack_webhook(request: Request):
     supabase.table("orders").update({"payment_status": "confirmed"}).eq("id", order_id).execute()
     supabase.table("payments").update({
         "status": "confirmed",
-        "paystack_reference": data.get("reference")
+        "paystack_reference": data.get("reference") or reference
     }).eq("order_id", order_id).eq("provider", "Paystack").execute()
 
     # Load channel and restaurant details for kitchen work and customer notification.
@@ -579,6 +623,30 @@ async def paystack_webhook(request: Request):
         logger.error(f"Failed to notify/send receipt for Paystack order {order_id}: {e}", exc_info=True)
 
     return {"status": "ok"}
+
+
+async def expire_pending_transfer_accounts():
+    """Reconcile expired temporary accounts before atomically cancelling them."""
+    cutoff = (datetime.now(pytz.utc) - timedelta(minutes=5)).isoformat()
+    result = supabase.table("payments").select("order_id, restaurant_id, paystack_reference, orders(telegram_user_id, customer_contact, order_channel)").eq("provider", "Paystack").eq("channel", "transfer").eq("status", "pending").lt("expires_at", cutoff).execute()
+    for payment in result.data or []:
+        reference = payment.get("paystack_reference")
+        if not reference:
+            continue
+        if (await confirm_paystack_payment(reference, "expiry")).get("status") == "ok":
+            continue
+        claimed = supabase.table("payments").update({"status": "expired"}).eq("order_id", payment.get("order_id")).eq("restaurant_id", payment.get("restaurant_id")).eq("status", "pending").select("order_id").execute()
+        if not claimed.data:
+            continue
+        order = payment.get("orders") or {}
+        try:
+            if order.get("order_channel") == "whatsapp":
+                await cancel_pending_order(bot, payment.get("order_id"), customer_contact=order.get("customer_contact"), restaurant_id=payment.get("restaurant_id"), allow_unconfirmed_online=True)
+            else:
+                await cancel_pending_order(bot, payment.get("order_id"), telegram_user_id=order.get("telegram_user_id"), allow_unconfirmed_online=True)
+            await notify_order_customer(bot, order, "Your transfer account expired. Reply MENU to place your order again.")
+        except Exception:
+            logger.exception("Failed expiring transfer order_id=%s", payment.get("order_id"))
 
 
 @app.post("/admin/paystack/subaccount/{restaurant_id}")
@@ -699,6 +767,7 @@ async def on_startup():
         CronTrigger(hour=9, minute=0, timezone=pytz.timezone('Africa/Lagos')),
         id='expiry_warnings'
     )
+    scheduler.add_job(expire_pending_transfer_accounts, IntervalTrigger(minutes=5, timezone=pytz.timezone('Africa/Lagos')), id='expire_paystack_transfers', max_instances=1, coalesce=True)
     
     scheduler.start()
     logger.info("✅ Scheduler started")

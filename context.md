@@ -38,7 +38,7 @@ The application is an async Python service. It is deployed behind FastAPI webhoo
 | `POST /webhook` | Feeds updates from the shared Telegram bot into `dp`. |
 | `GET /webhook/whatsapp` | Meta webhook verification using `WHATSAPP_VERIFY_TOKEN`. |
 | `POST /webhook/whatsapp` | Passes Meta events to `handle_whatsapp_webhook`. Status-only events are ignored. |
-| `POST /webhook/paystack` | Verifies Paystack HMAC, confirms an order idempotently, notifies the kitchen, deducts stock, and sends a Telegram receipt. |
+| `POST /webhook/paystack` | Verifies Paystack HMAC, confirms Paystack payments idempotently, handles rejected transfers, notifies the kitchen, deducts stock, and sends a receipt. |
 | `GET /paystack/callback` | Simple browser confirmation page; it does not confirm a payment. |
 | `POST /webhook/delivery/{restaurant_id}` | Routes Telegram updates to a restaurant-specific delivery bot. |
 | `POST /admin/paystack/subaccount/{restaurant_id}` | Creates a Paystack subaccount; requires `X-Admin-Key`. |
@@ -132,7 +132,7 @@ WhatsApp is not a Telegram UI clone. It begins when Meta sends an `order` messag
 6. Interactive payment choices use the shared order-type rule: dine-in/pickup offer cash, configured bank transfer, and enabled Paystack; delivery offers configured bank transfer, enabled Paystack, and Pay on Delivery only when `pay_on_delivery_enabled` is true. Delivery never offers Cash Payment. A submitted payment reply is checked against the current session order type and restaurant settings.
 7. Cash/pay-on-delivery create `order_channel = whatsapp`, carry the phone number in `customer_contact`, send a Telegram kitchen notification, attempt inventory deduction, and send a WhatsApp PDF receipt.
 8. Bank transfer sends bank details, accepts an image proof, downloads it from Meta, creates the order/payment record, and forwards the proof to the Telegram kitchen for manual confirmation.
-9. Paystack: `start_paystack_payment()` creates a pending order, generates a checkout link using a deterministic `<digits>@chowlin.ng` email, and sends the URL to the customer. The Paystack webhook in `main.py` confirms the order and sends a WhatsApp receipt.
+9. Paystack: hosted card checkout remains available. Both channels additionally offer Instant transfer: `paystack_transfer.py` creates a Charge API bank-transfer account using the restaurant subaccount, Decimal-safe kobo conversion, the same split fields as hosted checkout, and a 30-minute UTC expiry. The temporary account is shown in chat and the pending Paystack order stays hidden from the kitchen until `confirm_paystack_payment()` confirms it. Pay with Transfer must be enabled in the restaurant's Paystack account.
 10. Status notifications (payment confirmed/rejected, preparing, ready, delivered) are sent to the customer's WhatsApp number via `notify_order_customer()`.
 11. State lives in Supabase, so it survives service restarts. `WhatsAppState` offers `get_data`, `update_data`, `set_state`, and `clear` so it can be passed to shared persistence/kitchen functions.
 12. `sync_catalog_item_availability()` in `whatsapp.py` pushes availability and visibility (`published`/`staging`) changes to the Meta Catalog Batch API using `restaurants.whatsapp_catalog_id`. `items_batch` sends form-encoded `item_type=PRODUCT_ITEM`, `allow_upsert=false`, and a JSON-string `requests` field; each request uses the mapped `catalog_retailer_id` as `data.id`. Resync reports submission separately from the optional asynchronous handle status: a status-check failure is informational and never changes a successful submit into a failure. Code 100 gets one availability-only submit retry; authentication/permission errors do not retry.
@@ -222,7 +222,7 @@ Paystack requires an email address. For WhatsApp orders, use the documented dete
 
 - `Dockerfile` copies only the runtime modules it currently imports. If a new runtime module/asset is added, include it in the image build.
 - Migration 010 has no `.sql` extension but contains SQL and is the WhatsApp schema migration. Keep migration execution/documentation aware of that filename.
-- The existing report implementation totals all orders in its time range; it does not filter to confirmed payments. Clarify the desired revenue definition before changing financial reporting.
+- Migration 017 adds transfer account details, expiry, channel, and refund bookkeeping to `payments`. Transfer accounts expire after 30 minutes; operational cleanup should verify payment before cancelling a pending order. Late payments and stock-conflict/refund escalation remain operationally monitored rather than silently released to the kitchen.
 - Current WhatsApp text responses use Markdown-like asterisks but the Graph API text payload does not specify formatting. Prefer plain text or supported WhatsApp formatting intentionally.
 - `whatsapp_sessions` state updates and data updates are separate upserts. If extending concurrent webhook behavior, consider a single atomic state/data update or optimistic versioning.
 - `orders.order_status` may have a CHECK constraint that does not include `'delivered'`. Verify and update the constraint before deploying the rider delivery flow to production (see migration 011 note).

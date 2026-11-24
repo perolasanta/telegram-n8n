@@ -27,6 +27,7 @@ from receipt_generator import generate_receipt_pdf
 from aiogram.types import FSInputFile
 import pytz
 from datetime import datetime, timedelta
+from paystack_transfer import create_transfer_charge, split_fields
 
 router = Router()
 load_dotenv()
@@ -997,7 +998,8 @@ async def create_paystack_payment_link(order_id: str, amount: float, email: str,
         "reference": order_id,
         "callback_url": callback_url,
         "subaccount": subaccount_code,
-        "currency": "NGN"
+        "currency": "NGN",
+        **split_fields(amount),
     }
 
     async with aiohttp.ClientSession() as session:
@@ -2198,7 +2200,11 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
         "bank": ("🏦 Bank Transfer", "pay_bank"),
         "pod": ("💵 Pay on Delivery", "pay_delivery"),
         "paystack": ("💳 Pay with Card (Paystack)", "pay_paystack"),
+        "transfer": ("🏦 Instant transfer", "pay_transfer"),
     }
+    # Transfer is another Paystack rail; retain the hosted card checkout too.
+    if "paystack" in allowed_methods:
+        allowed_methods.append("transfer")
     payment_buttons = [
         [InlineKeyboardButton(text=button_details[method][0], callback_data=button_details[method][1])]
         for method in allowed_methods
@@ -2796,6 +2802,73 @@ async def payment_paystack(callback_query: types.CallbackQuery, state: FSMContex
         )
 
     await callback_query.answer()
+
+
+@dp.callback_query(F.data == "pay_transfer")
+async def payment_instant_transfer(callback_query: types.CallbackQuery, state: FSMContext):
+    """Issue a Paystack Charge temporary bank account inside Telegram."""
+    data = await state.get_data()
+    restaurant_id = data.get("restaurant_id")
+    result = supabase.table("restaurants").select(
+        "id, paystack_enabled, paystack_subaccount_code"
+    ).eq("id", restaurant_id).execute()
+    restaurant = result.data[0] if result.data else None
+    if not restaurant or not restaurant.get("paystack_enabled") or not restaurant.get("paystack_subaccount_code"):
+        await callback_query.message.answer("Instant transfer isn't available right now, please choose another payment method")
+        await callback_query.answer()
+        return
+    try:
+        customer_name = callback_query.from_user.username or callback_query.from_user.first_name or "Customer"
+        await state.update_data(payment_method="Paystack")
+        # create_order_in_db performs the authoritative inventory re-check immediately before Charge.
+        order_id, order = await create_order_in_db(callback_query.from_user.id, state, "Paystack", customer_name, "telegram", None)
+        details = await create_transfer_charge(order, restaurant, await get_paystack_email_for_user(callback_query.from_user.id))
+        if not details:
+            supabase.table("orders").update({"order_status": "cancelled"}).eq("id", order_id).eq("restaurant_id", restaurant_id).execute()
+            await callback_query.message.answer("Instant transfer isn't available right now, please choose another payment method")
+            return
+        amount = Decimal(str(order.get("total_amount") or data.get("total_price") or 0))
+        supabase.table("payments").insert({
+            "order_id": order_id, "restaurant_id": restaurant_id, "amount": str(amount),
+            "provider": "Paystack", "status": "pending", "provider_reference": details["reference"],
+            "paystack_reference": details["reference"], "paystack_subaccount_code": restaurant["paystack_subaccount_code"],
+            "account_number": details["account_number"], "account_name": details["account_name"],
+            "bank_name": details["bank_name"], "expires_at": details["expires_at"], "channel": "transfer",
+        }).execute()
+        expires = datetime.fromisoformat(details["expires_at"].replace("Z", "+00:00")).astimezone(pytz.timezone("Africa/Lagos")).strftime("%I:%M %p")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Check payment", callback_data=f"pcheck_{order_id}")
+        ]])
+        await callback_query.message.answer(
+            f"Bank: {details['bank_name']}\nAccount name: {details['account_name']}\nAccount number:\n{details['account_number']}\n"
+            f"Amount: ₦{amount:,.0f}\nExpires: {expires} WAT\n\n"
+            "Transfer the exact amount. Your order is confirmed automatically once payment arrives. Reply STATUS to check, or MENU for options.",
+            reply_markup=keyboard,
+        )
+        await state.update_data(cart={})
+    except ValueError as exc:
+        await callback_query.message.answer(f"⚠️ {escape(str(exc))}")
+    except Exception:
+        logging.exception("Telegram instant transfer setup failed")
+        await callback_query.message.answer("Instant transfer isn't available right now, please choose another payment method")
+    finally:
+        await callback_query.answer()
+
+
+@dp.callback_query(F.data.startswith("pcheck_"))
+async def check_instant_transfer(callback_query: types.CallbackQuery):
+    reference = (callback_query.data or "")[7:]
+    payment = supabase.table("payments").select("order_id, restaurant_id, status").eq(
+        "paystack_reference", reference
+    ).execute()
+    row = payment.data[0] if payment.data else None
+    if not row or row.get("status") != "pending":
+        await callback_query.answer("Payment is no longer pending.", show_alert=True)
+        return
+    # Lazy import avoids main<->bot import initialisation recursion.
+    from main import confirm_paystack_payment
+    result = await confirm_paystack_payment(reference, "telegram_status")
+    await callback_query.answer("Payment confirmed." if result.get("status") == "ok" else "Payment is still pending.", show_alert=True)
 
 
 @dp.callback_query(F.data == "pay_bank")
