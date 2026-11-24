@@ -59,6 +59,17 @@ def money(value) -> Decimal:
         return Decimal("0")
 
 
+PAYMENT_OPTION_IDS = {"cash": "pay_cash", "bank": "pay_bank", "pod": "pay_pod", "paystack": "pay_paystack", "transfer": "pay_transfer_instant"}
+
+
+def enabled_payment_option_ids(restaurant: dict, order_type: str) -> list[str]:
+    """One eligibility source for the WhatsApp selector and reply validator."""
+    methods = available_payment_methods(order_type, restaurant.get("pay_on_delivery_enabled"), restaurant.get("paystack_enabled"), bool(restaurant.get("bank_name") and restaurant.get("account_number")))
+    if restaurant.get("paystack_enabled") and restaurant.get("paystack_subaccount_code") and "paystack" in methods:
+        methods.append("transfer")
+    return [PAYMENT_OPTION_IDS[method] for method in methods if method in PAYMENT_OPTION_IDS]
+
+
 def _unix_timestamp(now=None) -> int:
     if now is None:
         return int(datetime.now(timezone.utc).timestamp())
@@ -487,19 +498,16 @@ async def send_buttons(phone_number_id: str, token: str, to: str, body: str, but
     await send_whatsapp_message(phone_number_id, token, to, build_buttons_payload(body, buttons))
 
 
-async def send_payment_options(phone_number_id, token, to, allowed_methods: list[str], state, order_type, restaurant_id=None, transfer_eligible=False):
-    if not allowed_methods:
+async def send_payment_options(phone_number_id, token, to, restaurant: dict, state, order_type):
+    offered_ids = enabled_payment_option_ids(restaurant, order_type)
+    if not offered_ids:
         await send_text(
             phone_number_id, token, to,
             "This order type isn't available right now. Please contact the restaurant.",
         )
         await state.clear()
         return
-    offered_methods = list(allowed_methods)
-    if transfer_eligible and "paystack" in offered_methods:
-        offered_methods.append("transfer")
-    option_ids = {"cash": "pay_cash", "bank": "pay_bank", "pod": "pay_pod", "paystack": "pay_paystack", "transfer": "pay_transfer_instant"}
-    logging.info("WhatsApp payment selector restaurant_id=%s option_ids=%s", restaurant_id, [option_ids.get(method) for method in offered_methods])
+    logging.info("WhatsApp payment selector restaurant_id=%s option_ids=%s", restaurant.get("id"), offered_ids)
     titles = {
         "cash": ("pay_cash", "Cash"),
         "bank": ("pay_bank", "Bank transfer"),
@@ -509,10 +517,8 @@ async def send_payment_options(phone_number_id, token, to, allowed_methods: list
     }
     if order_type == "pickup":
         titles["cash"] = ("pay_cash", "Cash at pickup")
-    rows = [
-        {"id": titles[method][0], "title": titles[method][1]}
-        for method in offered_methods if method in titles
-    ]
+    method_by_id = {value: key for key, value in PAYMENT_OPTION_IDS.items()}
+    rows = [{"id": reply_id, "title": titles[method_by_id[reply_id]][1]} for reply_id in offered_ids]
     if not rows:
         await send_text(
             phone_number_id, token, to,
@@ -1616,13 +1622,9 @@ async def choose_pickup(state, restaurant, from_number):
     await state.update_data(order_type="pickup", delivery_fee=0, delivery_zone_id=None, delivery_zone_name=None)
     await recalculate_total(state, restaurant)
     await state.set_state("waiting_for_payment_method")
-    allowed_methods = available_payment_methods(
-        "pickup", restaurant.get("pay_on_delivery_enabled"), restaurant.get("paystack_enabled"),
-        bool(restaurant.get("bank_name") and restaurant.get("account_number")),
-    )
     await send_payment_options(
         restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"],
-        from_number, allowed_methods, state, "pickup", restaurant["id"], bool(restaurant.get("paystack_enabled") and restaurant.get("paystack_subaccount_code")),
+        from_number, restaurant, state, "pickup",
     )
 
 
@@ -1673,16 +1675,9 @@ async def request_payment_method(state, restaurant, from_number):
     await state.set_state("waiting_for_payment_method")
     await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"💰 Total: ₦{float(total):,.0f}")
     data = await state.get_data()
-    allowed_methods = available_payment_methods(
-        data.get("order_type", "delivery"), restaurant.get("pay_on_delivery_enabled"),
-        restaurant.get("paystack_enabled"),
-        bool(restaurant.get("bank_name") and restaurant.get("account_number")),
-    )
-    if restaurant.get("paystack_enabled") and restaurant.get("paystack_subaccount_code") and "paystack" in allowed_methods:
-        allowed_methods.append("transfer")
     await send_payment_options(
         restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"],
-        from_number, allowed_methods, state, data.get("order_type", "delivery"), restaurant["id"], bool(restaurant.get("paystack_enabled") and restaurant.get("paystack_subaccount_code")),
+        from_number, restaurant, state, data.get("order_type", "delivery"),
     )
 
 
@@ -2336,13 +2331,9 @@ async def handle_payment_selection(button_id, state, restaurant, from_number, su
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please choose a payment option from the current order.")
         return
     data = await state.get_data()
-    allowed_methods = available_payment_methods(
-        data.get("order_type", "delivery"), restaurant.get("pay_on_delivery_enabled"),
-        restaurant.get("paystack_enabled"),
-        bool(restaurant.get("bank_name") and restaurant.get("account_number")),
-    )
-    method_ids = {"pay_cash": "cash", "pay_bank": "bank", "pay_pod": "pod", "pay_paystack": "paystack", "pay_transfer_instant": "transfer"}
-    if method_ids.get(button_id) not in allowed_methods:
+    allowed_ids = enabled_payment_option_ids(restaurant, data.get("order_type", "delivery"))
+    if button_id not in allowed_ids:
+        logging.warning("Rejected WhatsApp payment reply id=%s state=%s allowed_ids=%s", button_id, current_state, allowed_ids)
         await send_text(
             restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
             "That payment method isn't available for this order.",

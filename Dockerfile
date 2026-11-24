@@ -9,6 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py bot.py reports.py receipt_generator.py whatsapp.py whatsapp_state.py paystack_transfer.py ./
+COPY scripts/ ./scripts/
 
 EXPOSE 8001
 
