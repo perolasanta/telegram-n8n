@@ -92,7 +92,13 @@ async def create_transfer_charge(order: dict, restaurant: dict, customer_email: 
     """Create a temporary account. A timeout is reconciled once, never retried."""
     secret = os.getenv("PAYSTACK_SECRET_KEY")
     import aiohttp
-    payload = build_transfer_charge_payload(order, restaurant, customer_email, expiry_minutes)
+    channel = str(order.get("order_channel") or order.get("channel") or "unknown")
+    try:
+        payload = build_transfer_charge_payload(order, restaurant, customer_email, expiry_minutes)
+    except (ValueError, ArithmeticError, TypeError) as exc:
+        stage = "missing_subaccount" if not restaurant.get("paystack_subaccount_code") else "invalid_amount"
+        logging.warning("Paystack transfer failed channel=%s restaurant_id=%s order_id=%s stage=%s", channel, restaurant.get("id"), order.get("id"), stage)
+        return None
     reference = payload["reference"]
     if not secret:
         logging.warning("Paystack transfer unavailable reference=%s", reference)
@@ -106,8 +112,8 @@ async def create_transfer_charge(order: dict, restaurant: dict, customer_email: 
                 parsed = parse_transfer_response(result)
                 if response.status < 300 and result.get("status") and parsed:
                     return parsed
-                logging.warning("Paystack transfer charge failed status=%s code=%s message=%s reference=%s",
-                                response.status, result.get("code"), result.get("message"), reference)
+                stage = "paystack_response_missing_account" if response.status < 300 else "paystack_http_error"
+                logging.warning("Paystack transfer failed channel=%s restaurant_id=%s order_id=%s stage=%s http_status=%s paystack_code=%s paystack_message=%s fbtrace=%s reference=%s", channel, restaurant.get("id"), reference, stage, response.status, result.get("code"), result.get("message"), result.get("fbtrace_id"), reference)
     except (aiohttp.ClientError, TimeoutError):
         # A request may have reached Paystack. Verify exactly once before cancelling.
         try:

@@ -536,7 +536,8 @@ async def paystack_webhook(request: Request):
         order = supabase.table("orders").select("telegram_user_id, customer_contact, order_channel, restaurant_id").eq("id", row.get("order_id")).eq("restaurant_id", row.get("restaurant_id")).execute()
         if order.data:
             channel = order.data[0].get("order_channel")
-            await notify_order_customer(bot, order.data[0], f"Your transfer was rejected, most commonly because the amount was wrong. Please check the amount or contact the restaurant. {transfer_customer_wording(channel, 'restart')}")
+            target_bot = await get_bot_for_order(order.data[0])
+            await notify_order_customer(target_bot, order.data[0], f"Your transfer was rejected, most commonly because the amount was wrong. Please check the amount or contact the restaurant. {transfer_customer_wording(channel, 'restart')}")
         logger.info("Rejected Paystack transfer reference=%s", reference)
         return {"status": "ok"}
     if event.get("event") != "charge.success":
@@ -573,6 +574,35 @@ async def confirm_paystack_payment(reference: str, source: str, webhook_data: di
         return {"status": "pending"}
 
     order_id = reference
+    # Persisted payment amount is authoritative; legacy rows fall back to order total.
+    payment_row = supabase.table("payments").select("amount, restaurant_id, status").eq("paystack_reference", reference).execute()
+    payment = payment_row.data[0] if payment_row.data else {}
+    expected_kobo = None
+    try:
+        if payment.get("amount") is not None:
+            expected_kobo = int((Decimal(str(payment["amount"])) * 100).to_integral_value())
+    except Exception:
+        expected_kobo = None
+    if expected_kobo is None:
+        legacy = supabase.table("orders").select("total_amount").eq("id", order_id).execute()
+        try:
+            expected_kobo = int((Decimal(str((legacy.data or [{}])[0].get("total_amount") or 0)) * 100).to_integral_value())
+        except Exception:
+            expected_kobo = None
+    received_kobo = data.get("amount")
+    currency = data.get("currency")
+    if expected_kobo is not None and (currency != "NGN" or not isinstance(received_kobo, int) or received_kobo != expected_kobo):
+        # Claim review once: repeated webhooks must not repeat staff alerts.
+        claimed = supabase.table("payments").update({"status": "needs_review"}).eq("paystack_reference", reference).eq("status", "pending").select("order_id").execute()
+        if claimed.data:
+            order_result = supabase.table("orders").select("telegram_user_id, customer_contact, order_channel, restaurant_id, restaurants(kitchen_chat_id)").eq("id", order_id).execute()
+            order_data = order_result.data[0] if order_result.data else {}
+            target_bot = await get_bot_for_order(order_data)
+            kitchen = (order_data.get("restaurants") or {}).get("kitchen_chat_id")
+            if kitchen:
+                await target_bot.send_message(kitchen, f"⚠️ Paystack amount mismatch\nOrder #{order_id.replace('-', '')[:4].upper()}\nExpected: ₦{Decimal(expected_kobo) / 100:,.2f}\nReceived: ₦{Decimal(str(received_kobo or 0)) / 100:,.2f}\nReference: {reference}\nCustomer: {order_data.get('customer_contact') or order_data.get('telegram_user_id') or 'unknown'}")
+            await notify_order_customer(target_bot, order_data, "We received an amount different from the expected total. The restaurant will contact you.")
+        return {"status": "needs_review"}
     # Idempotency check: see if we've already processed this order's payment before doing any updates or notifications.
     current = supabase.table("orders").select("payment_status").eq("id", order_id).execute()
     if current.data and current.data[0]["payment_status"] == "confirmed":
@@ -654,7 +684,7 @@ async def refund_paystack_payment(reference: str, amount=None):
             raise RuntimeError("Paystack refund request rejected")
         supabase.table("payments").update({"status": "refunded", "refund_reference": refund.get("reference"), "refunded_at": datetime.now(pytz.utc).isoformat()}).eq("paystack_reference", reference).eq("restaurant_id", payment.get("restaurant_id")).execute()
         order = payment.get("orders") or {}
-        await notify_order_customer(bot, order, f"Your refund of ₦{refund_amount:,.0f} has been initiated. It can take a few business days to reach your account. {transfer_customer_wording(order.get('order_channel'), 'restart')}")
+        await notify_order_customer(await get_bot_for_order(order), order, f"Your refund of ₦{refund_amount:,.0f} has been initiated. It can take a few business days to reach your account. {transfer_customer_wording(order.get('order_channel'), 'restart')}")
         return {"status": "ok"}
     except Exception:
         # Release the claim for staff retry; deliberately never include provider body/secret in logs.
@@ -682,7 +712,7 @@ async def expire_pending_transfer_accounts():
                 await cancel_pending_order(bot, payment.get("order_id"), customer_contact=order.get("customer_contact"), restaurant_id=payment.get("restaurant_id"), allow_unconfirmed_online=True)
             else:
                 await cancel_pending_order(bot, payment.get("order_id"), telegram_user_id=order.get("telegram_user_id"), allow_unconfirmed_online=True)
-            await notify_order_customer(bot, order, f"Your transfer account expired. {transfer_customer_wording(order.get('order_channel'), 'restart')}")
+            await notify_order_customer(await get_bot_for_order(order), order, f"Your transfer account expired. {transfer_customer_wording(order.get('order_channel'), 'restart')}")
         except Exception:
             logger.exception("Failed expiring transfer order_id=%s", payment.get("order_id"))
 

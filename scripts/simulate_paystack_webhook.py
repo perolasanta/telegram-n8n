@@ -59,6 +59,7 @@ def main():
     raw = json.dumps(build_payload(args.reference, amount, args.event), separators=(",", ":")).encode("utf-8")
     signature = hmac.new(secret.encode("utf-8"), raw, hashlib.sha512).hexdigest()
     request = Request(args.url, data=raw, method="POST", headers={"Content-Type": "application/json", "x-paystack-signature": signature})
+    print(f"Sending event={args.event} reference={args.reference} amount_kobo={kobo(amount)}")
     try:
         with urlopen(request, timeout=20) as response:
             print(response.status, response.read().decode("utf-8", "replace"))

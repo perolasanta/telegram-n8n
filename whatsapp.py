@@ -2405,6 +2405,9 @@ async def start_instant_transfer(state, restaurant, from_number, customer_name):
         await state.update_data(payment_method="Paystack")
         order_id, order = await create_order_in_db(None, state, "Paystack", customer_name, "whatsapp", None, from_number)
         email = f"{''.join(ch for ch in from_number if ch.isdigit())}@chowlin.ng"
+        # Insert responses may be sparse; use the same authoritative state total
+        # Telegram falls back to when forming the Charge payload.
+        order = {**(order or {}), "id": order_id, "total_amount": (order or {}).get("total_amount") or (await state.get_data()).get("total_price"), "restaurant_id": restaurant["id"], "order_channel": "whatsapp"}
         details = await create_transfer_charge(order, restaurant, email)
         if not details:
             supabase.table("orders").update({"order_status": "cancelled"}).eq("id", order_id).eq("restaurant_id", restaurant["id"]).execute()
