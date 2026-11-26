@@ -17,6 +17,7 @@ from bot import (
     cancel_pending_order,
 )
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.client.default import DefaultBotProperties
 import os
 import json
@@ -575,7 +576,7 @@ async def confirm_paystack_payment(reference: str, source: str, webhook_data: di
 
     order_id = reference
     # Persisted payment amount is authoritative; legacy rows fall back to order total.
-    payment_row = supabase.table("payments").select("amount, restaurant_id, status").eq("paystack_reference", reference).execute()
+    payment_row = supabase.table("payments").select("amount, restaurant_id, status, channel").eq("paystack_reference", reference).execute()
     payment = payment_row.data[0] if payment_row.data else {}
     expected_kobo = None
     try:
@@ -595,12 +596,37 @@ async def confirm_paystack_payment(reference: str, source: str, webhook_data: di
         # Claim review once: repeated webhooks must not repeat staff alerts.
         claimed = supabase.table("payments").update({"status": "needs_review"}).eq("paystack_reference", reference).eq("status", "pending").select("order_id").execute()
         if claimed.data:
-            order_result = supabase.table("orders").select("telegram_user_id, customer_contact, order_channel, restaurant_id, restaurants(kitchen_chat_id)").eq("id", order_id).execute()
+            order_result = supabase.table("orders").select("telegram_user_id, customer_name, customer_contact, order_channel, restaurant_id, total_amount, payment_method, order_items(quantity, menu_items(name)), restaurants(kitchen_chat_id, manager_telegram_id, whatsapp_phone_number_id, whatsapp_access_token)").eq("id", order_id).execute()
             order_data = order_result.data[0] if order_result.data else {}
             target_bot = await get_bot_for_order(order_data)
-            kitchen = (order_data.get("restaurants") or {}).get("kitchen_chat_id")
-            if kitchen:
-                await target_bot.send_message(kitchen, f"⚠️ Paystack amount mismatch\nOrder #{order_id.replace('-', '')[:4].upper()}\nExpected: ₦{Decimal(expected_kobo) / 100:,.2f}\nReceived: ₦{Decimal(str(received_kobo or 0)) / 100:,.2f}\nReference: {reference}\nCustomer: {order_data.get('customer_contact') or order_data.get('telegram_user_id') or 'unknown'}")
+            restaurant = order_data.get("restaurants") or {}
+            target = restaurant.get("manager_telegram_id") or restaurant.get("kitchen_chat_id")
+            received = Decimal(str(received_kobo or 0)) / 100
+            expected = Decimal(expected_kobo) / 100
+            difference = abs(expected - received)
+            direction = "UNDERPAID" if received < expected else "OVERPAID"
+            rail = "Instant transfer" if payment.get("channel") == "transfer" else "Card"
+            items = ", ".join(f"{item.get('quantity') or 0} x {(item.get('menu_items') or {}).get('name', 'Item')}" for item in order_data.get("order_items") or []) or "No item details"
+            if order_data.get("order_channel") == "whatsapp":
+                customer = " / ".join(filter(None, [order_data.get("customer_name"), order_data.get("customer_contact")])) or "unknown"
+            else:
+                name = order_data.get("customer_name") or "Customer"
+                telegram_id = order_data.get("telegram_user_id")
+                customer = f'<a href="tg://user?id={telegram_id}">{html.escape(name)}</a>' if telegram_id else html.escape(name)
+            if target:
+                alert = (
+                    f"⚠️ <b>Payment mismatch — #{order_id.replace('-', '')[:4].upper()}</b>\n"
+                    f"{direction}: expected ₦{expected:,.2f}; received ₦{received:,.2f}; difference ₦{difference:,.2f}\n"
+                    f"Method: {rail} | Channel: {order_data.get('order_channel', 'unknown').title()}\n"
+                    f"Reference: <code>{html.escape(reference)}</code>\n"
+                    f"Items: {html.escape(items)}\nTotal: ₦{Decimal(str(order_data.get('total_amount') or 0)):,.2f}\n"
+                    f"Customer: {customer}"
+                )
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Accept & prepare", callback_data=f"psaccept_{reference}"),
+                    InlineKeyboardButton(text="Refund received amount", callback_data=f"psmrefund_{reference}_{int(received_kobo or 0)}"),
+                ]])
+                await target_bot.send_message(target, alert, reply_markup=keyboard)
             await notify_order_customer(target_bot, order_data, "We received an amount different from the expected total. The restaurant will contact you.")
         return {"status": "needs_review"}
     # Idempotency check: see if we've already processed this order's payment before doing any updates or notifications.
@@ -658,10 +684,40 @@ async def confirm_paystack_payment(reference: str, source: str, webhook_data: di
     return {"status": "ok"}
 
 
+async def accept_paystack_mismatch(reference: str) -> dict:
+    """Claim an amount review once, then release its order through the usual work."""
+    claimed = supabase.table("payments").update({"status": "confirmed"}).eq(
+        "paystack_reference", reference).eq("status", "needs_review").select("order_id, restaurant_id").execute()
+    if not claimed.data:
+        return {"status": "already_handled"}
+    payment = claimed.data[0]
+    order_id = payment["order_id"]
+    logger.info("Paystack amount mismatch accepted by restaurant reference=%s", reference)
+    order_updated = supabase.table("orders").update({"payment_status": "confirmed"}).eq(
+        "id", order_id).eq("restaurant_id", payment["restaurant_id"]).eq("payment_status", "pending").select("id").execute()
+    if not order_updated.data:
+        return {"status": "already_handled"}
+    order_result = supabase.table("orders").select(
+        "telegram_user_id, customer_contact, order_channel, restaurant_id, restaurants(kitchen_chat_id, whatsapp_phone_number_id, whatsapp_access_token)"
+    ).eq("id", order_id).eq("restaurant_id", payment["restaurant_id"]).execute()
+    order = order_result.data[0] if order_result.data else {}
+    target_bot = await get_bot_for_order(order)
+    kitchen = (order.get("restaurants") or {}).get("kitchen_chat_id")
+    try:
+        await send_order_to_kitchen_from_db(target_bot, order_id)
+        low_stock_items = await deduct_inventory_for_order(order_id)
+        await send_restock_alert(target_bot, payment["restaurant_id"], kitchen, low_stock_items)
+        await notify_order_customer(target_bot, order, "Your payment was accepted and your order is being prepared.")
+        await send_order_receipt(target_bot, order, order_id)
+    except Exception:
+        logger.exception("Post-review confirmation work failed order_id=%s", order_id)
+    return {"status": "ok", "order_id": order_id}
+
+
 async def refund_paystack_payment(reference: str, amount=None):
     """Atomically claim and submit a Paystack refund; safe against double taps."""
     payment_result = supabase.table("payments").select(
-        "order_id, restaurant_id, amount, status, paystack_reference, orders(telegram_user_id, customer_contact, order_channel)"
+        "order_id, restaurant_id, amount, status, paystack_reference, orders(telegram_user_id, customer_contact, order_channel, restaurants(whatsapp_phone_number_id, whatsapp_access_token))"
     ).eq("paystack_reference", reference).execute()
     payment = payment_result.data[0] if payment_result.data else None
     if not payment or payment.get("status") in {"refund_pending", "refunded"}:
@@ -684,7 +740,10 @@ async def refund_paystack_payment(reference: str, amount=None):
             raise RuntimeError("Paystack refund request rejected")
         supabase.table("payments").update({"status": "refunded", "refund_reference": refund.get("reference"), "refunded_at": datetime.now(pytz.utc).isoformat()}).eq("paystack_reference", reference).eq("restaurant_id", payment.get("restaurant_id")).execute()
         order = payment.get("orders") or {}
-        await notify_order_customer(await get_bot_for_order(order), order, f"Your refund of ₦{refund_amount:,.0f} has been initiated. It can take a few business days to reach your account. {transfer_customer_wording(order.get('order_channel'), 'restart')}")
+        try:
+            await notify_order_customer(await get_bot_for_order(order), order, f"Your refund of ₦{refund_amount:,.0f} has been initiated. It can take a few business days to reach your account. {transfer_customer_wording(order.get('order_channel'), 'restart')}")
+        except Exception:
+            logger.exception("Refund customer notification failed reference=%s", reference)
         return {"status": "ok"}
     except Exception:
         # Release the claim for staff retry; deliberately never include provider body/secret in logs.

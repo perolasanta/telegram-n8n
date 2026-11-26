@@ -65,9 +65,7 @@ PAYMENT_OPTION_IDS = {"cash": "pay_cash", "bank": "pay_bank", "pod": "pay_pod", 
 
 def enabled_payment_option_ids(restaurant: dict, order_type: str) -> list[str]:
     """One eligibility source for the WhatsApp selector and reply validator."""
-    methods = available_payment_methods(order_type, restaurant.get("pay_on_delivery_enabled"), restaurant.get("paystack_enabled"), bool(restaurant.get("bank_name") and restaurant.get("account_number")))
-    if restaurant.get("paystack_enabled") and restaurant.get("paystack_subaccount_code") and "paystack" in methods:
-        methods.append("transfer")
+    methods = available_payment_methods(order_type, restaurant.get("pay_on_delivery_enabled"), restaurant.get("paystack_enabled"), bool(restaurant.get("bank_name") and restaurant.get("account_number")), bool(restaurant.get("paystack_subaccount_code")))
     return [PAYMENT_OPTION_IDS[method] for method in methods if method in PAYMENT_OPTION_IDS]
 
 
@@ -511,15 +509,15 @@ async def send_payment_options(phone_number_id, token, to, restaurant: dict, sta
     logging.info("WhatsApp payment selector restaurant_id=%s option_ids=%s", restaurant.get("id"), offered_ids)
     titles = {
         "cash": ("pay_cash", "Cash"),
-        "bank": ("pay_bank", "Bank transfer"),
+        "bank": ("pay_bank", "Transfer + screenshot"),
         "pod": ("pay_pod", "Pay on delivery"),
-        "paystack": ("pay_paystack", "Pay with card"),
+        "paystack": ("pay_paystack", "Card payment"),
         "transfer": ("pay_transfer_instant", "Instant transfer"),
     }
     if order_type == "pickup":
         titles["cash"] = ("pay_cash", "Cash at pickup")
     method_by_id = {value: key for key, value in PAYMENT_OPTION_IDS.items()}
-    rows = [{"id": reply_id, "title": titles[method_by_id[reply_id]][1]} for reply_id in offered_ids]
+    rows = [{"id": reply_id, "title": titles[method_by_id[reply_id]][1], **({"description": "Needs screenshot proof; restaurant confirms manually"} if reply_id == "pay_bank" else {})} for reply_id in offered_ids]
     if not rows:
         await send_text(
             phone_number_id, token, to,
@@ -1095,10 +1093,20 @@ def format_order_status_line(order: dict) -> str:
     return f"#{order_id} — {status_label} — ₦{total}"
 
 
-def order_status_words(status) -> str:
-    return {"pending": "Received", "preparing": "Being prepared", "ready": "Ready",
-            "dispatched": "Dispatched", "delivered": "Delivered", "cancelled": "Cancelled"}.get(
-        str(status or "pending").lower(), "Received")
+def order_status_words(order) -> str:
+    """Customer wording for the statuses actually persisted on orders."""
+    status = str((order if isinstance(order, str) else order.get("order_status")) or "pending").lower()
+    if status in {"pending", "received"}:
+        return "We've received your order and the restaurant will start soon."
+    if status == "preparing":
+        return "Your order is being prepared."
+    if status == "ready":
+        if isinstance(order, dict) and order.get("order_type") == "delivery" and order.get("dispatch_sent_at"):
+            return "Your order is on its way."
+        if isinstance(order, dict) and order.get("order_type") == "pickup":
+            return "Your order is ready for pickup."
+        return "Your order is ready and will be sent out shortly."
+    return {"delivered": "Your order was delivered.", "cancelled": "This order was cancelled."}.get(status, "We've received your order and the restaurant will start soon.")
 
 
 def payment_status_words(order: dict) -> str:
@@ -2005,7 +2013,7 @@ async def fetch_customer_order(supabase, order_id, restaurant_id, from_number, s
 
 async def send_customer_order_status(restaurant, from_number, supabase):
     result = supabase.table("orders").select(
-        "id, order_status, payment_method, payment_status, total_amount"
+        "id, order_status, order_type, dispatch_sent_at, payment_method, payment_status, total_amount"
     ).eq("restaurant_id", restaurant["id"]).eq(
         "order_channel", "whatsapp"
     ).eq("customer_contact", from_number).order("created_at", desc=True).limit(1).execute()
@@ -2049,9 +2057,9 @@ async def send_customer_order_status(restaurant, from_number, supabase):
                 await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, body)
                 return
         detail = await fetch_customer_order(supabase, order["id"], restaurant["id"], from_number,
-            "id, total_amount, order_status, payment_method, payment_status, order_items(quantity, menu_items(name))")
+            "id, total_amount, order_status, order_type, dispatch_sent_at, payment_method, payment_status, order_items(quantity, menu_items(name))")
         items = ", ".join(f"{x.get('quantity') or 0} x {(x.get('menu_items') or {}).get('name', 'Item')}" for x in (detail or {}).get("order_items") or [])
-        body = f"Order #{str(order.get('id'))[:8]}\n{truncate(items or 'No item details available.', 500)}\nTotal: ₦{money(order.get('total_amount')):,.0f}\nPayment: {payment_status_words(order)}\nStatus: {order_status_words(order.get('order_status'))}"
+        body = f"Order #{str(order.get('id'))[:8]}\n{truncate(items or 'No item details available.', 500)}\nTotal: ₦{money(order.get('total_amount')):,.0f}\nPayment: {payment_status_words(order)}\nStatus: {order_status_words(detail or order)}"
     await send_text(
         restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
         body,
@@ -2388,7 +2396,7 @@ async def handle_payment_selection(button_id, state, restaurant, from_number, su
             return
         await state.update_data(payment_method="Bank Transfer")
         await state.set_state("waiting_for_payment_proof")
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"Bank Transfer Details\n\nAmount: ₦{float(total):,.0f}\nBank: {truncate(info.get('bank_name'), 100)}\nAccount Number: {truncate(info.get('account_number'), 64)}\nAccount Name: {truncate(info.get('account_name'), 100)}\n\nSend a screenshot of your payment receipt.")
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"Bank Transfer Details\n\nAmount: ₦{float(total):,.0f}\nBank: {truncate(info.get('bank_name'), 100)}\nAccount Number: {truncate(info.get('account_number'), 64)}\nAccount Name: {truncate(info.get('account_name'), 100)}\n\nAfter paying, send a screenshot of your transfer receipt as an image in this chat. The restaurant will confirm it manually, which can take a few minutes.")
         return
     if button_id == "pay_paystack":
         await start_paystack_payment(state, restaurant, from_number, customer_name, total)

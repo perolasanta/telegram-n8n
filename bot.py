@@ -707,8 +707,8 @@ async def cancel_pending_order(
 
     if not order:
         return result("not_found")
-    permitted_whatsapp_payment = allow_unconfirmed_online and order.get("payment_status") != "confirmed"
-    if not (can_self_cancel(order) or permitted_whatsapp_payment):
+    permitted_unconfirmed_online = allow_unconfirmed_online and order.get("payment_status") != "confirmed"
+    if not (can_self_cancel(order) or permitted_unconfirmed_online):
         if (
             order.get("payment_method") in {"Cash Payment", "Pay on Delivery"}
             and order.get("order_status") != "pending"
@@ -792,19 +792,21 @@ def can_self_cancel(order: dict) -> bool:
     )
 
 
-def available_payment_methods(order_type, pod_enabled, paystack_enabled, has_bank) -> list[str]:
-    """Return enabled payment method ids for an order's fulfillment type."""
+def available_payment_methods(order_type, pod_enabled, paystack_enabled, has_bank, transfer_enabled=False) -> list[str]:
+    """Return enabled methods in the customer-facing order used by both channels."""
     methods = []
+    if paystack_enabled and transfer_enabled:
+        methods.append("transfer")
+    if paystack_enabled:
+        methods.append("paystack")
     if order_type == "dine_in":
         methods.append("cash")
     elif order_type == "pickup" and pod_enabled:
         methods.append("cash")
-    if has_bank:
-        methods.append("bank")
-    if paystack_enabled:
-        methods.append("paystack")
     if order_type == "delivery" and pod_enabled:
         methods.append("pod")
+    if has_bank:
+        methods.append("bank")
     return methods
 
 
@@ -2156,7 +2158,7 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
     restaurant_settings = {}
     if data.get("restaurant_id"):
         restaurant_state = supabase.table("restaurants")\
-            .select("delivery_fee_type, pay_on_delivery_enabled, bank_name, account_number, paystack_enabled")\
+            .select("delivery_fee_type, pay_on_delivery_enabled, bank_name, account_number, paystack_enabled, paystack_subaccount_code")\
             .eq("id", data["restaurant_id"])\
             .execute()
         restaurant_settings = restaurant_state.data[0] if restaurant_state.data else {}
@@ -2187,6 +2189,7 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
         order_type, restaurant_settings.get("pay_on_delivery_enabled"),
         restaurant_settings.get("paystack_enabled"),
         bool(restaurant_settings.get("bank_name") and restaurant_settings.get("account_number")),
+        bool(restaurant_settings.get("paystack_subaccount_code")),
     )
     if not allowed_methods:
         await callback_query.message.answer(
@@ -2197,14 +2200,11 @@ async def confirm_order(callback_query: types.CallbackQuery, state: FSMContext):
         return
     button_details = {
         "cash": ("💰 Cash at pickup" if order_type == "pickup" else "💰 Cash Payment", "pay_cash"),
-        "bank": ("🏦 Bank Transfer", "pay_bank"),
+        "bank": ("Bank transfer (needs screenshot)", "pay_bank"),
         "pod": ("💵 Pay on Delivery", "pay_delivery"),
         "paystack": ("💳 Pay with Card (Paystack)", "pay_paystack"),
         "transfer": ("🏦 Instant transfer", "pay_transfer"),
     }
-    # Transfer is another Paystack rail; retain the hosted card checkout too.
-    if "paystack" in allowed_methods:
-        allowed_methods.append("transfer")
     payment_buttons = [
         [InlineKeyboardButton(text=button_details[method][0], callback_data=button_details[method][1])]
         for method in allowed_methods
@@ -2592,13 +2592,14 @@ async def get_telegram_allowed_payment_methods(state: FSMContext) -> list[str]:
     if not restaurant_id:
         return []
     result = supabase.table("restaurants").select(
-        "pay_on_delivery_enabled, bank_name, account_number, paystack_enabled"
+        "pay_on_delivery_enabled, bank_name, account_number, paystack_enabled, paystack_subaccount_code"
     ).eq("id", restaurant_id).execute()
     restaurant = result.data[0] if result.data else {}
     return available_payment_methods(
         data.get("order_type", "dine_in"), restaurant.get("pay_on_delivery_enabled"),
         restaurant.get("paystack_enabled"),
         bool(restaurant.get("bank_name") and restaurant.get("account_number")),
+        bool(restaurant.get("paystack_subaccount_code")),
     )
 
 @dp.callback_query(F.data == "pay_delivery")
@@ -2937,6 +2938,60 @@ async def check_instant_transfer(callback_query: types.CallbackQuery):
     await callback_query.answer(answer, show_alert=True)
 
 
+@dp.callback_query(F.data.startswith("psaccept_"))
+async def accept_paystack_mismatch(callback_query: types.CallbackQuery):
+    """Manager/kitchen accepts a claimed Paystack amount mismatch exactly once."""
+    reference = (callback_query.data or "")[9:]
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    from main import accept_paystack_mismatch as accept_review
+    result = await accept_review(reference)
+    if result.get("status") == "ok":
+        await callback_query.answer("Payment accepted; order sent to preparation.")
+    else:
+        await callback_query.answer("This review was already handled.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("psmrefund_"))
+async def refund_paystack_mismatch(callback_query: types.CallbackQuery):
+    """Refund the actual Paystack receipt after atomically claiming its review."""
+    payload = (callback_query.data or "")[10:]
+    reference, _, received_kobo = payload.rpartition("_")
+    try:
+        received_amount = Decimal(received_kobo) / 100
+    except Exception:
+        await callback_query.answer("Refund amount is invalid; use the Paystack dashboard.", show_alert=True)
+        return
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    payment_result = supabase.table("payments").select(
+        "order_id, restaurant_id, status, orders(telegram_user_id, customer_contact, order_channel)"
+    ).eq("paystack_reference", reference).execute()
+    payment = payment_result.data[0] if payment_result.data else None
+    if not payment or payment.get("status") != "needs_review":
+        await callback_query.answer("This review was already handled.", show_alert=True)
+        return
+    from main import refund_paystack_payment
+    result = await refund_paystack_payment(reference, received_amount)
+    if result.get("status") != "ok":
+        await callback_query.answer("Refund could not be started. Refund it from the Paystack dashboard.", show_alert=True)
+        return
+    order = payment.get("orders") or {}
+    outcome = await cancel_pending_order(
+        bot, payment["order_id"], telegram_user_id=order.get("telegram_user_id"),
+        customer_contact=order.get("customer_contact"), restaurant_id=payment.get("restaurant_id"),
+        allow_unconfirmed_online=True,
+    )
+    if outcome.get("result") == "cancelled":
+        await callback_query.answer("Refund initiated and order cancelled.")
+    else:
+        await callback_query.answer("Refund initiated; order cancellation needs review.", show_alert=True)
+
+
 @dp.callback_query(F.data.startswith("psrefund_"))
 async def refund_late_paystack_payment(callback_query: types.CallbackQuery):
     """Kitchen-only buttons may use this short reference callback; helper is idempotent."""
@@ -2989,8 +3044,8 @@ async def payment_bank(callback_query: types.CallbackQuery, state: FSMContext):
         f"Bank: {restaurant_info['bank_name']}\n"
         f"Account Number: {restaurant_info['account_number']}\n"
         f"Account Name: {restaurant_info['account_name']}\n\n"
-        f"📸 After making the transfer, please send a screenshot "
-        f"of your payment receipt."
+        "📸 After paying, send a photo of your transfer receipt in this chat. "
+        "The restaurant will confirm it manually, which can take a few minutes."
     )
     
     await callback_query.message.answer(bank_details)

@@ -278,14 +278,14 @@ class TestAvailablePaymentMethods(unittest.TestCase):
                             paystack_enabled=paystack_enabled, has_bank=has_bank,
                         ):
                             expected = []
-                            if order_type == "dine_in" or (order_type == "pickup" and pod_enabled):
-                                expected.append("cash")
-                            if has_bank:
-                                expected.append("bank")
                             if paystack_enabled:
                                 expected.append("paystack")
+                            if order_type == "dine_in" or (order_type == "pickup" and pod_enabled):
+                                expected.append("cash")
                             if order_type == "delivery" and pod_enabled:
                                 expected.append("pod")
+                            if has_bank:
+                                expected.append("bank")
                             self.assertEqual(
                                 available_payment_methods(
                                     order_type, pod_enabled, paystack_enabled, has_bank,
