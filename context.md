@@ -221,6 +221,9 @@ Paystack requires an email address. For WhatsApp orders, use the documented dete
 
 ## Known implementation notes for future work
 
+- Instant transfer setup now isolates stock/order creation, Paystack charge, payment persistence, and account-detail delivery failures. A persistence failure cancels the unconfirmed order through `cancel_pending_order()` and uses a setup-error message; a details-send failure keeps the saved pending transfer available for a later Telegram Check payment or WhatsApp STATUS request. Each transfer failure log includes stage, channel, tenant, and order id; post-charge failures include only the safe Paystack reference.
+- Telegram Check payment and WhatsApp STATUS verify pending Paystack references before rendering the stored transfer status. Both render status-specific customer messages and pending account details; Telegram removes the inline control for final statuses. The `tests/test_runtime_undefined_names.py` AST/symbol-table check covers deployed runtime modules as an F821 guard, and `tests/test_instant_transfer_setup.py` covers WhatsApp transfer creation failures and success.
+
 - Paystack orders remain pending in the database but are hidden from the kitchen board, `/pending`, and rush-hour counts until payment is confirmed. The verified Paystack webhook is the notification path after confirmation.
 - The WhatsApp welcome uses Meta `catalog_message` with action `{"name": "catalog_message"}`, an optional footer limited to 60 characters, explicitly points customers to the shop icon, adapts its delivery/pickup wording from `pickup_enabled`, and has a plain-text fallback if the interactive message fails.
 

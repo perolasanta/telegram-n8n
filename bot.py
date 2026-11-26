@@ -2814,20 +2814,36 @@ async def payment_instant_transfer(callback_query: types.CallbackQuery, state: F
     ).eq("id", restaurant_id).execute()
     restaurant = result.data[0] if result.data else None
     if not restaurant or not restaurant.get("paystack_enabled") or not restaurant.get("paystack_subaccount_code"):
+        logging.error("Instant transfer setup failed stage=charge_creation_failed channel=telegram restaurant_id=%s order_id=%s paystack_reference=%s", restaurant_id, None, None)
         await callback_query.message.answer("Instant transfer isn't available right now, please choose another payment method")
         await callback_query.answer()
         return
+    order_id = None
+    reference = None
     try:
         customer_name = callback_query.from_user.username or callback_query.from_user.first_name or "Customer"
         await state.update_data(payment_method="Paystack")
         # create_order_in_db performs the authoritative inventory re-check immediately before Charge.
         order_id, order = await create_order_in_db(callback_query.from_user.id, state, "Paystack", customer_name, "telegram", None)
+    except Exception:
+        logging.exception("Instant transfer setup failed stage=stock_recheck_failed channel=telegram restaurant_id=%s order_id=%s paystack_reference=%s", restaurant_id, order_id, reference)
+        await callback_query.message.answer("Please check your cart and try again.")
+        await callback_query.answer()
+        return
+    try:
         details = await create_transfer_charge(order, restaurant, await get_paystack_email_for_user(callback_query.from_user.id))
-        if not details:
-            supabase.table("orders").update({"order_status": "cancelled"}).eq("id", order_id).eq("restaurant_id", restaurant_id).execute()
-            await callback_query.message.answer("Instant transfer isn't available right now, please choose another payment method")
-            return
-        amount = Decimal(str(order.get("total_amount") or data.get("total_price") or 0))
+        reference = (details or {}).get("reference")
+    except Exception:
+        logging.exception("Instant transfer setup failed stage=charge_creation_failed channel=telegram restaurant_id=%s order_id=%s paystack_reference=%s", restaurant_id, order_id, reference)
+        details = None
+    if not details:
+        logging.error("Instant transfer setup failed stage=charge_creation_failed channel=telegram restaurant_id=%s order_id=%s paystack_reference=%s", restaurant_id, order_id, reference)
+        await cancel_pending_order(bot, order_id, telegram_user_id=callback_query.from_user.id, allow_unconfirmed_online=True)
+        await callback_query.message.answer("Instant transfer isn't available right now, please choose another payment method")
+        await callback_query.answer()
+        return
+    amount = Decimal(str(order.get("total_amount") or data.get("total_price") or 0))
+    try:
         supabase.table("payments").insert({
             "order_id": order_id, "restaurant_id": restaurant_id, "amount": str(amount),
             "provider": "Paystack", "status": "pending", "provider_reference": details["reference"],
@@ -2835,22 +2851,30 @@ async def payment_instant_transfer(callback_query: types.CallbackQuery, state: F
             "account_number": details["account_number"], "account_name": details["account_name"],
             "bank_name": details["bank_name"], "expires_at": details["expires_at"], "channel": "transfer",
         }).execute()
+    except Exception:
+        logging.exception("Instant transfer setup failed stage=persist_payment_failed channel=telegram restaurant_id=%s order_id=%s paystack_reference=%s", restaurant_id, order_id, reference)
+        await cancel_pending_order(bot, order_id, telegram_user_id=callback_query.from_user.id, allow_unconfirmed_online=True)
+        await callback_query.message.answer("Something went wrong while setting up your transfer. Please try again or choose another payment method.")
+        await callback_query.answer()
+        return
+    try:
         expires = datetime.fromisoformat(details["expires_at"].replace("Z", "+00:00")).astimezone(pytz.timezone("Africa/Lagos")).strftime("%I:%M %p")
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Check payment", callback_data=f"pcheck_{order_id}")
         ]])
-        await callback_query.message.answer(
-            f"Bank: {details['bank_name']}\nAccount name: {details['account_name']}\nAccount number:\n{details['account_number']}\n"
-            f"Amount: ₦{amount:,.0f}\nExpires: {expires} WAT\n\n"
-            f"Transfer the exact amount. Your order is confirmed automatically once payment arrives. {transfer_customer_wording('telegram')}",
-            reply_markup=keyboard,
-        )
+        try:
+            await callback_query.message.answer(
+                f"Bank: {details['bank_name']}\nAccount name: {details['account_name']}\nAccount number:\n{details['account_number']}\n"
+                f"Amount: ₦{amount:,.0f}\nExpires: {expires} WAT\n\n"
+                f"Transfer the exact amount. Your order is confirmed automatically once payment arrives. {transfer_customer_wording('telegram')}",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            logging.exception("Instant transfer setup failed stage=send_details_failed channel=telegram restaurant_id=%s order_id=%s paystack_reference=%s", restaurant_id, order_id, reference)
+            return
         await state.update_data(cart={})
-    except ValueError as exc:
-        await callback_query.message.answer(f"⚠️ {escape(str(exc))}")
     except Exception:
-        logging.exception("Telegram instant transfer setup failed")
-        await callback_query.message.answer("Instant transfer isn't available right now, please choose another payment method")
+        logging.exception("Instant transfer setup failed stage=send_details_failed channel=telegram restaurant_id=%s order_id=%s paystack_reference=%s", restaurant_id, order_id, reference)
     finally:
         await callback_query.answer()
 
@@ -2858,17 +2882,59 @@ async def payment_instant_transfer(callback_query: types.CallbackQuery, state: F
 @dp.callback_query(F.data.startswith("pcheck_"))
 async def check_instant_transfer(callback_query: types.CallbackQuery):
     reference = (callback_query.data or "")[7:]
-    payment = supabase.table("payments").select("order_id, restaurant_id, status").eq(
+    owned_order = supabase.table("orders").select("id, restaurant_id").eq("id", reference).eq(
+        "telegram_user_id", callback_query.from_user.id
+    ).eq("order_channel", "telegram").execute()
+    owned = owned_order.data[0] if owned_order.data else None
+    if not owned:
+        await callback_query.answer("We couldn't find this transfer.", show_alert=True)
+        return
+    payment = supabase.table("payments").select("order_id, restaurant_id, status, account_name, account_number, bank_name, amount, expires_at").eq(
         "paystack_reference", reference
+    ).eq("restaurant_id", owned["restaurant_id"]
     ).execute()
     row = payment.data[0] if payment.data else None
-    if not row or row.get("status") != "pending":
-        await callback_query.answer("Payment is no longer pending.", show_alert=True)
+    if not row:
+        await callback_query.answer("We couldn't find this transfer.", show_alert=True)
         return
-    # Lazy import avoids main<->bot import initialisation recursion.
-    from main import confirm_paystack_payment
-    result = await confirm_paystack_payment(reference, "telegram_status")
-    await callback_query.answer("Payment confirmed." if result.get("status") == "ok" else "Payment is still pending.", show_alert=True)
+    if row.get("status") == "pending":
+        from main import confirm_paystack_payment
+        await confirm_paystack_payment(reference, "telegram_status")
+        payment = supabase.table("payments").select("order_id, restaurant_id, status, account_name, account_number, bank_name, amount, expires_at").eq("paystack_reference", reference).eq("restaurant_id", row["restaurant_id"]).execute()
+        row = payment.data[0] if payment.data else row
+    status = row.get("status")
+    final = status in {"confirmed", "rejected", "expired", "cancelled"}
+    if final:
+        try:
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                logging.info("Could not remove transfer button order_id=%s: %s", row.get("order_id"), exc)
+    if status == "confirmed":
+        answer = f"Payment confirmed. Your order is being prepared. #{str(row.get('order_id'))[:8]}"
+    elif status == "pending":
+        expires = row.get("expires_at")
+        remaining = ""
+        if expires:
+            try:
+                seconds = max(0, int((datetime.fromisoformat(expires.replace("Z", "+00:00")) - datetime.now(pytz.utc)).total_seconds()))
+                remaining = f" Time left: {seconds // 60} minutes."
+            except (ValueError, TypeError):
+                pass
+        answer = f"Payment is still pending. Bank: {row.get('bank_name') or 'your transfer bank'}; account: {row.get('account_name') or ''} {row.get('account_number') or ''}; amount ₦{Decimal(str(row.get('amount') or 0)):,.2f}.{remaining} {transfer_customer_wording('telegram')}"
+    elif status in {"needs_review", "amount_mismatch"}:
+        answer = "The restaurant is reviewing your payment."
+    elif status == "rejected":
+        answer = f"This transfer was rejected. Please contact the restaurant. {transfer_customer_wording('telegram', 'restart')}"
+    elif status == "expired":
+        answer = f"This transfer account has expired. {transfer_customer_wording('telegram', 'restart')}"
+    elif status == "cancelled":
+        answer = f"This order was cancelled. {transfer_customer_wording('telegram', 'restart')}"
+    elif status in {"refunded", "refund_pending"}:
+        answer = f"Your refund is being processed or has been initiated. Please allow a few business days for it to reach your account. {transfer_customer_wording('telegram', 'restart')}"
+    else:
+        answer = "The restaurant is reviewing your payment."
+    await callback_query.answer(answer, show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("psrefund_"))

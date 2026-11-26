@@ -18,7 +18,7 @@ import main
 
 WHATSAPP_PAYSTACK_SUCCESS = {
     "event": "charge.success",
-    "data": {"reference": "1f2d3c4b-0000-4000-8000-000000000001"},
+    "data": {"reference": "1f2d3c4b-0000-4000-8000-000000000001", "amount": 100000, "currency": "NGN"},
 }
 
 
@@ -58,6 +58,8 @@ class Query:
     def execute(self):
         if self.operation == "update":
             return Result()
+        if self.table_name == "payments" and self.select_fields == "amount, restaurant_id, status":
+            return Result([{"amount": "1000.00", "restaurant_id": "restaurant-1", "status": "pending"}])
         if self.table_name == "orders" and self.select_fields == "payment_status":
             return Result([{"payment_status": "pending"}])
         if self.table_name == "orders":

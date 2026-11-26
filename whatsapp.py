@@ -24,6 +24,7 @@ from whatsapp_state import WhatsAppState
 from receipt_generator import generate_receipt_pdf
 from bot import (
     available_payment_methods,
+    bot as shared_bot,
     build_composite_cart_line,
     can_self_cancel,
     cancel_pending_order,
@@ -2013,6 +2014,40 @@ async def send_customer_order_status(restaurant, from_number, supabase):
         body = "You have no orders yet. Tap the shop icon to place one."
     else:
         order = orders[0]
+        if order.get("payment_method") == "Paystack":
+            payment_result = supabase.table("payments").select("paystack_reference, status, account_name, account_number, bank_name, amount, expires_at").eq("order_id", order["id"]).eq("restaurant_id", restaurant["id"]).eq("provider", "Paystack").eq("channel", "transfer").limit(1).execute()
+            payment = (payment_result.data or [None])[0]
+            if payment and payment.get("status") == "pending" and payment.get("paystack_reference"):
+                from main import confirm_paystack_payment
+                await confirm_paystack_payment(payment["paystack_reference"], "whatsapp_status")
+                payment_result = supabase.table("payments").select("paystack_reference, status, account_name, account_number, bank_name, amount, expires_at").eq("order_id", order["id"]).eq("restaurant_id", restaurant["id"]).eq("provider", "Paystack").eq("channel", "transfer").limit(1).execute()
+                payment = (payment_result.data or [payment])[0]
+            if payment:
+                status = payment.get("status")
+                if status == "confirmed":
+                    body = f"Payment confirmed. Your order is being prepared. #{str(order['id'])[:8]}"
+                elif status == "pending":
+                    remaining = ""
+                    try:
+                        seconds = max(0, int((datetime.fromisoformat(payment["expires_at"].replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds()))
+                        remaining = f" Time left: {seconds // 60} minutes."
+                    except (ValueError, TypeError, KeyError):
+                        pass
+                    body = f"Payment is still pending. Bank: {payment.get('bank_name') or ''}\nAccount name: {payment.get('account_name') or ''}\nAccount number: {payment.get('account_number') or ''}\nAmount: ₦{money(payment.get('amount')):,.2f}.{remaining} {transfer_customer_wording('whatsapp')}"
+                elif status in {"needs_review", "amount_mismatch"}:
+                    body = "The restaurant is reviewing your payment."
+                elif status == "rejected":
+                    body = f"This transfer was rejected. Please contact the restaurant. {transfer_customer_wording('whatsapp', 'restart')}"
+                elif status == "expired":
+                    body = f"This transfer account has expired. {transfer_customer_wording('whatsapp', 'restart')}"
+                elif status == "cancelled":
+                    body = f"This order was cancelled. {transfer_customer_wording('whatsapp', 'restart')}"
+                elif status in {"refunded", "refund_pending"}:
+                    body = f"Your refund is being processed or has been initiated. Please allow a few business days for it to reach your account. {transfer_customer_wording('whatsapp', 'restart')}"
+                else:
+                    body = "The restaurant is reviewing your payment."
+                await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, body)
+                return
         detail = await fetch_customer_order(supabase, order["id"], restaurant["id"], from_number,
             "id, total_amount, order_status, payment_method, payment_status, order_items(quantity, menu_items(name))")
         items = ", ".join(f"{x.get('quantity') or 0} x {(x.get('menu_items') or {}).get('name', 'Item')}" for x in (detail or {}).get("order_items") or [])
@@ -2401,30 +2436,44 @@ async def start_paystack_payment(state, restaurant, from_number, customer_name, 
 
 async def start_instant_transfer(state, restaurant, from_number, customer_name):
     """Create the pending Paystack order only after the normal stock re-check."""
+    order_id = None
+    details = None
+    channel = "whatsapp"
+    rid = restaurant.get("id")
     try:
         await state.update_data(payment_method="Paystack")
         order_id, order = await create_order_in_db(None, state, "Paystack", customer_name, "whatsapp", None, from_number)
-        email = f"{''.join(ch for ch in from_number if ch.isdigit())}@chowlin.ng"
-        # Insert responses may be sparse; use the same authoritative state total
-        # Telegram falls back to when forming the Charge payload.
-        order = {**(order or {}), "id": order_id, "total_amount": (order or {}).get("total_amount") or (await state.get_data()).get("total_price"), "restaurant_id": restaurant["id"], "order_channel": "whatsapp"}
-        details = await create_transfer_charge(order, restaurant, email)
-        if not details:
-            supabase.table("orders").update({"order_status": "cancelled"}).eq("id", order_id).eq("restaurant_id", restaurant["id"]).execute()
-            await state.set_state("waiting_for_payment_method")
-            await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Instant transfer isn't available right now, please choose another payment method")
-            return
-        total = money(order.get("total_amount"))
-        supabase.table("payments").insert({"order_id": order_id, "restaurant_id": restaurant["id"], "amount": str(total), "provider": "Paystack", "status": "pending", "provider_reference": details["reference"], "paystack_reference": details["reference"], "paystack_subaccount_code": restaurant["paystack_subaccount_code"], "account_number": details["account_number"], "account_name": details["account_name"], "bank_name": details["bank_name"], "expires_at": details["expires_at"], "channel": "transfer"}).execute()
-        expires = datetime.fromisoformat(details["expires_at"].replace("Z", "+00:00")).astimezone(__import__('pytz').timezone("Africa/Lagos")).strftime("%I:%M %p")
-        await state.set_state("awaiting_transfer")
-        await state.update_data(active_transfer_order_id=order_id)
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"Bank: {details['bank_name']}\nAccount name: {details['account_name']}\nAccount number:\n{details['account_number']}\nAmount: ₦{total:,.0f}\nExpires: {expires} WAT\n\nTransfer the exact amount. Your order is confirmed automatically once payment arrives. {transfer_customer_wording('whatsapp')}")
-    except ValueError as exc:
-        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"⚠️ {truncate(exc, 1000)}")
     except Exception:
-        logging.exception("WhatsApp instant transfer setup failed")
+        logging.exception("Instant transfer setup failed stage=stock_recheck_failed channel=%s restaurant_id=%s order_id=%s paystack_reference=%s", channel, rid, order_id, None)
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Please check your cart and try again.")
+        return
+    email = f"{''.join(ch for ch in from_number if ch.isdigit())}@chowlin.ng"
+    order = {**(order or {}), "id": order_id, "total_amount": (order or {}).get("total_amount") or (await state.get_data()).get("total_price"), "restaurant_id": rid, "order_channel": channel}
+    try:
+        details = await create_transfer_charge(order, restaurant, email)
+    except Exception:
+        logging.exception("Instant transfer setup failed stage=charge_creation_failed channel=%s restaurant_id=%s order_id=%s paystack_reference=%s", channel, rid, order_id, None)
+    if not details:
+        logging.error("Instant transfer setup failed stage=charge_creation_failed channel=%s restaurant_id=%s order_id=%s paystack_reference=%s", channel, rid, order_id, None)
+        await cancel_pending_order(shared_bot, order_id, customer_contact=from_number, restaurant_id=rid, allow_unconfirmed_online=True)
+        await state.set_state("waiting_for_payment_method")
         await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Instant transfer isn't available right now, please choose another payment method")
+        return
+    total = money(order.get("total_amount"))
+    try:
+        state.supabase.table("payments").insert({"order_id": order_id, "restaurant_id": rid, "amount": str(total), "provider": "Paystack", "status": "pending", "provider_reference": details["reference"], "paystack_reference": details["reference"], "paystack_subaccount_code": restaurant["paystack_subaccount_code"], "account_number": details["account_number"], "account_name": details["account_name"], "bank_name": details["bank_name"], "expires_at": details["expires_at"], "channel": "transfer"}).execute()
+    except Exception:
+        logging.exception("Instant transfer setup failed stage=persist_payment_failed channel=%s restaurant_id=%s order_id=%s paystack_reference=%s", channel, rid, order_id, details.get("reference"))
+        await cancel_pending_order(shared_bot, order_id, customer_contact=from_number, restaurant_id=rid, allow_unconfirmed_online=True)
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, "Something went wrong while setting up your transfer. Please try again or choose another payment method.")
+        return
+    expires = datetime.fromisoformat(details["expires_at"].replace("Z", "+00:00")).astimezone(__import__('pytz').timezone("Africa/Lagos")).strftime("%I:%M %p")
+    await state.set_state("awaiting_transfer")
+    await state.update_data(active_transfer_order_id=order_id)
+    try:
+        await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, f"Bank: {details['bank_name']}\nAccount name: {details['account_name']}\nAccount number:\n{details['account_number']}\nAmount: ₦{total:,.0f}\nExpires: {expires} WAT\n\nTransfer the exact amount. Your order is confirmed automatically once payment arrives. {transfer_customer_wording('whatsapp')}")
+    except Exception:
+        logging.exception("Instant transfer setup failed stage=send_details_failed channel=%s restaurant_id=%s order_id=%s paystack_reference=%s", channel, rid, order_id, details.get("reference"))
 
 
 async def download_whatsapp_media(media_id: str, token: str) -> tuple[bytes, str]:
