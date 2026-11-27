@@ -44,7 +44,7 @@ from bot import (
 )
 from paystack_transfer import build_order_status_text
 
-GRAPH_API = "https://graph.facebook.com/v25.0"
+GRAPH_API = "https://graph.facebook.com/v27.0"
 MAX_WHATSAPP_LIST_ROWS = 10
 MAX_WHATSAPP_CATALOG_FOOTER_LENGTH = 60
 MAX_LINE_QTY = 50
