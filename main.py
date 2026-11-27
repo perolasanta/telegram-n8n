@@ -38,7 +38,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from reports import generate_daily_report_for_window, generate_weekly_report, get_daily_report_window
 from whatsapp import handle_whatsapp_webhook, is_whatsapp_addon_active, make_table_token, resync_catalog_availability
-from paystack_transfer import transfer_customer_wording
+from paystack_transfer import build_order_status_text, transfer_customer_wording
 
 
 FASTAPI_WEBHOOK_URL = os.getenv("FASTAPI_WEBHOOK_URL","https://telegram-n8n-restaurant-bot.onrender.com")  # Replace with your actual webhook URL
@@ -698,7 +698,7 @@ async def accept_paystack_mismatch(reference: str) -> dict:
     if not order_updated.data:
         return {"status": "already_handled"}
     order_result = supabase.table("orders").select(
-        "telegram_user_id, customer_contact, order_channel, restaurant_id, restaurants(kitchen_chat_id, whatsapp_phone_number_id, whatsapp_access_token)"
+        "telegram_user_id, customer_contact, order_channel, restaurant_id, order_status, order_type, dispatch_sent_at, payment_method, payment_status, restaurants(kitchen_chat_id, whatsapp_phone_number_id, whatsapp_access_token)"
     ).eq("id", order_id).eq("restaurant_id", payment["restaurant_id"]).execute()
     order = order_result.data[0] if order_result.data else {}
     target_bot = await get_bot_for_order(order)
@@ -707,7 +707,7 @@ async def accept_paystack_mismatch(reference: str) -> dict:
         await send_order_to_kitchen_from_db(target_bot, order_id)
         low_stock_items = await deduct_inventory_for_order(order_id)
         await send_restock_alert(target_bot, payment["restaurant_id"], kitchen, low_stock_items)
-        await notify_order_customer(target_bot, order, "Your payment was accepted and your order is being prepared.")
+        await notify_order_customer(target_bot, order, build_order_status_text(order, {"status": "confirmed"}, order.get("order_channel") or "telegram"))
         await send_order_receipt(target_bot, order, order_id)
     except Exception:
         logger.exception("Post-review confirmation work failed order_id=%s", order_id)
@@ -726,8 +726,16 @@ async def refund_paystack_payment(reference: str, amount=None):
         "paystack_reference", reference).eq("restaurant_id", payment.get("restaurant_id")).neq(
         "status", "refund_pending").neq("status", "refunded").select("order_id").execute()
     if not claimed.data:
+        logger.warning(
+            "Paystack refund failed reference=%s stage=claim_failed http_status=%s message=%s code=%s",
+            reference, None, None, None,
+        )
         return {"status": "already_handled"}
     refund_amount = Decimal(str(amount if amount is not None else payment.get("amount") or 0))
+    failure_stage = "network_error"
+    http_status = None
+    provider_message = None
+    provider_code = None
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
             payload = {"transaction": reference}
@@ -735,8 +743,12 @@ async def refund_paystack_payment(reference: str, amount=None):
                 payload["amount"] = int((refund_amount * 100).to_integral_value())
             async with session.post("https://api.paystack.co/refund", headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"}, json=payload) as response:
                 data = await response.json(content_type=None)
+                http_status = response.status
         refund = data.get("data") if isinstance(data, dict) else {}
         if response.status >= 300 or not data.get("status"):
+            failure_stage = "api_error"
+            provider_message = data.get("message") if isinstance(data, dict) else None
+            provider_code = data.get("code") if isinstance(data, dict) else None
             raise RuntimeError("Paystack refund request rejected")
         supabase.table("payments").update({"status": "refunded", "refund_reference": refund.get("reference"), "refunded_at": datetime.now(pytz.utc).isoformat()}).eq("paystack_reference", reference).eq("restaurant_id", payment.get("restaurant_id")).execute()
         order = payment.get("orders") or {}
@@ -745,10 +757,15 @@ async def refund_paystack_payment(reference: str, amount=None):
         except Exception:
             logger.exception("Refund customer notification failed reference=%s", reference)
         return {"status": "ok"}
-    except Exception:
+    except (aiohttp.ClientError, TimeoutError):
+        failure_stage = "network_error"
         # Release the claim for staff retry; deliberately never include provider body/secret in logs.
         supabase.table("payments").update({"status": payment.get("status") or "needs_review"}).eq("paystack_reference", reference).eq("restaurant_id", payment.get("restaurant_id")).eq("status", "refund_pending").execute()
-        logger.warning("Paystack refund failed reference=%s", reference)
+        logger.warning("Paystack refund failed reference=%s stage=%s http_status=%s message=%s code=%s", reference, failure_stage, http_status, provider_message, provider_code)
+        return {"status": "failed"}
+    except Exception:
+        supabase.table("payments").update({"status": payment.get("status") or "needs_review"}).eq("paystack_reference", reference).eq("restaurant_id", payment.get("restaurant_id")).eq("status", "refund_pending").execute()
+        logger.warning("Paystack refund failed reference=%s stage=%s http_status=%s message=%s code=%s", reference, failure_stage, http_status, provider_message, provider_code)
         return {"status": "failed"}
 
 

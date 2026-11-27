@@ -42,6 +42,7 @@ from bot import (
     validate_cart_inventory,
     HELD_RECEIPT_METHODS,
 )
+from paystack_transfer import build_order_status_text
 
 GRAPH_API = "https://graph.facebook.com/v25.0"
 MAX_WHATSAPP_LIST_ROWS = 10
@@ -2031,35 +2032,16 @@ async def send_customer_order_status(restaurant, from_number, supabase):
                 payment_result = supabase.table("payments").select("paystack_reference, status, account_name, account_number, bank_name, amount, expires_at").eq("order_id", order["id"]).eq("restaurant_id", restaurant["id"]).eq("provider", "Paystack").eq("channel", "transfer").limit(1).execute()
                 payment = (payment_result.data or [payment])[0]
             if payment:
-                status = payment.get("status")
-                if status == "confirmed":
-                    body = f"Payment confirmed. Your order is being prepared. #{str(order['id'])[:8]}"
-                elif status == "pending":
-                    remaining = ""
-                    try:
-                        seconds = max(0, int((datetime.fromisoformat(payment["expires_at"].replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds()))
-                        remaining = f" Time left: {seconds // 60} minutes."
-                    except (ValueError, TypeError, KeyError):
-                        pass
-                    body = f"Payment is still pending. Bank: {payment.get('bank_name') or ''}\nAccount name: {payment.get('account_name') or ''}\nAccount number: {payment.get('account_number') or ''}\nAmount: ₦{money(payment.get('amount')):,.2f}.{remaining} {transfer_customer_wording('whatsapp')}"
-                elif status in {"needs_review", "amount_mismatch"}:
-                    body = "The restaurant is reviewing your payment."
-                elif status == "rejected":
-                    body = f"This transfer was rejected. Please contact the restaurant. {transfer_customer_wording('whatsapp', 'restart')}"
-                elif status == "expired":
-                    body = f"This transfer account has expired. {transfer_customer_wording('whatsapp', 'restart')}"
-                elif status == "cancelled":
-                    body = f"This order was cancelled. {transfer_customer_wording('whatsapp', 'restart')}"
-                elif status in {"refunded", "refund_pending"}:
-                    body = f"Your refund is being processed or has been initiated. Please allow a few business days for it to reach your account. {transfer_customer_wording('whatsapp', 'restart')}"
-                else:
-                    body = "The restaurant is reviewing your payment."
+                current = await fetch_customer_order(supabase, order["id"], restaurant["id"], from_number,
+                    "id, order_status, order_type, dispatch_sent_at, payment_method, payment_status")
+                body = build_order_status_text(current or {}, payment, "whatsapp")
                 await send_text(restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number, body)
                 return
         detail = await fetch_customer_order(supabase, order["id"], restaurant["id"], from_number,
             "id, total_amount, order_status, order_type, dispatch_sent_at, payment_method, payment_status, order_items(quantity, menu_items(name))")
         items = ", ".join(f"{x.get('quantity') or 0} x {(x.get('menu_items') or {}).get('name', 'Item')}" for x in (detail or {}).get("order_items") or [])
-        body = f"Order #{str(order.get('id'))[:8]}\n{truncate(items or 'No item details available.', 500)}\nTotal: ₦{money(order.get('total_amount')):,.0f}\nPayment: {payment_status_words(order)}\nStatus: {order_status_words(detail or order)}"
+        current = detail or order
+        body = f"Order #{str(order.get('id'))[:8]}\n{truncate(items or 'No item details available.', 500)}\nTotal: ₦{money(order.get('total_amount')):,.0f}\n{build_order_status_text(current, None, 'whatsapp')}"
     await send_text(
         restaurant["whatsapp_phone_number_id"], restaurant["whatsapp_access_token"], from_number,
         body,

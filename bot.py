@@ -27,7 +27,7 @@ from receipt_generator import generate_receipt_pdf
 from aiogram.types import FSInputFile
 import pytz
 from datetime import datetime, timedelta
-from paystack_transfer import create_transfer_charge, split_fields, transfer_customer_wording
+from paystack_transfer import build_order_status_text, create_transfer_charge, split_fields, transfer_customer_wording
 
 router = Router()
 load_dotenv()
@@ -2911,30 +2911,14 @@ async def check_instant_transfer(callback_query: types.CallbackQuery):
         except TelegramBadRequest as exc:
             if "message is not modified" not in str(exc).lower():
                 logging.info("Could not remove transfer button order_id=%s: %s", row.get("order_id"), exc)
-    if status == "confirmed":
-        answer = f"Payment confirmed. Your order is being prepared. #{str(row.get('order_id'))[:8]}"
-    elif status == "pending":
-        expires = row.get("expires_at")
-        remaining = ""
-        if expires:
-            try:
-                seconds = max(0, int((datetime.fromisoformat(expires.replace("Z", "+00:00")) - datetime.now(pytz.utc)).total_seconds()))
-                remaining = f" Time left: {seconds // 60} minutes."
-            except (ValueError, TypeError):
-                pass
-        answer = f"Payment is still pending. Bank: {row.get('bank_name') or 'your transfer bank'}; account: {row.get('account_name') or ''} {row.get('account_number') or ''}; amount ₦{Decimal(str(row.get('amount') or 0)):,.2f}.{remaining} {transfer_customer_wording('telegram')}"
-    elif status in {"needs_review", "amount_mismatch"}:
-        answer = "The restaurant is reviewing your payment."
-    elif status == "rejected":
-        answer = f"This transfer was rejected. Please contact the restaurant. {transfer_customer_wording('telegram', 'restart')}"
-    elif status == "expired":
-        answer = f"This transfer account has expired. {transfer_customer_wording('telegram', 'restart')}"
-    elif status == "cancelled":
-        answer = f"This order was cancelled. {transfer_customer_wording('telegram', 'restart')}"
-    elif status in {"refunded", "refund_pending"}:
-        answer = f"Your refund is being processed or has been initiated. Please allow a few business days for it to reach your account. {transfer_customer_wording('telegram', 'restart')}"
-    else:
-        answer = "The restaurant is reviewing your payment."
+    current_order = supabase.table("orders").select(
+        "id, restaurant_id, order_status, order_type, dispatch_sent_at, payment_method, payment_status"
+    ).eq("id", row["order_id"]).eq("restaurant_id", row["restaurant_id"]).eq(
+        "telegram_user_id", callback_query.from_user.id
+    ).eq("order_channel", "telegram").execute()
+    answer = build_order_status_text(
+        current_order.data[0] if current_order.data else {}, row, "telegram"
+    )
     await callback_query.answer(answer, show_alert=True)
 
 
@@ -4440,10 +4424,9 @@ async def order_status(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     
     order = supabase.table("orders")\
-        .select("id, order_status, payment_status, payment_method, total_amount, created_at")\
+        .select("id, restaurant_id, order_status, order_type, dispatch_sent_at, payment_status, payment_method, total_amount, created_at")\
         .eq("telegram_user_id", user_id)\
         .eq("order_channel", "telegram")\
-        .in_("order_status", ["pending", "preparing"])\
         .order("created_at", desc=True)\
         .limit(1)\
         .execute()
@@ -4453,7 +4436,7 @@ async def order_status(message: types.Message, state: FSMContext):
         return
     
     o = order.data[0]
-    emoji = {"pending": "⏳", "preparing": "🍳"}.get(o["order_status"], "📦")
+    emoji = {"pending": "⏳", "received": "⏳", "preparing": "🍳", "ready": "📦", "delivered": "✅", "cancelled": "❌"}.get(o["order_status"], "📦")
     keyboard = None
     if can_self_cancel(o):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
@@ -4462,7 +4445,7 @@ async def order_status(message: types.Message, state: FSMContext):
     await message.answer(
         f"{emoji} <b>Active Order</b>\n\n"
         f"Order: #{o['id'][:8]}\n"
-        f"Status: {o['order_status'].capitalize()}\n"
+        f"Status: {build_order_status_text(o, None, 'telegram')}\n"
         f"Payment: {o['payment_status'].capitalize()}\n"
         f"Total: ₦{float(o['total_amount']):,.0f}",
         reply_markup=keyboard,

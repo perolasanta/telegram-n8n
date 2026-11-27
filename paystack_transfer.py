@@ -22,6 +22,75 @@ def transfer_customer_wording(channel: str, purpose: str = "check") -> str:
     return "Reply STATUS to check, or MENU for options." if channel == "whatsapp" else "Tap Check payment below if you have paid and not yet received confirmation. You can also use /status or /cancel."
 
 
+def build_order_status_text(order: dict, payment: dict | None, channel: str) -> str:
+    """Return one channel-appropriate customer status from current order/payment rows."""
+    order = order or {}
+    payment = payment or {}
+    payment_status = str(payment.get("status") or order.get("payment_status") or "").lower()
+    payment_method = str(order.get("payment_method") or "").lower()
+    paid_offline = payment_method in {"cash payment", "cash", "pay on delivery"}
+
+    if payment_status != "confirmed" and not paid_offline:
+        if payment_status == "pending":
+            expires = payment.get("expires_at")
+            remaining = ""
+            if expires:
+                try:
+                    expiry = datetime.fromisoformat(str(expires).replace("Z", "+00:00"))
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    seconds = max(0, int((expiry - datetime.now(timezone.utc)).total_seconds()))
+                    remaining = f" Time left: {seconds // 60} minutes."
+                except (TypeError, ValueError):
+                    pass
+            if payment:
+                if channel == "whatsapp":
+                    return (
+                        f"Payment is still pending. Bank: {payment.get('bank_name') or ''}\n"
+                        f"Account name: {payment.get('account_name') or ''}\n"
+                        f"Account number: {payment.get('account_number') or ''}\n"
+                        f"Amount: ₦{Decimal(str(payment.get('amount') or 0)):,.2f}.{remaining} "
+                        f"{transfer_customer_wording(channel)}"
+                    )
+                return (
+                    f"Payment is still pending. Bank: {payment.get('bank_name') or 'your transfer bank'}; "
+                    f"account: {payment.get('account_name') or ''} {payment.get('account_number') or ''}; "
+                    f"amount ₦{Decimal(str(payment.get('amount') or 0)):,.2f}.{remaining} "
+                    f"{transfer_customer_wording(channel)}"
+                )
+            return "Your payment is still pending."
+        if payment_status in {"needs_review", "amount_mismatch"}:
+            return "The restaurant is reviewing your payment."
+        if payment_status == "rejected":
+            return f"This transfer was rejected. Please contact the restaurant. {transfer_customer_wording(channel, 'restart')}"
+        if payment_status == "expired":
+            return f"This transfer account has expired. {transfer_customer_wording(channel, 'restart')}"
+        if payment_status == "cancelled":
+            return f"This order was cancelled. {transfer_customer_wording(channel, 'restart')}"
+        if payment_status in {"refunded", "refund_pending"}:
+            return f"Your refund is being processed or has been initiated. Please allow a few business days for it to reach your account. {transfer_customer_wording(channel, 'restart')}"
+        return "The restaurant is reviewing your payment."
+
+    status = str(order.get("order_status") or "pending").lower()
+    if status in {"pending", "received"}:
+        stage = "We've received your order and the restaurant will start soon."
+    elif status == "preparing":
+        stage = "Your order is being prepared."
+    elif status == "ready" and order.get("order_type") == "delivery" and order.get("dispatch_sent_at"):
+        stage = "Your order is on its way."
+    elif status == "ready" and order.get("order_type") == "pickup":
+        stage = "Your order is ready for pickup."
+    elif status == "ready":
+        stage = "Your order is ready and will be sent out shortly."
+    elif status == "delivered":
+        stage = "Your order was delivered."
+    elif status == "cancelled":
+        stage = "This order was cancelled."
+    else:
+        stage = "We've received your order and the restaurant will start soon."
+    return f"Payment confirmed. {stage}" if payment_status == "confirmed" else stage
+
+
 def amount_to_kobo(amount: Any) -> int:
     """Convert naira to kobo without binary-float rounding."""
     value = Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
